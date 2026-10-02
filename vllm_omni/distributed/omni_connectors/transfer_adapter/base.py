@@ -17,6 +17,10 @@ class OmniTransferAdapterBase:
     leaves the specific data processing (chunks, KV cache, etc.) to subclasses.
     """
 
+    # How long the receive thread backs off after a pass that received
+    # nothing, while requests are pending.
+    _empty_pass_wait_s = 0.001
+
     def __init__(self, config: Any):
         self.config = config
         if not hasattr(self, "connector"):
@@ -53,8 +57,9 @@ class OmniTransferAdapterBase:
         """Loop to poll for incoming data.
 
         Process each pending request exactly once per pass.  When no request
-        made progress, back off 1 ms instead of tight-spinning on failed
-        shm_open syscalls (which can burn a full CPU core).
+        made progress, back off ``_empty_pass_wait_s`` instead of
+        tight-spinning on failed shm_open syscalls (which can burn a full CPU
+        core).
         """
         while not self.stop_event.is_set():
             n = len(self._pending_load_reqs)
@@ -79,7 +84,7 @@ class OmniTransferAdapterBase:
                 if not self._pending_load_reqs and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.1)
                 elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+                    self._recv_cond.wait(timeout=self._empty_pass_wait_s)
 
     def record_send_failure(self, request_id: str | None, reason: str) -> None:
         """Note that a chunk for *request_id* will never be delivered.

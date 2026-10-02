@@ -15,6 +15,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
+from vllm_omni import envs
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
@@ -27,6 +28,9 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+# The receive thread's back-off after an empty pass under VLLM_OMNI_FAST_POLL.
+_FAST_POLL_EMPTY_PASS_WAIT_S = 0.0001
 
 
 class _SenderGeneration:
@@ -173,6 +177,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
         self.connector = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
+        # VLLM_OMNI_FAST_POLL: each committed chunk sets chunk_landed, which
+        # the stage's engine loop waits on instead of sleeping, and the
+        # receive thread backs off _FAST_POLL_EMPTY_PASS_WAIT_S, since a
+        # missing shared-memory key costs it little. The stock waits otherwise
+        # sit between the upstream send and this stage scheduling the chunk.
+        self.fast_poll = envs.VLLM_OMNI_FAST_POLL
+        self.chunk_landed = threading.Event()
+        if self.fast_poll:
+            self._empty_pass_wait_s = _FAST_POLL_EMPTY_PASS_WAIT_S
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -677,6 +690,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            if self.fast_poll:
+                self.chunk_landed.set()
             return True
 
         return False

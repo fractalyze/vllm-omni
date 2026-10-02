@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_FRAME0: bool = False
     VLLM_OMNI_EARLY_CHUNK: bool = False
     VLLM_OMNI_TALKER_PREP: bool = False
+    VLLM_OMNI_FAST_POLL: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -82,6 +83,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prompt with its chat parts cut on the host, without GPU syncs; the input
     # is the same.
     "VLLM_OMNI_TALKER_PREP": lambda: os.environ.get("VLLM_OMNI_TALKER_PREP", "0") == "1",
+    # "1" wakes a stage the moment an upstream chunk lands instead of on its
+    # next poll: the chunk adapter's receive thread backs off for less between
+    # empty passes, and the engine loop waits on the commit instead of
+    # sleeping.
+    "VLLM_OMNI_FAST_POLL": lambda: os.environ.get("VLLM_OMNI_FAST_POLL", "0") == "1",
 }
 
 

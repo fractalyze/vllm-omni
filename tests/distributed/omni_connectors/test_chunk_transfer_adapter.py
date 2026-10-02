@@ -3683,3 +3683,27 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+def _commit_ar_chunk(adapter) -> bool:
+    request = _req("fast", RequestStatus.WAITING)
+    payload = {"meta": {}, "ids": {"prompt": [1, 2], "all": [1, 2, 3]}}
+    return adapter._commit_received_chunk(
+        request, (payload, 1), stage_id=1, req_id="fast", chunk_id=0, connector_get_key="fast_0_0"
+    )
+
+
+def test_fast_poll_off_keeps_the_1ms_backoff(monkeypatch, build_adapter):
+    monkeypatch.delenv("VLLM_OMNI_FAST_POLL", raising=False)
+    adapter, _ = build_adapter()
+    assert adapter._empty_pass_wait_s == 0.001
+    assert _commit_ar_chunk(adapter)
+    assert not adapter.chunk_landed.is_set()
+
+
+def test_fast_poll_signals_each_committed_chunk(monkeypatch, build_adapter):
+    monkeypatch.setenv("VLLM_OMNI_FAST_POLL", "1")
+    adapter, _ = build_adapter()
+    assert adapter._empty_pass_wait_s == 0.0001
+    assert _commit_ar_chunk(adapter)
+    assert adapter.chunk_landed.is_set()

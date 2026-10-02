@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import threading
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -97,6 +98,10 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     return True
 
 
+# vLLM's engine loop sleeps this long after a step that ran nothing.
+_IDLE_WAIT_S = 0.001
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -109,6 +114,26 @@ class StageEngineCoreProc(EngineCoreProc):
         super().__init__(*args, **kwargs)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+        # VLLM_OMNI_FAST_POLL: set when the chunk adapter commits a chunk.
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        self._chunk_landed: threading.Event | None = (
+            adapter.chunk_landed if adapter is not None and getattr(adapter, "fast_poll", False) else None
+        )
+
+    def _process_engine_step(self) -> bool:
+        """vLLM's EngineCore._process_engine_step; with VLLM_OMNI_FAST_POLL, a
+        step that ran nothing while requests wait for a chunk waits for the
+        chunk to land, for the same 1 ms at most, instead of sleeping it out."""
+        if self._chunk_landed is None:
+            return super()._process_engine_step()
+        outputs, model_executed = self.step_fn()
+        for output in outputs.items() if outputs else ():
+            self.output_queue.put_nowait(output)
+        self.post_step(model_executed)
+        if not model_executed and self.scheduler.has_requests():
+            self._chunk_landed.wait(_IDLE_WAIT_S)
+            self._chunk_landed.clear()
+        return model_executed
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
