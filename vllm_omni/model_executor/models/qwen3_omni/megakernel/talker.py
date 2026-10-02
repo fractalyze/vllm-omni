@@ -31,7 +31,7 @@ VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS caps its CTAs, which leaves SMs to
 code2wav.
 
 The CTA counts change how the kernels split their sums, so the audio a
-prompt gets depends on them; at fixed counts every repeat is identical.
+prompt gets depends on them; which SMs the CTAs run on does not.
 """
 
 from __future__ import annotations
