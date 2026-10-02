@@ -118,6 +118,7 @@ from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 
+from vllm_omni import envs
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
@@ -126,6 +127,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     _get_request_video_use_audio_in_video,
     _get_video_second_per_grid_t,
 )
+from vllm_omni.model_executor.models.qwen3_omni.megakernel.thinker import ThinkerMegakernel
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
@@ -1032,6 +1034,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     # PEFT stores the expert LoRA matrices with an explicit expert dimension.
     is_3d_moe_weight: bool = True
+    # Set by __init__ when VLLM_OMNI_THINKER_MEGAKERNEL is on.
+    megakernel: ThinkerMegakernel | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1163,6 +1167,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+        if envs.VLLM_OMNI_THINKER_MEGAKERNEL:
+            self.megakernel = ThinkerMegakernel(
+                decode_ctas=envs.VLLM_OMNI_THINKER_MEGAKERNEL_CTAS,
+                prefill=envs.VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL,
+                prefill_ctas=envs.VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS,
+            )
 
     def _get_deepstack_input_embeds(
         self,
@@ -1393,6 +1404,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
+        if self.megakernel is not None:
+            output = self.megakernel.forward(
+                self, inputs_embeds, positions, intermediate_tensors, capture_layer_indices, return_hidden_states
+            )
+            if output is not None:
+                return output
+
         if self.use_deepstack and inputs_embeds is not None and get_pp_group().is_first_rank:
             deepstack_input_embeds = self._get_deepstack_input_embeds(inputs_embeds.size(0))
         else:
@@ -1436,6 +1454,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             weights,
             mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"talker.": None, "code2wav.": None}),
         )
+        if self.megakernel is not None:
+            self.megakernel.load_weights(self)
 
         return loaded_weights
 

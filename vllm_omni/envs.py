@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Environment switches read by vLLM-Omni's model executors.
+
+Each entry is read when its attribute is accessed (`envs.NAME`); a consumer
+reads a switch once, when it is constructed, and keeps the value.
+"""
+
+import os
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    VLLM_OMNI_THINKER_MEGAKERNEL: bool = False
+    VLLM_OMNI_THINKER_MEGAKERNEL_CTAS: int | None = None
+    VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL: bool = False
+    VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS: int | None = None
+
+
+def _ctas(name: str) -> int | None:
+    """A CTA cap: unset or 0 means one CTA per SM."""
+    return int(os.environ.get(name, "0")) or None
+
+
+environment_variables: dict[str, Callable[[], Any]] = {
+    # "1" runs Qwen3-Omni's thinker decode steps (one token, one request) on
+    # the decode megakernel, one launch a step
+    # (model_executor/models/qwen3_omni/megakernel/). Needs the thinker's MoE
+    # on moe_backend triton and an sm_120a GPU.
+    "VLLM_OMNI_THINKER_MEGAKERNEL": lambda: os.environ.get("VLLM_OMNI_THINKER_MEGAKERNEL", "0") == "1",
+    # How many CTAs (SMs) a decode step takes; the rest stay free for the
+    # stages that share the GPU. Unset or 0: every SM.
+    "VLLM_OMNI_THINKER_MEGAKERNEL_CTAS": lambda: _ctas("VLLM_OMNI_THINKER_MEGAKERNEL_CTAS"),
+    # With VLLM_OMNI_THINKER_MEGAKERNEL=1, "1" also runs one request's prompt
+    # chunks of 2 to 64 tokens on the prefill megakernel, one launch a chunk.
+    "VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL": lambda: os.environ.get("VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL", "0") == "1",
+    # How many CTAs (SMs) a prefill chunk takes. Unset or 0: every SM.
+    "VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS": lambda: _ctas("VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS"),
+}
+
+
+def __getattr__(name: str):
+    if name in environment_variables:
+        return environment_variables[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(environment_variables.keys())
