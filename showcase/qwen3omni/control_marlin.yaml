@@ -1,0 +1,87 @@
+# Copyright 2026 Fractalyze Inc. All rights reserved.
+#
+# Copied from fractalyze/decode-mk@8f0b255419113d3c3c137747f4c9e4878973411b control/qwen3omni/control_marlin.yaml.
+#
+# Qwen3-Omni-30B-A3B (AWQ-4bit) speech on one RTX 5090, with the thinker's MoE
+# on Marlin instead of triton. Served stock, identical greedy requests can
+# give different text: the Marlin MoE's split-K reduction order follows an
+# atomic row order.
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # The talker takes one thinker token per frame while the thinker runs,
+      # so each frame the first chunk waits for is one thinker token.
+      initial_codec_chunk_frames: 1
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.655
+    moe_backend: marlin
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.225
+    moe_backend: triton
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      seed: 42
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.04
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.1
+
+platforms:
+  cuda:
+    stages:
+      # vLLM captures CUDA graphs only up to 4 tokens for max_num_seqs 2, so a
+      # prompt's prefill ran eagerly, bound by launching ~550 kernels. Up to
+      # 64 tokens covers a short prompt's prefill in both stages. Must sit
+      # here: this block replaces a stage-level compilation_config.
+      - stage_id: 0
+        compilation_config:
+          custom_ops: ["+rotary_embedding"]
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 48, 64]
+      - stage_id: 1
+        compilation_config:
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 48, 64]
