@@ -303,7 +303,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         from vllm_omni.model_executor.models.qwen3_omni.serving import frame0
 
         if frame0.serves(self):
-            self.talker_frame0 = frame0.TalkerFrame0()
+            self.talker_frame0 = frame0.TalkerFrame0.with_listeners()
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)

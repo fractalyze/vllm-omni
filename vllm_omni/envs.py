@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     VLLM_OMNI_EARLY_CHUNK: bool = False
     VLLM_OMNI_TALKER_PREP: bool = False
     VLLM_OMNI_FAST_POLL: bool = False
+    VLLM_OMNI_FRAME0_AUDIO: bool = False
+    VLLM_OMNI_QWEN3_OMNI_RUN_DIR: str | None = None
 
 
 def _ctas(name: str) -> int | None:
@@ -88,6 +90,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # empty passes, and the engine loop waits on the commit instead of
     # sleeping.
     "VLLM_OMNI_FAST_POLL": lambda: os.environ.get("VLLM_OMNI_FAST_POLL", "0") == "1",
+    # With VLLM_OMNI_FRAME0=1, "1" decodes each Qwen3-Omni request's frame 0
+    # in the talker's process, on code2wav's weights shared over CUDA IPC,
+    # and sends that first audio chunk straight to the API
+    # (model_executor/models/qwen3_omni/serving/frame0_audio.py).
+    "VLLM_OMNI_FRAME0_AUDIO": lambda: os.environ.get("VLLM_OMNI_FRAME0_AUDIO", "0") == "1",
+    # The directory one Qwen3-Omni server's stages and API share for
+    # VLLM_OMNI_FRAME0_AUDIO and VLLM_OMNI_THINKER_YIELD. Unset: one per user
+    # under the system temp directory, so servers sharing a host need one each.
+    "VLLM_OMNI_QWEN3_OMNI_RUN_DIR": lambda: os.environ.get("VLLM_OMNI_QWEN3_OMNI_RUN_DIR") or None,
 }
 
 

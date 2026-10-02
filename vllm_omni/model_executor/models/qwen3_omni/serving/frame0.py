@@ -35,6 +35,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 
+from vllm_omni import envs
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -88,6 +89,17 @@ class TalkerFrame0:
         self._state: dict[str, Any] = {}
         self.listeners: list[Frame0Listener] = []
         self._logged = False
+
+    @classmethod
+    def with_listeners(cls) -> TalkerFrame0:
+        """A TalkerFrame0 with the listeners the switches turn on, in the
+        order they must run."""
+        frame0 = cls()
+        if envs.VLLM_OMNI_FRAME0_AUDIO:
+            from vllm_omni.model_executor.models.qwen3_omni.serving.frame0_audio import Frame0AudioSender
+
+            frame0.listeners.append(Frame0AudioSender())
+        return frame0
 
     def _live_state(self, runner) -> dict[str, Any]:
         for req_id in [r for r in self._state if r not in runner.requests]:

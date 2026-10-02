@@ -15,7 +15,7 @@ import asyncio
 import os
 import time
 from collections.abc import AsyncGenerator, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
@@ -23,6 +23,7 @@ from vllm.plugins.io_processors import get_io_processor
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni import envs
 from vllm_omni.diffusion.data import OmniACK
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.omni_base import (
@@ -31,6 +32,9 @@ from vllm_omni.entrypoints.omni_base import (
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.qwen3_omni.serving.frame0_audio import Frame0AudioReceiver
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -105,6 +109,10 @@ class AsyncEventResolver:
 
 class AsyncOmniBase(OmniBase):
     """Shared asyncio foundation of the async entrypoints (see module docstring)."""
+
+    # Qwen3-Omni with VLLM_OMNI_FRAME0_AUDIO: the talker's chunk 0, received
+    # beside code2wav's.
+    _frame0_audio: Frame0AudioReceiver | None = None
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
@@ -427,6 +435,23 @@ class AsyncOmniBase(OmniBase):
 
         self.final_output_task = asyncio.create_task(_final_output_loop())
         logger.debug("[AsyncOmni] Final output handler started")
+        if envs.VLLM_OMNI_FRAME0_AUDIO and self._frame0_audio is None:
+            from vllm_omni.model_executor.models.qwen3_omni.serving.frame0_audio import Frame0AudioReceiver
+
+            self._frame0_audio = Frame0AudioReceiver(self.request_states)
+            self._frame0_audio.start()
+
+    def _handle_output_message(self, msg):
+        """OmniBase's handling; with VLLM_OMNI_FRAME0_AUDIO, code2wav's
+        chunk 0 is skipped when the talker's reached the request first."""
+        result = super()._handle_output_message(msg)
+        receiver = self._frame0_audio
+        if receiver is None:
+            return result
+        should_continue, _, stage_id, _ = result
+        if should_continue or stage_id != receiver.stage_id or receiver.keep_stage_output(msg):
+            return result
+        return True, None, None, None
 
     async def _abort_internal_requests(
         self,

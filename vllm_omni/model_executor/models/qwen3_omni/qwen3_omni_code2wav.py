@@ -32,6 +32,7 @@ from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.model_executor.models.qwen3_omni.serving import frame0_audio
 
 logger = init_logger(__name__)
 
@@ -396,4 +397,6 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         except Exception:
             logger.error("Error logging model load summary")
 
+        if envs.VLLM_OMNI_FRAME0_AUDIO:
+            frame0_audio.export_code2wav(self)
         return loaded
