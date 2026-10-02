@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_CODE2WAV_STREAM_GRAPHS: bool = False
     VLLM_OMNI_CODE2WAV_COMPILE: bool = False
     VLLM_OMNI_FRAME0: bool = False
+    VLLM_OMNI_EARLY_CHUNK: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -72,6 +73,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill step instead of after its first decode step
     # (model_executor/models/qwen3_omni/serving/frame0.py).
     "VLLM_OMNI_FRAME0": lambda: os.environ.get("VLLM_OMNI_FRAME0", "0") == "1",
+    # "1" sends the Qwen3-Omni talker its prefill input (chunk 0) as soon as
+    # the thinker samples a text prompt's first token, one thinker step sooner
+    # (stage_input_processors/qwen3_omni.py).
+    "VLLM_OMNI_EARLY_CHUNK": lambda: os.environ.get("VLLM_OMNI_EARLY_CHUNK", "0") == "1",
 }
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni import envs
 from vllm_omni.data_entry_keys import (
     CodesStruct,
     EmbeddingsStruct,
@@ -23,6 +24,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.qwen3_omni.serving import thinker_embedding
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
     extract_language_from_request,
@@ -379,7 +381,123 @@ def thinker2talker_async_chunk(
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
     """
+    if envs.VLLM_OMNI_EARLY_CHUNK:
+        return _thinker2talker_early_chunk(transfer_manager, multimodal_output, request, is_finished)
+    return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
 
+
+def _captured_layer(layers: Mapping[Any, Any], index: int) -> tuple[Any, torch.Tensor | None]:
+    """(key, tensor) of a captured thinker layer, keyed by int or by str."""
+    for key in (index, str(index)):
+        if layers.get(key) is not None:
+            return key, layers[key]
+    return None, None
+
+
+def _early_chunk_requests(transfer_manager: Any) -> set[str]:
+    """Requests whose chunk 0 went out with the first token's embedding."""
+    requests = getattr(transfer_manager, "_qwen3_omni_early_chunk_requests", None)
+    if requests is None:
+        requests = transfer_manager._qwen3_omni_early_chunk_requests = set()
+    return requests
+
+
+def _early_chunk_stream(transfer_manager: Any, device: torch.device) -> torch.cuda.Stream | None:
+    """A side stream on the thinker's device for the first token's lookup;
+    None (the current stream) off CUDA."""
+    if device.type != "cuda":
+        return None
+    stream = getattr(transfer_manager, "_qwen3_omni_early_chunk_stream", None)
+    if stream is None:
+        stream = transfer_manager._qwen3_omni_early_chunk_stream = torch.cuda.Stream(device=device)
+    return stream
+
+
+def _thinker2talker_early_chunk(
+    transfer_manager: Any,
+    multimodal_output: OmniPayload | dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool,
+) -> OmniPayloadStruct | None:
+    """VLLM_OMNI_EARLY_CHUNK: chunk 0 goes out at the thinker's first token
+    instead of a thinker decode step later.
+
+    The talker's prefill needs the prompt and the reply's first text token.
+    The stock path holds the prompt rows until the next thinker step captures
+    that token's rows. For a text prompt the talker reads only thinker
+    embeddings (the token's accept-layer hidden state feeds multimodal user
+    parts alone), and the token's embedding is a table lookup, available once
+    it is sampled. So when the prefill step's output already holds the first
+    token, chunk 0 goes out at once with that token's embedding and a zero
+    hidden row, and the next step's chunk, which carries the same token
+    again, is dropped unless it ends the request. A prompt with audio, image
+    or video keeps the stock path: its talker input needs hidden states.
+    """
+    request_id = request.external_req_id
+    chunk_id = transfer_manager.put_req_chunk[request_id]
+    early_requests = _early_chunk_requests(transfer_manager)
+    if chunk_id == 1 and request_id in early_requests:
+        early_requests.discard(request_id)
+        if not is_finished:
+            # This step's rows are the first token's, already sent.
+            return None
+    thinker = thinker_embedding.registered()
+    if (
+        chunk_id != 0
+        or thinker is None
+        or getattr(request, "mm_features", None)
+        or transfer_manager.request_payload.get(request_id) is not None
+        or not isinstance(multimodal_output, dict)
+    ):
+        return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
+    prompt = list(request.prompt_token_ids)
+    tokens = list(request.all_token_ids)
+    states = multimodal_output.get("hidden_states")
+    if not isinstance(states, dict):
+        return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
+    layers = states.get("layers", {})
+    embed_key, embedding = _captured_layer(layers, _get_embedding_layer_index())
+    hidden_key, hidden = _captured_layer(layers, _get_accept_hidden_layer_index(transfer_manager))
+    if len(tokens) != len(prompt) + 1 or embedding is None or hidden is None or embedding.shape[0] != len(prompt):
+        return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
+
+    # The captured rows reach this thread on the host; the table is on the
+    # thinker's device. On the thinker's own stream the copy back would wait
+    # out the decode step already queued behind the prefill: the step this
+    # saves. A failure must leave chunk 0 to the stock path: the adapter drops
+    # a processor that raises, and with it the prompt rows the talker needs.
+    try:
+        with torch.cuda.stream(_early_chunk_stream(transfer_manager, thinker.device)):
+            first = torch.tensor([tokens[-1]], device=thinker.device)
+            first_embedding = thinker.embed_input_ids(first).to(embedding.device, embedding.dtype)
+        first_embedding = first_embedding.view(1, -1)
+    except Exception:
+        logger.exception("VLLM_OMNI_EARLY_CHUNK: the first token's embedding failed")
+        return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
+    extended_layers = dict(layers)
+    extended_layers[embed_key] = torch.cat((embedding, first_embedding))
+    extended_layers[hidden_key] = torch.cat((hidden, hidden.new_zeros(1, hidden.shape[1])))
+    extended = dict(multimodal_output)
+    extended["hidden_states"] = dict(states, layers=extended_layers)
+    # With an empty saved payload and more rows than the prompt, the stock
+    # path sends chunk 0 now instead of saving it.
+    transfer_manager.request_payload[request_id] = {
+        "embed": {"prefill": embedding[:0].detach().cpu()},
+        "hidden_states": {"output": hidden[:0].detach().cpu()},
+    }
+    payload = _thinker2talker_chunk(transfer_manager, extended, request, is_finished)
+    if payload is not None:
+        early_requests.add(request_id)
+        logger.debug("VLLM_OMNI_EARLY_CHUNK: chunk 0 of %s sent with the first token", request_id)
+    return payload
+
+
+def _thinker2talker_chunk(
+    transfer_manager: Any,
+    multimodal_output: OmniPayload | dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
     if not isinstance(multimodal_output, Mapping):
