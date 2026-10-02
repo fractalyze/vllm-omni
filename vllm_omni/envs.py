@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_CODE2WAV_COMPILE: bool = False
     VLLM_OMNI_FRAME0: bool = False
     VLLM_OMNI_EARLY_CHUNK: bool = False
+    VLLM_OMNI_TALKER_PREP: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -77,6 +78,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the thinker samples a text prompt's first token, one thinker step sooner
     # (stage_input_processors/qwen3_omni.py).
     "VLLM_OMNI_EARLY_CHUNK": lambda: os.environ.get("VLLM_OMNI_EARLY_CHUNK", "0") == "1",
+    # "1" builds the Qwen3-Omni talker's prefill input from a text-only
+    # prompt with its chat parts cut on the host, without GPU syncs; the input
+    # is the same.
+    "VLLM_OMNI_TALKER_PREP": lambda: os.environ.get("VLLM_OMNI_TALKER_PREP", "0") == "1",
 }
 
 

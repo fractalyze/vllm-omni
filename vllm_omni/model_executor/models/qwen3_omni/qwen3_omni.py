@@ -90,6 +90,14 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def chat_segments(prompt_ids: list[int], total: int, im_start: int) -> list[tuple[int, int, int]]:
+    """(start, end, role token) of each chat part: from each <|im_start|> in
+    the prompt to the next, the last running to `total` (the prompt and the
+    reply so far)."""
+    starts = [i for i, token in enumerate(prompt_ids) if token == im_start] + [total]
+    return [(start, end, prompt_ids[start + 1]) for start, end in zip(starts, starts[1:])]
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -131,6 +139,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         }
     )
     packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
+    # VLLM_OMNI_TALKER_PREP, read when the talker stage is built.
+    _host_talker_prep = False
 
     def _maybe_apply_model_mapping(self) -> None:
         apply_outer_quant_config_mapping(self)
@@ -208,6 +218,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # The outer wrapper exposes talker_mtp for every stage, but only
             # the talker stage owns the module that the method invokes.
             self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
+            self._host_talker_prep = envs.VLLM_OMNI_TALKER_PREP
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
@@ -1024,6 +1035,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
+        if self._host_talker_prep:
+            prefill = self._text_prompt_to_talker_prefill(
+                thinker_embed,
+                thinker_hidden,
+                input_ids,
+                thinker_result_ids,
+                speaker_id,
+                tts_bos_thinker,
+                tts_eos_thinker,
+                tts_pad_thinker,
+            )
+            if prefill is not None:
+                return prefill
         target_len = thinker_result_ids.shape[-1]
         im_start_indexes = torch.cat(
             (
@@ -1088,6 +1112,67 @@ class Qwen3OmniMoeForConditionalGeneration(
         talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
 
         return talker_input_id, talker_input_embed, trailing_text_hidden_all
+
+    def _text_prompt_to_talker_prefill(
+        self,
+        thinker_embed: torch.Tensor,
+        thinker_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        thinker_result_ids: torch.Tensor,
+        speaker_id,
+        tts_bos_thinker: torch.Tensor | None,
+        tts_eos_thinker: torch.Tensor | None,
+        tts_pad_thinker: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+        """VLLM_OMNI_TALKER_PREP: _thinker_to_talker_prefill's result for a
+        prompt with no audio, image or video token, with the chat parts cut
+        from the token ids on the host; None for any other prompt.
+
+        The GPU path finds the cuts with a nonzero, an .item() per part and
+        per role check and an .any() per user part: a dozen host syncs before
+        the talker's prefill forward. Here the host copies the prompt and the
+        ids once each, and every part is projected by the same calls on the
+        same rows, so the input is the same.
+        """
+        result_ids = thinker_result_ids.view(-1).tolist()
+        thinker = self.thinker_config
+        if {thinker.audio_token_id, thinker.image_token_id, thinker.video_token_id} & set(result_ids):
+            return None
+        config = self.config
+        parts = chat_segments(input_ids[0].tolist(), len(result_ids), config.im_start_token_id)
+        roles = (config.system_token_id, config.user_token_id, config.assistant_token_id)
+        if any(role not in roles for _, _, role in parts):
+            return None
+
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self._get_tts_embed(
+            thinker_embed, tts_bos_thinker, tts_eos_thinker, tts_pad_thinker
+        )
+        device = input_ids.device
+        hidden_size = config.talker_config.text_config.hidden_size
+        rows = min(len(result_ids), thinker_hidden.shape[0], thinker_embed.shape[0])
+        embeds: list[torch.Tensor] = []
+        ids: list[torch.Tensor] = []
+        trailing = None
+        for i, (start, end, role) in enumerate(parts):
+            if role == config.user_token_id:
+                stop = min(end, rows)
+                if stop > start:
+                    part = self.talker.text_projection(thinker_embed[start:stop]).to(device)
+                else:
+                    part = torch.empty((0, hidden_size), device=device, dtype=torch.bfloat16)
+                embeds.append(part)
+                ids.append(thinker_result_ids[start:end])
+            elif role == config.assistant_token_id and i == len(parts) - 1:
+                part, part_ids, trailing = self._get_talker_assistant_parts(
+                    start, end, speaker_id, thinker_embed, tts_pad_embed, tts_bos_embed, tts_eos_embed
+                )
+                embeds.append(part)
+                ids.append(part_ids)
+        return (
+            torch.cat([t.to(device) for t in ids], dim=0),
+            torch.cat([t.to(device) for t in embeds], dim=0),
+            trailing,
+        )
 
     def _thinker_decode_to_talker_decode(
         self,
