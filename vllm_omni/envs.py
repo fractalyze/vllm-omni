@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_DETERMINISTIC_MARLIN: bool = False
     VLLM_OMNI_CODE2WAV_STREAM_GRAPHS: bool = False
     VLLM_OMNI_CODE2WAV_COMPILE: bool = False
+    VLLM_OMNI_FRAME0: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -67,6 +68,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (with a CUDA graph) instead of a plain CUDA graph. Inductor's kernels
     # differ from eager ones, so the first chunk's samples change slightly.
     "VLLM_OMNI_CODE2WAV_COMPILE": lambda: os.environ.get("VLLM_OMNI_CODE2WAV_COMPILE", "0") == "1",
+    # "1" ships each Qwen3-Omni talker request's first audio frame with its
+    # prefill step instead of after its first decode step
+    # (model_executor/models/qwen3_omni/serving/frame0.py).
+    "VLLM_OMNI_FRAME0": lambda: os.environ.get("VLLM_OMNI_FRAME0", "0") == "1",
 }
 
 

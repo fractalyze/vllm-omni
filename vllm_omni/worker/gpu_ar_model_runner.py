@@ -2067,6 +2067,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sample_hidden_states=sample_hidden_states,
             multimodal_outputs=multimodal_outputs,
         )
+        if self.talker_frame0 is not None:
+            multimodal_outputs = self.talker_frame0.ship_with_prefill(
+                self,
+                req_ids=req_ids_output_copy,
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                sample_hidden_states=sample_hidden_states,
+                multimodal_outputs=multimodal_outputs,
+            )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
