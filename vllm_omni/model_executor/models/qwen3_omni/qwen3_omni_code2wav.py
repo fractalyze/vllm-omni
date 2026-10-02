@@ -27,12 +27,36 @@ from vllm.model_executor.models.utils import (  # type: ignore
     WeightsMapper,
 )
 
+from vllm_omni import envs
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
 
 logger = init_logger(__name__)
+
+# The frames a one-frame first chunk pads to: the smallest graph size.
+FIRST_CHUNK_FRAMES = 2
+
+# The largest streaming decode when no chunking config bounds it.
+_STREAMING_MAX_FRAMES = 64
+
+
+def streaming_capture_sizes(codec_chunk_frames: int, codec_left_context_frames: int) -> list[int]:
+    """Frame counts a streaming decode needs graphs for: powers of two up to
+    the largest one (a chunk with its left context), and the chunk with and
+    without its left context.
+
+    Streaming (async_chunk) decodes at most a chunk plus its left context, so
+    the non-streaming sizes the wrapper captures by default (up to 325
+    frames, more memory than the one-GPU deploy leaves code2wav) are never
+    replayed. A larger decode still runs, eagerly, as it does past the
+    wrapper's largest graph.
+    """
+    largest = codec_chunk_frames + codec_left_context_frames or _STREAMING_MAX_FRAMES
+    sizes = {size for size in (2**i for i in range(1, 12)) if size <= largest}
+    sizes.update(size for size in (codec_chunk_frames, largest) if size > 0)
+    return sorted(sizes)
 
 
 class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
@@ -154,8 +178,14 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
             return
 
+        # VLLM_OMNI_CODE2WAV_STREAM_GRAPHS: graphs only at streaming sizes.
+        capture_sizes = None
+        if envs.VLLM_OMNI_CODE2WAV_STREAM_GRAPHS:
+            capture_sizes = streaming_capture_sizes(codec_chunk_frames, codec_left_context_frames)
         wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
+            capture_sizes=capture_sizes,
+            compile_shapes=self.first_chunk_compile_shapes(),
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
@@ -177,6 +207,18 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             self.config.num_quantizers,
             self._cudagraph_wrapper.capture_sizes,
         )
+
+    @staticmethod
+    def first_chunk_compile_shapes() -> list[tuple[int, int]] | None:
+        """With VLLM_OMNI_CODE2WAV_COMPILE=1, the (batch, frames) of a first
+        chunk, for the graph wrapper to decode on torch.compile.
+
+        A one-frame first chunk is many small kernels (the pre-transformer's
+        norms and rotary embeddings, the convolutions); Inductor fuses them.
+        The chunk sits on the path to the first audio, while later chunks
+        have their predecessor's audio to hide behind and keep plain graphs.
+        """
+        return [(1, FIRST_CHUNK_FRAMES)] if envs.VLLM_OMNI_CODE2WAV_COMPILE else None
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         """
