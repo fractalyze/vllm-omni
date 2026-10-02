@@ -3,6 +3,8 @@
 Qwen3-Omni-30B-A3B (AWQ-4bit) speech output on one RTX 5090, served by stock
 vLLM-Omni from this branch. `control_marlin.yaml` is the deploy config: three
 stages (thinker, talker, code2wav) on GPU 0, with the thinker's MoE on Marlin.
+[measurements.md](measurements.md) compares the kernel arm with stock
+vLLM-Omni and the deterministic Marlin arm.
 
 ## Install
 
