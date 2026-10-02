@@ -12,6 +12,8 @@ into these modules only when their switch is on:
   prefill step;
 - frame0_audio.py (VLLM_OMNI_FRAME0_AUDIO): the talker decodes that frame on
   code2wav's weights and sends the first audio chunk straight to the API;
+- thinker_yield.py (VLLM_OMNI_THINKER_YIELD): the thinker's decode waits while
+  the talker makes a request's first frame;
 - thinker_embedding.py: the thinker stage's embedding lookup, which
   VLLM_OMNI_EARLY_CHUNK uses to send the talker its prefill input at the
   thinker's first token.

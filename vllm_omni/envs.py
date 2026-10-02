@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_FAST_POLL: bool = False
     VLLM_OMNI_FRAME0_AUDIO: bool = False
     VLLM_OMNI_QWEN3_OMNI_RUN_DIR: str | None = None
+    VLLM_OMNI_THINKER_YIELD: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -99,6 +100,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_OMNI_FRAME0_AUDIO and VLLM_OMNI_THINKER_YIELD. Unset: one per user
     # under the system temp directory, so servers sharing a host need one each.
     "VLLM_OMNI_QWEN3_OMNI_RUN_DIR": lambda: os.environ.get("VLLM_OMNI_QWEN3_OMNI_RUN_DIR") or None,
+    # With VLLM_OMNI_FRAME0=1, "1" holds the Qwen3-Omni thinker's decode,
+    # after a request's first decode step, until the talker has shipped that
+    # request's frame 0 or HOLD_S has passed
+    # (model_executor/models/qwen3_omni/serving/thinker_yield.py).
+    "VLLM_OMNI_THINKER_YIELD": lambda: os.environ.get("VLLM_OMNI_THINKER_YIELD", "0") == "1",
 }
 
 

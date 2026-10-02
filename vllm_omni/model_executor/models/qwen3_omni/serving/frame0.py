@@ -99,6 +99,11 @@ class TalkerFrame0:
             from vllm_omni.model_executor.models.qwen3_omni.serving.frame0_audio import Frame0AudioSender
 
             frame0.listeners.append(Frame0AudioSender())
+        if envs.VLLM_OMNI_THINKER_YIELD:
+            from vllm_omni.model_executor.models.qwen3_omni.serving.thinker_yield import FrameShippedCounter
+
+            # Last: the thinker resumes once frame 0's audio is on its way.
+            frame0.listeners.append(FrameShippedCounter())
         return frame0
 
     def _live_state(self, runner) -> dict[str, Any]:
