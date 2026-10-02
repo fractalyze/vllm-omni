@@ -5,6 +5,8 @@ vLLM-Omni from this branch. `control_marlin.yaml` is the deploy config: three
 stages (thinker, talker, code2wav) on GPU 0, with the thinker's MoE on Marlin.
 [measurements.md](measurements.md) compares the kernel arm with stock
 vLLM-Omni and the deterministic Marlin arm.
+[huggingface/README.md](huggingface/README.md) is the Hugging Face model
+card for these results.
 
 ## Install
 
