@@ -1,6 +1,6 @@
 # Copyright 2026 Fractalyze Inc. All rights reserved.
 #
-# Copied from fractalyze/decode-mk@8f0b255419113d3c3c137747f4c9e4878973411b control/qwen3omni/control_marlin.yaml.
+# Settings copied from fractalyze/decode-mk@8f0b255419113d3c3c137747f4c9e4878973411b control/qwen3omni/control_marlin.yaml.
 #
 # Qwen3-Omni-30B-A3B (AWQ-4bit) speech on one RTX 5090, with the thinker's MoE
 # on Marlin instead of triton. Served stock, identical greedy requests can
@@ -13,8 +13,8 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      # The talker takes one thinker token per frame while the thinker runs,
-      # so each frame the first chunk waits for is one thinker token.
+      # The first audio chunk is emitted after one codec frame instead of the
+      # stock four, so speech starts sooner.
       initial_codec_chunk_frames: 1
       codec_chunk_frames: 25
       codec_left_context_frames: 25
@@ -74,10 +74,10 @@ stages:
 platforms:
   cuda:
     stages:
-      # vLLM captures CUDA graphs only up to 4 tokens for max_num_seqs 2, so a
-      # prompt's prefill ran eagerly, bound by launching ~550 kernels. Up to
-      # 64 tokens covers a short prompt's prefill in both stages. Must sit
-      # here: this block replaces a stage-level compilation_config.
+      # For max_num_seqs 2, vLLM captures CUDA graphs only up to 4 tokens, so a
+      # prompt's prefill runs eagerly. Capturing up to 64 tokens covers a short
+      # prompt's prefill in both stages. Must sit here: this block replaces a
+      # stage-level compilation_config.
       - stage_id: 0
         compilation_config:
           custom_ops: ["+rotary_embedding"]
