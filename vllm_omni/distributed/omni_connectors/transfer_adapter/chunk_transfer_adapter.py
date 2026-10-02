@@ -186,6 +186,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.chunk_landed = threading.Event()
         if self.fast_poll:
             self._empty_pass_wait_s = _FAST_POLL_EMPTY_PASS_WAIT_S
+        # VLLM_OMNI_TALKER_PREPREFILL: received pre chunks by request, until
+        # the compact chunk that follows each is rebuilt from it.
+        self._pre_chunks: dict[str, dict] | None = {} if envs.VLLM_OMNI_TALKER_PREPREFILL else None
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -568,6 +571,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> bool:
         """Commit a received connector chunk while receiver state is locked."""
         payload_data, size = result
+        if self._pre_chunks is not None:
+            from vllm_omni.model_executor.models.qwen3_omni.serving import talker_preprefill
+
+            talker_preprefill.merge_received(self._pre_chunks, req_id, payload_data)
 
         if payload_data:
             # Update connector state

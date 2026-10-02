@@ -3707,3 +3707,24 @@ def test_fast_poll_signals_each_committed_chunk(monkeypatch, build_adapter):
     assert adapter._empty_pass_wait_s == 0.0001
     assert _commit_ar_chunk(adapter)
     assert adapter.chunk_landed.is_set()
+
+
+def test_preprefill_rebuilds_the_compact_chunk_on_receipt(monkeypatch, build_adapter):
+    monkeypatch.setenv("VLLM_OMNI_TALKER_PREPREFILL", "1")
+    adapter, _ = build_adapter()
+    request = _req("pre", RequestStatus.WAITING)
+    pre = {
+        "meta": {},
+        "embed": {"prefill": torch.ones(2, 3)},
+        "hidden_states": {"output": torch.zeros(2, 3)},
+        "ids": {"prompt": [1, 2], "all": [1, 2]},
+    }
+    compact = {"meta": {}, "hidden_states": {"layers": {0: torch.full((1, 3), 5.0)}}, "ids": {"all": [1, 2, 7]}}
+
+    for chunk_id, payload in enumerate((pre, compact)):
+        adapter._commit_received_chunk(
+            request, (payload, 1), stage_id=1, req_id="pre", chunk_id=chunk_id, connector_get_key=f"pre_{chunk_id}"
+        )
+
+    assert compact["embed"]["prefill"].tolist() == [[1.0] * 3, [1.0] * 3, [5.0] * 3]
+    assert compact["hidden_states"]["output"].shape == (3, 3)

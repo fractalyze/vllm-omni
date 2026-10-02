@@ -24,7 +24,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.qwen3_omni.serving import thinker_embedding
+from vllm_omni.model_executor.models.qwen3_omni.serving import talker_preprefill, thinker_embedding
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
     extract_language_from_request,
@@ -381,9 +381,56 @@ def thinker2talker_async_chunk(
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
     """
+    if envs.VLLM_OMNI_TALKER_PREPREFILL:
+        return _thinker2talker_preprefill_chunk(transfer_manager, multimodal_output, request, is_finished)
     if envs.VLLM_OMNI_EARLY_CHUNK:
         return _thinker2talker_early_chunk(transfer_manager, multimodal_output, request, is_finished)
     return _thinker2talker_chunk(transfer_manager, multimodal_output, request, is_finished)
+
+
+def _thinker2talker_preprefill_chunk(
+    transfer_manager: Any,
+    multimodal_output: OmniPayload | dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool,
+) -> OmniPayloadStruct | None:
+    """VLLM_OMNI_TALKER_PREPREFILL: turns the thinker scheduler's pre chunk
+    into the talker payload chunk 0 would carry, without the reply's rows
+    (qwen3_omni/serving/talker_preprefill.py).
+
+    Every later chunk goes to the processors behind as if the pre chunk had
+    not been sent, so the early chunk still goes out as their chunk 0, and
+    that chunk drops the prompt rows the talker already holds.
+    """
+    request_id = request.external_req_id
+    pre = multimodal_output.get(talker_preprefill.PRE_CHUNK_KEY) if isinstance(multimodal_output, Mapping) else None
+    if pre is not None:
+        prefill, (tts_bos, tts_eos, tts_pad) = pre
+        prompt = list(request.prompt_token_ids)
+        return OmniPayloadStruct(
+            embed=EmbeddingsStruct(prefill=prefill, tts_bos=tts_bos, tts_eos=tts_eos, tts_pad=tts_pad),
+            hidden_states=HiddenStatesStruct(output=prefill.new_zeros(prefill.shape)),
+            ids=IdsStruct(all=prompt, prompt=prompt),
+            meta=MetaStruct(finished=torch.tensor(False)),
+            speaker=extract_speaker_from_request(request),
+            language=extract_language_from_request(request),
+        )
+    inner = _thinker2talker_early_chunk if envs.VLLM_OMNI_EARLY_CHUNK else _thinker2talker_chunk
+    pre_sent = talker_preprefill.pre_chunk_requests(transfer_manager)
+    if request_id not in pre_sent:
+        return inner(transfer_manager, multimodal_output, request, is_finished)
+    # The processors behind count chunks without the pre chunk.
+    first = transfer_manager.put_req_chunk[request_id] == 1
+    transfer_manager.put_req_chunk[request_id] -= 1
+    try:
+        payload = inner(transfer_manager, multimodal_output, request, is_finished)
+    finally:
+        transfer_manager.put_req_chunk[request_id] += 1
+        if is_finished:
+            pre_sent.discard(request_id)
+    if first and payload is not None:
+        payload = talker_preprefill.compact(payload, HiddenStatesStruct, OmniPayloadStruct)
+    return payload
 
 
 def _captured_layer(layers: Mapping[Any, Any], index: int) -> tuple[Any, torch.Tensor | None]:

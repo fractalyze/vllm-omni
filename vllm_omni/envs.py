@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_FRAME0_AUDIO: bool = False
     VLLM_OMNI_QWEN3_OMNI_RUN_DIR: str | None = None
     VLLM_OMNI_THINKER_YIELD: bool = False
+    VLLM_OMNI_TALKER_PREPREFILL: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -105,6 +106,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request's frame 0 or HOLD_S has passed
     # (model_executor/models/qwen3_omni/serving/thinker_yield.py).
     "VLLM_OMNI_THINKER_YIELD": lambda: os.environ.get("VLLM_OMNI_THINKER_YIELD", "0") == "1",
+    # With VLLM_OMNI_EARLY_CHUNK=1, "1" prefills all but the last position of
+    # a text prompt's Qwen3-Omni talker prompt while the thinker prefills, so
+    # only the last position waits for the thinker's first token
+    # (model_executor/models/qwen3_omni/serving/talker_preprefill.py).
+    "VLLM_OMNI_TALKER_PREPREFILL": lambda: os.environ.get("VLLM_OMNI_TALKER_PREPREFILL", "0") == "1",
 }
 
 

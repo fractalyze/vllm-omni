@@ -61,7 +61,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
-from vllm_omni.model_executor.models.qwen3_omni.serving import thinker_embedding
+from vllm_omni.model_executor.models.qwen3_omni.serving import talker_preprefill, thinker_embedding
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.platforms import current_omni_platform
 
@@ -139,8 +139,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         }
     )
     packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
-    # VLLM_OMNI_TALKER_PREP, read when the talker stage is built.
+    # VLLM_OMNI_TALKER_PREP and VLLM_OMNI_TALKER_PREPREFILL, read when the
+    # talker stage is built.
     _host_talker_prep = False
+    _talker_preprefill = False
 
     def _maybe_apply_model_mapping(self) -> None:
         apply_outer_quant_config_mapping(self)
@@ -219,6 +221,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # the talker stage owns the module that the method invokes.
             self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
             self._host_talker_prep = envs.VLLM_OMNI_TALKER_PREP
+            self._talker_preprefill = envs.VLLM_OMNI_TALKER_PREPREFILL
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
@@ -877,6 +880,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         return self.tts_bos_embed, self.tts_eos_embed, self.tts_pad_embed
 
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, payload: OmniPayload):
+        if self._talker_preprefill:
+            last_row = self._talker_prefill_last_row(input_embeds, payload)
+            if last_row is not None:
+                return last_row
         hs: HiddenStates = payload.get("hidden_states", {})
         embed: Embeddings = payload.get("embed", {})
         ids: Ids = payload.get("ids", {})
@@ -991,6 +998,48 @@ class Qwen3OmniMoeForConditionalGeneration(
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+
+    def _talker_prefill_last_row(
+        self, input_embeds: torch.Tensor, payload: OmniPayload
+    ) -> tuple[torch.Tensor, torch.Tensor, OmniPayload] | None:
+        """VLLM_OMNI_TALKER_PREPREFILL: the prefill step of a text prompt's
+        last position alone, the step after its pre-prefill.
+
+        The full path rebuilds the whole talker prompt only to keep its last
+        row. For a text prompt that row is the projection of the reply's
+        first token, among the same four assistant rows the full path
+        projects, plus the codec BOS embedding, so only it is computed here;
+        what else the full path returns, the first step already left in the
+        request's buffer. None for any other step.
+        """
+        embed, ids, meta = (payload.get(key) or {} for key in ("embed", "ids", "meta"))
+        prefill, prompt, all_ids = embed.get("prefill"), ids.get("prompt"), ids.get("all")
+        if input_embeds.shape[0] != 1 or prefill is None or prompt is None or all_ids is None:
+            return None
+        prompt, all_ids = list(prompt), list(all_ids)
+        thinker = self.thinker_config
+        if {thinker.audio_token_id, thinker.image_token_id, thinker.video_token_id} & set(all_ids):
+            return None
+        config = self.config
+        rows = min(len(all_ids), prefill.shape[0])
+        part = talker_preprefill.last_row_part(
+            chat_segments(prompt, len(all_ids), config.im_start_token_id),
+            rows,
+            config.user_token_id,
+            config.assistant_token_id,
+            config.system_token_id,
+        )
+        if part is None or meta.get("num_processed_tokens", 0) != part[2] - 1:
+            return None
+        start, end, _ = part
+        device = self._module_device(self.talker)
+        text = self.talker.text_projection(prefill[start:end].to(device=device, dtype=torch.bfloat16)).to(device)
+        bos = torch.tensor([config.talker_config.codec_bos_id], device=device)
+        codec = self.talker.embed_input_ids(bos).to(device=device, dtype=torch.bfloat16)
+        update: OmniPayload = {"meta": {"prefill_consumed_text_tokens": 1}}
+        self._talker_cache_thinker_decode_embeds(embed, update)
+        ids_out = torch.full((1,), config.tts_pad_token_id, dtype=torch.long, device=device)
+        return ids_out, text[talker_preprefill.ASSISTANT_ROWS - 1 :] + codec, update
 
     def _talker_cache_thinker_decode_embeds(
         self,
@@ -1518,7 +1567,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             thinker_loaded = self.thinker.load_weights(thinker_weights)
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
             loaded_weights.update(thinker_loaded)
-            if envs.VLLM_OMNI_EARLY_CHUNK:
+            if envs.VLLM_OMNI_EARLY_CHUNK or envs.VLLM_OMNI_TALKER_PREPREFILL:
                 thinker_embedding.register(self.thinker, self.tts_tokens)
 
         # Load talker weights
