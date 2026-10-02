@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_TALKER_MEGAKERNEL_CTAS: int = 96
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL: bool = False
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS: int | None = None
+    VLLM_OMNI_DETERMINISTIC_MARLIN: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -52,6 +53,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How many CTAs (SMs) a code-predictor launch takes; the rest stay free
     # for code2wav. Unset or 0: every SM.
     "VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS": lambda: _ctas("VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS"),
+    # "1" makes vLLM's Marlin MoE give the same bits across identical
+    # requests: each expert's rows are sorted by row before the prefill's
+    # grouped GEMM (vllm_omni/patch.py). Read once, when vllm_omni is imported.
+    "VLLM_OMNI_DETERMINISTIC_MARLIN": lambda: os.environ.get("VLLM_OMNI_DETERMINISTIC_MARLIN", "0") == "1",
 }
 
 
