@@ -19,6 +19,17 @@ if TYPE_CHECKING:
     VLLM_OMNI_TALKER_MEGAKERNEL_CTAS: int = 96
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL: bool = False
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS: int | None = None
+    VLLM_OMNI_DETERMINISTIC_MARLIN: bool = False
+    VLLM_OMNI_CODE2WAV_STREAM_GRAPHS: bool = False
+    VLLM_OMNI_CODE2WAV_COMPILE: bool = False
+    VLLM_OMNI_FRAME0: bool = False
+    VLLM_OMNI_EARLY_CHUNK: bool = False
+    VLLM_OMNI_TALKER_PREP: bool = False
+    VLLM_OMNI_FAST_POLL: bool = False
+    VLLM_OMNI_FRAME0_AUDIO: bool = False
+    VLLM_OMNI_QWEN3_OMNI_RUN_DIR: str | None = None
+    VLLM_OMNI_THINKER_YIELD: bool = False
+    VLLM_OMNI_TALKER_PREPREFILL: bool = False
 
 
 def _ctas(name: str) -> int | None:
@@ -52,6 +63,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How many CTAs (SMs) a code-predictor launch takes; the rest stay free
     # for code2wav. Unset or 0: every SM.
     "VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS": lambda: _ctas("VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS"),
+    # "1" makes vLLM's Marlin MoE give the same bits across identical
+    # requests: each expert's rows are sorted by row before the prefill's
+    # grouped GEMM (vllm_omni/patch.py). Read once, when vllm_omni is imported.
+    "VLLM_OMNI_DETERMINISTIC_MARLIN": lambda: os.environ.get("VLLM_OMNI_DETERMINISTIC_MARLIN", "0") == "1",
+    # "1" captures Qwen3-Omni code2wav's CUDA graphs only at the frame counts
+    # a streaming (async_chunk) decode uses, instead of every size up to a
+    # non-streaming decode's. Needs the stage's enforce_eager off.
+    "VLLM_OMNI_CODE2WAV_STREAM_GRAPHS": lambda: os.environ.get("VLLM_OMNI_CODE2WAV_STREAM_GRAPHS", "0") == "1",
+    # "1" decodes Qwen3-Omni code2wav's one-frame first chunk on torch.compile
+    # (with a CUDA graph) instead of a plain CUDA graph. Inductor's kernels
+    # differ from eager ones, so the first chunk's samples change slightly.
+    "VLLM_OMNI_CODE2WAV_COMPILE": lambda: os.environ.get("VLLM_OMNI_CODE2WAV_COMPILE", "0") == "1",
+    # "1" ships each Qwen3-Omni talker request's first audio frame with its
+    # prefill step instead of after its first decode step
+    # (model_executor/models/qwen3_omni/serving/frame0.py).
+    "VLLM_OMNI_FRAME0": lambda: os.environ.get("VLLM_OMNI_FRAME0", "0") == "1",
+    # "1" sends the Qwen3-Omni talker its prefill input (chunk 0) as soon as
+    # the thinker samples a text prompt's first token, one thinker step sooner
+    # (stage_input_processors/qwen3_omni.py).
+    "VLLM_OMNI_EARLY_CHUNK": lambda: os.environ.get("VLLM_OMNI_EARLY_CHUNK", "0") == "1",
+    # "1" builds the Qwen3-Omni talker's prefill input from a text-only
+    # prompt with its chat parts cut on the host, without GPU syncs; the input
+    # is the same.
+    "VLLM_OMNI_TALKER_PREP": lambda: os.environ.get("VLLM_OMNI_TALKER_PREP", "0") == "1",
+    # "1" wakes a stage the moment an upstream chunk lands instead of on its
+    # next poll: the chunk adapter's receive thread backs off for less between
+    # empty passes, and the engine loop waits on the commit instead of
+    # sleeping.
+    "VLLM_OMNI_FAST_POLL": lambda: os.environ.get("VLLM_OMNI_FAST_POLL", "0") == "1",
+    # With VLLM_OMNI_FRAME0=1, "1" decodes each Qwen3-Omni request's frame 0
+    # in the talker's process, on code2wav's weights shared over CUDA IPC,
+    # and sends that first audio chunk straight to the API
+    # (model_executor/models/qwen3_omni/serving/frame0_audio.py).
+    "VLLM_OMNI_FRAME0_AUDIO": lambda: os.environ.get("VLLM_OMNI_FRAME0_AUDIO", "0") == "1",
+    # The directory one Qwen3-Omni server's stages and API share for
+    # VLLM_OMNI_FRAME0_AUDIO and VLLM_OMNI_THINKER_YIELD. Unset: one per user
+    # under the system temp directory, so servers sharing a host need one each.
+    "VLLM_OMNI_QWEN3_OMNI_RUN_DIR": lambda: os.environ.get("VLLM_OMNI_QWEN3_OMNI_RUN_DIR") or None,
+    # With VLLM_OMNI_FRAME0=1, "1" holds the Qwen3-Omni thinker's decode,
+    # after a request's first decode step, until the talker has shipped that
+    # request's frame 0 or HOLD_S has passed
+    # (model_executor/models/qwen3_omni/serving/thinker_yield.py).
+    "VLLM_OMNI_THINKER_YIELD": lambda: os.environ.get("VLLM_OMNI_THINKER_YIELD", "0") == "1",
+    # With VLLM_OMNI_EARLY_CHUNK=1, "1" prefills all but the last position of
+    # a text prompt's Qwen3-Omni talker prompt while the thinker prefills, so
+    # only the last position waits for the thinker's first token
+    # (model_executor/models/qwen3_omni/serving/talker_preprefill.py).
+    "VLLM_OMNI_TALKER_PREPREFILL": lambda: os.environ.get("VLLM_OMNI_TALKER_PREPREFILL", "0") == "1",
 }
 
 

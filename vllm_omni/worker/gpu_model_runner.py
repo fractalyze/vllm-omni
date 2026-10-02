@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni import envs
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
@@ -45,6 +46,8 @@ from vllm_omni.platforms import current_omni_platform
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import RoutedExpertsLists
+
+    from vllm_omni.model_executor.models.qwen3_omni.serving.frame0 import TalkerFrame0
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -82,6 +85,9 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 
 class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
+    # Qwen3-Omni's talker with VLLM_OMNI_FRAME0=1: frame 0 ships with the
+    # prefill step.
+    talker_frame0: "TalkerFrame0 | None" = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -289,6 +295,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        self._init_talker_frame0()
+
+    def _init_talker_frame0(self) -> None:
+        if not envs.VLLM_OMNI_FRAME0:
+            return
+        from vllm_omni.model_executor.models.qwen3_omni.serving import frame0
+
+        if frame0.serves(self):
+            self.talker_frame0 = frame0.TalkerFrame0.with_listeners()
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -1938,6 +1953,50 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         inputs_embeds: torch.Tensor,
         start_offsets: list[int] | None = None,
     ) -> None:
+        frame0 = self.talker_frame0
+        rows_with_frame0 = frame0.rows_with_frame0(self, decode_req_ids) if frame0 is not None else []
+        if len(rows_with_frame0) < len(decode_req_ids):
+            if rows_with_frame0:
+                logger.warning(
+                    "VLLM_OMNI_FRAME0: a batch mixes first decode steps with and without a shipped "
+                    "frame 0; the code predictor also runs for those rows"
+                )
+            self._run_talker_mtp(decode_req_ids, inputs_embeds, start_offsets)
+        if frame0 is not None and rows_with_frame0:
+            frame0.feed_first_decode_step(self, decode_req_ids, rows_with_frame0, inputs_embeds, start_offsets)
+
+    def _talker_mtp_row_generator(self, req_id: str, device: torch.device) -> torch.Generator | None:
+        """The request's code-predictor generator: seeded from its
+        tts_local_seed on first use and kept for the request's lifetime, or
+        None without a seed."""
+        sampling_params = getattr(self.requests[req_id], "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+        seed = extra_args.get("tts_local_seed") if isinstance(extra_args, dict) else None
+        if seed is None:
+            return None
+        cache = getattr(self, "_talker_mtp_generators", None)
+        if cache is None:
+            cache = {}
+            self._talker_mtp_generators = cache
+        generator = cache.get(req_id)
+        if generator is None or generator.device != device:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+            cache[req_id] = generator
+        return generator
+
+    def _subtalker_sampling_kwargs(self) -> dict[str, Any]:
+        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
+        if not isinstance(subtalker_params, dict):
+            subtalker_params = {}
+        return {key: subtalker_params.get(key) for key in ("do_sample", "temperature", "top_k", "top_p")}
+
+    def _run_talker_mtp(
+        self,
+        decode_req_ids: list[str],
+        inputs_embeds: torch.Tensor,
+        start_offsets: list[int] | None = None,
+    ) -> None:
         decode_batch_size = len(decode_req_ids)
         if decode_batch_size == 0:
             return
@@ -1961,34 +2020,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
-        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
-        if not isinstance(subtalker_params, dict):
-            subtalker_params = {}
-
-        def _explicit_talker_seed(req_id: str) -> int | None:
-            sampling_params = getattr(self.requests[req_id], "sampling_params", None)
-            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = None
-            if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
-            return int(seed) if seed is not None else None
-
-        def _row_generator(req_id: str) -> torch.Generator | None:
-            seed = _explicit_talker_seed(req_id)
-            if seed is None:
-                return None
-            cache = getattr(self, "_talker_mtp_generators", None)
-            if cache is None:
-                cache = {}
-                self._talker_mtp_generators = cache
-            generator = cache.get(req_id)
-            if generator is None or generator.device != req_input_ids.device:
-                generator = torch.Generator(device=req_input_ids.device)
-                generator.manual_seed(seed)
-                cache[req_id] = generator
-            return generator
-
-        row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        row_generators = [self._talker_mtp_row_generator(req_id, req_input_ids.device) for req_id in decode_req_ids]
         cache = getattr(self, "_talker_mtp_generators", None)
         if cache:
             # Generators live as long as their request; drop finished ones.
@@ -2014,7 +2046,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
                     self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
                     row_offsets = None if start_offsets is None else [start_offsets[row]]
-                    self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
+                    self._run_talker_mtp([req_id], inputs_embeds, row_offsets)
             finally:
                 self.talker_mtp_input_ids.gpu[:decode_batch_size].copy_(saved_input_ids)
                 self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
@@ -2022,12 +2054,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 self.text_step.gpu[:decode_batch_size].copy_(saved_text)
             return
 
-        talker_kwargs = {
-            "do_sample": subtalker_params.get("do_sample"),
-            "temperature": subtalker_params.get("temperature"),
-            "top_k": subtalker_params.get("top_k"),
-            "top_p": subtalker_params.get("top_p"),
-        }
+        talker_kwargs = self._subtalker_sampling_kwargs()
         if decode_batch_size == 1:
             if row_generators[0] is not None:
                 talker_kwargs["generator"] = row_generators[0]

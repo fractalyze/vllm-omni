@@ -22,6 +22,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni import envs
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -100,9 +101,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_running_reqs: int
+    # VLLM_OMNI_TALKER_PREPREFILL, read at construction.
+    _talker_preprefill = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._talker_preprefill = envs.VLLM_OMNI_TALKER_PREPREFILL
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -346,11 +350,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        waiting = getattr(self, "waiting")
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        if self._talker_preprefill:
+            return self._schedule_with_preprefill(throttle_prefills)
+        return self._schedule(throttle_prefills)
+
+    def _schedule_with_preprefill(self, throttle_prefills: bool) -> SchedulerOutput:
+        """VLLM_OMNI_TALKER_PREPREFILL (qwen3_omni/serving/talker_preprefill.py):
+        in the talker's stage, a waiting request holding only its pre chunk is
+        scheduled for all but its last prompt position, alone, or sits out the
+        step next to others; in the thinker's stage, each text prompt whose
+        whole prefill is scheduled sends its pre chunk."""
+        from vllm_omni.model_executor.models.qwen3_omni.serving import talker_preprefill
+
+        cap, kept_out = talker_preprefill.plan_step(list(self.waiting))
+        config = self.scheduler_config
+        threshold = config.long_prefill_token_threshold
+        if cap is not None:
+            config.long_prefill_token_threshold = cap
+        if kept_out:
+            self.waiting.remove_requests(kept_out)
+        try:
+            scheduler_output = self._schedule(throttle_prefills)
+        finally:
+            config.long_prefill_token_threshold = threshold
+            for request in reversed(kept_out):
+                self.waiting.prepend_request(request)
+        try:
+            talker_preprefill.send_pre_chunks(self, scheduler_output)
+        except Exception:
+            logger.exception("VLLM_OMNI_TALKER_PREPREFILL: the pre chunk failed")
+        return scheduler_output
+
+    def _schedule(self, throttle_prefills: bool) -> SchedulerOutput:
+        waiting = getattr(self, "waiting")
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting

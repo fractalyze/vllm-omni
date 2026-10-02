@@ -633,3 +633,82 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# =============================================================================
+# Patch Marlin MoE: order each expert's rows by row index (deterministic output)
+# =============================================================================
+# WHY: moe_align_block_size groups each token's (token, expert) rows by
+# expert, but orders the rows inside an expert's segment with atomics, so the
+# order changes from run to run. When a segment spans several of Marlin's
+# M-blocks (a 32-token prefill routes 256 rows at block_size_m 8), a row's
+# block decides its split-K reduction order and the MoE output bits change
+# with it: identical greedy requests then diverge within a few tokens.
+# Sorting each segment by row index pins the order. The sort runs on the GPU
+# without a host sync, so CUDA graphs still capture it.
+#
+# SCOPE: opt-in with VLLM_OMNI_DETERMINISTIC_MARLIN=1. Wraps the
+# moe_align_block_size name the marlin_moe module calls. With at most
+# block_size tokens every segment fits in one block, where the order does
+# not change the output, so decode steps skip the sort (it adds a few kernels
+# a layer). The test is on shapes only, so CUDA graphs still capture it.
+#
+# REMOVE WHEN: vLLM's moe_align_block_size (or Marlin's caller) emits
+# segments in row order itself; this belongs upstream in vLLM.
+_TAIL_EXPERT = 2**31 - 1
+
+
+def _sorted_within_experts(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size: int,
+    num_rows: int,
+) -> torch.Tensor:
+    """`sorted_ids` with each expert's segment in ascending row order.
+
+    Segments come in ascending expert order, so sorting by (the expert of the
+    position's block, row) keeps every row in its segment. Padding (the value
+    `num_rows`) sorts last in its segment, and positions at or past
+    `num_tokens_post_padded`, whose expert_ids are unset, keep a key past every
+    expert's.
+    """
+    size = sorted_ids.numel()
+    position = torch.arange(size, device=sorted_ids.device)
+    block_expert = expert_ids.long().repeat_interleave(block_size)[:size]
+    block_expert = torch.where(
+        position < num_tokens_post_padded.long(),
+        block_expert,
+        torch.full_like(block_expert, _TAIL_EXPERT),
+    )
+    key = block_expert * (num_rows + 1) + sorted_ids.long()
+    return (key.sort().values % (num_rows + 1)).to(sorted_ids.dtype)
+
+
+def _patch_deterministic_marlin_moe() -> None:
+    from vllm_omni import envs
+
+    if not envs.VLLM_OMNI_DETERMINISTIC_MARLIN:
+        return
+    from vllm.model_executor.layers.fused_moe.experts import marlin_moe
+
+    align = marlin_moe.moe_align_block_size
+    if getattr(align, "_vllm_omni_deterministic", False):
+        return
+
+    def moe_align_block_size(topk_ids, block_size, num_experts, *args, **kwargs):
+        sorted_ids, expert_ids, num_tokens_post_padded = align(topk_ids, block_size, num_experts, *args, **kwargs)
+        # A token routes to distinct experts, so no segment holds more rows
+        # than there are tokens.
+        if topk_ids.shape[0] > block_size:
+            sorted_ids = _sorted_within_experts(
+                sorted_ids, expert_ids, num_tokens_post_padded, block_size, topk_ids.numel()
+            )
+        return sorted_ids, expert_ids, num_tokens_post_padded
+
+    moe_align_block_size._vllm_omni_deterministic = True  # type: ignore[attr-defined]
+    marlin_moe.moe_align_block_size = moe_align_block_size
+    _PATCH_LOGGER.info("Marlin MoE patch: each expert's rows sorted by row (VLLM_OMNI_DETERMINISTIC_MARLIN).")
+
+
+_patch_deterministic_marlin_moe()

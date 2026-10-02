@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni import envs
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -65,6 +66,9 @@ from vllm_omni.worker.sampling_utils import (
     sanitize_min_tokens_stop_ids,
 )
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.qwen3_omni.serving.thinker_yield import Hold
 
 logger = init_logger(__name__)
 
@@ -362,6 +366,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
+    # Qwen3-Omni's thinker with VLLM_OMNI_THINKER_YIELD=1: its decode waits
+    # while the talker makes a request's frame 0.
+    thinker_hold: Hold | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -398,6 +405,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        self._init_thinker_hold()
+
+    def _init_thinker_hold(self) -> None:
+        if not envs.VLLM_OMNI_THINKER_YIELD:
+            return
+        from vllm_omni.model_executor.models.qwen3_omni.serving import thinker_yield
+
+        if thinker_yield.serves(self):
+            self.thinker_hold = thinker_yield.Hold(thinker_yield.frame0_shipped())
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -849,6 +865,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if self.thinker_hold is not None:
+            self.thinker_hold.before_step(scheduler_output, self.requests)
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -2067,6 +2085,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sample_hidden_states=sample_hidden_states,
             multimodal_outputs=multimodal_outputs,
         )
+        if self.talker_frame0 is not None:
+            multimodal_outputs = self.talker_frame0.ship_with_prefill(
+                self,
+                req_ids=req_ids_output_copy,
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                sample_hidden_states=sample_hidden_states,
+                multimodal_outputs=multimodal_outputs,
+            )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
