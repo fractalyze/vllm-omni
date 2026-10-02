@@ -5,9 +5,11 @@ their shapes.
 
 The talker's decode steps and the code predictor's teacher-forced frames are
 held to an fp32 PyTorch model, within FACTOR × the error of the same model in
-bf16, and the code predictor's draws to the wrapper's "stored" sampler. The
-talker's and the code predictor's forwards are then run with the megakernel
-switched on, on stand-ins holding those weights as vLLM does after loading:
+bf16, and the code predictor's draws to the wrapper's "stored" sampler. Both
+kernels must give the same bits beside a co-tenant holding the SMs as they
+launch, as under CUDA MPS, as alone. The talker's and the code predictor's
+forwards are then run with the megakernel switched on, on stand-ins holding
+those weights as vLLM does after loading:
 an eligible call must give exactly what the kernel gives when launched
 directly, and every other talker step must reach the stock forward.
 
@@ -79,6 +81,28 @@ def _uniforms(*shape: int, gen: torch.Generator) -> torch.Tensor:
     return torch.rand(*shape, generator=gen, device="cuda").clamp(_UNIFORM_EPS, 1 - _UNIFORM_EPS)
 
 
+def _beside_co_tenant(launch):
+    """launch()'s result with GEMMs on another stream holding the SMs as it
+    starts, so its CTAs become resident one by one as SMs free up, on other
+    SMs and in another order than alone, as under CUDA MPS beside the other
+    stages."""
+    a = torch.randn(8192, 8192, device="cuda").bfloat16()
+    # Neither on the legacy default stream, which would wait for the other.
+    side, main = torch.cuda.Stream(), torch.cuda.Stream()
+    side_done, launched = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    current_omni_platform.synchronize()
+    with torch.cuda.stream(side):
+        for _ in range(4):
+            a @ a
+        side_done.record()
+    with torch.cuda.stream(main):
+        launched.record()
+        out = launch()
+    current_omni_platform.synchronize()
+    assert launched.elapsed_time(side_done) > 0, "the launch reached the GPU after the co-tenant had ended"
+    return out
+
+
 # ---------------------------------------------------------------------------
 #  Talker decode
 # ---------------------------------------------------------------------------
@@ -140,6 +164,22 @@ def test_talker_steps_within_bf16_budget(talker_layers, talker_norm, cos_sin, ct
         truth = td.reference_step(talker_layers, talker_norm, caches, embedding, pos, positions, cos_sin, torch.float32)
         error, allowed = _rel_l2(got, truth), _rel_l2(budget, truth)
         assert error <= FACTOR * allowed, f"pos {pos}: error {error:.3g} exceeds {FACTOR} × bf16's {allowed:.3g}"
+
+
+def test_talker_steps_do_not_depend_on_cta_residency(talker_layers, talker_norm, cos_sin):
+    def steps(launch):
+        caches = td.new_caches(TALKER_LAYERS, BLOCKS * BLOCK_SIZE, BLOCK_SIZE)
+        decoder = td.TalkerDecoder(talker_layers, caches, talker_norm, cos_sin, ctas=96, splits=2)
+        outputs = []
+        for pos in range(8):
+            embedding, positions = _talker_inputs(pos)
+            outputs.append(launch(lambda: decoder.step(embedding, pos, positions)))
+        return outputs
+
+    alone = steps(lambda step: step())
+    beside = steps(_beside_co_tenant)
+    for pos, (want, got) in enumerate(zip(alone, beside)):
+        assert torch.equal(got, want), f"pos {pos}"
 
 
 class _StockTalkerModel:
@@ -325,6 +365,14 @@ def test_code_predictor_frames_are_independent_and_deterministic(cp_weights):
     alone_codes, alone_logits = predictor.run(hidden[1:2], code0_embed[1:2], uniforms[1:2])
     assert torch.equal(again_logits, logits) and torch.equal(again_codes, codes)
     assert torch.equal(alone_logits[0], logits[1]) and torch.equal(alone_codes[0], codes[1])
+
+
+def test_code_predictor_frames_do_not_depend_on_cta_residency(cp_weights):
+    predictor = cp.CodePredictor(cp_weights, TOP_K, TOP_P, ctas=96)
+    hidden, code0_embed, uniforms, _ = _frames(cp_weights, count=3, seed=4)
+    codes, logits = predictor.run(hidden, code0_embed, uniforms)
+    beside_codes, beside_logits = _beside_co_tenant(lambda: predictor.run(hidden, code0_embed, uniforms))
+    assert torch.equal(beside_logits, logits) and torch.equal(beside_codes, codes)
 
 
 def _code_predictor_stand_in(weights, ctas=None):

@@ -100,8 +100,20 @@ vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
   uniforms drawn up front: the same distribution as the stock sampler, not
   the same random stream, so the audio differs from the stock arm's.
 - As with the thinker, the CTA counts change how the kernels split their
-  sums, so a prompt's audio depends on them; at fixed counts every repeat
-  gives the same audio.
+  sums, so a prompt's audio depends on them. Which SMs the CTAs run on does
+  not, so CUDA MPS leaves the audio unchanged.
+- The talker calls its code predictor without the request's generator
+  (`code_predictor_forward`), so codes 1 to 15 are drawn from the talker
+  stage's own CUDA random stream, on the stock path as on the kernel. A
+  request's audio therefore depends on every talker step the server took
+  before it: a fresh server replays the same audio for the same sequence of
+  requests, and repeats of one prompt differ.
+- The talker's prompt runs on vLLM's compiled forward, loaded from vLLM's
+  `torch.compile` cache. Inductor picks some of its kernels' launch
+  configurations by timing them, so two cache entries (another environment,
+  or a recompile) can round differently. One different code then shifts the
+  audio of every later request while the text stays the same, so two arms
+  compare byte for byte only when they load the same compiled talker.
 
 ## Serving switches
 
