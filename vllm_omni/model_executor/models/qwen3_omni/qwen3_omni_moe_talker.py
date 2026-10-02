@@ -21,6 +21,8 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni import envs
+from vllm_omni.model_executor.models.qwen3_omni.megakernel.talker import TalkerMegakernel
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
@@ -57,6 +59,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     """
 
     logger = init_logger(__name__)
+    # Set by __init__ when VLLM_OMNI_TALKER_MEGAKERNEL is on.
+    megakernel: TalkerMegakernel | None = None
 
     # Weight mapping from HuggingFace to vLLM naming convention
     hf_to_vllm_mapper = WeightsMapper(
@@ -127,6 +131,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "code_predictor")
         )
+
+        if envs.VLLM_OMNI_TALKER_MEGAKERNEL:
+            self.megakernel = TalkerMegakernel(ctas=envs.VLLM_OMNI_TALKER_MEGAKERNEL_CTAS)
 
     def code_predictor_forward(
         self,
@@ -258,6 +265,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Forward pass through the talker model."""
+        if self.megakernel is not None and not kwargs:
+            output = self.megakernel.forward(self, inputs_embeds, positions, intermediate_tensors)
+            if output is not None:
+                return output
+
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.embed_input_ids(input_ids)
             input_ids = None

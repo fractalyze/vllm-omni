@@ -15,6 +15,10 @@ if TYPE_CHECKING:
     VLLM_OMNI_THINKER_MEGAKERNEL_CTAS: int | None = None
     VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL: bool = False
     VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS: int | None = None
+    VLLM_OMNI_TALKER_MEGAKERNEL: bool = False
+    VLLM_OMNI_TALKER_MEGAKERNEL_CTAS: int = 96
+    VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL: bool = False
+    VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS: int | None = None
 
 
 def _ctas(name: str) -> int | None:
@@ -36,6 +40,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL": lambda: os.environ.get("VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL", "0") == "1",
     # How many CTAs (SMs) a prefill chunk takes. Unset or 0: every SM.
     "VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS": lambda: _ctas("VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS"),
+    # "1" runs Qwen3-Omni's talker decode steps (one token, one request) on the
+    # talker megakernel, one launch a step. Needs an sm_120a GPU.
+    "VLLM_OMNI_TALKER_MEGAKERNEL": lambda: os.environ.get("VLLM_OMNI_TALKER_MEGAKERNEL", "0") == "1",
+    # How many CTAs (SMs) a talker step takes. Unset or 0: 96, which leaves
+    # the thinker's decode its SMs when the stages share the GPU under MPS.
+    "VLLM_OMNI_TALKER_MEGAKERNEL_CTAS": lambda: _ctas("VLLM_OMNI_TALKER_MEGAKERNEL_CTAS") or 96,
+    # "1" runs Qwen3-Omni's code predictor (codes 1 to 15 of each audio frame)
+    # on the code-predictor megakernel, one launch a call. Needs an sm_120a GPU.
+    "VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL": lambda: os.environ.get("VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL", "0") == "1",
+    # How many CTAs (SMs) a code-predictor launch takes; the rest stay free
+    # for code2wav. Unset or 0: every SM.
+    "VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS": lambda: _ctas("VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS"),
 }
 
 

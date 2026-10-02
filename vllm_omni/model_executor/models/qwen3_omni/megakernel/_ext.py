@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2026 Fractalyze Inc. All rights reserved.
-"""JIT-builds the thinker megakernel extension (csrc/) against the running torch.
+"""JIT-builds the Qwen3-Omni megakernel extension (csrc/) against the running torch.
 
 The extension must share a process with the torch that loads it, so it is
 compiled with the CUDA toolkit that torch was built against. When `CUDA_HOME`
@@ -17,7 +17,9 @@ from types import ModuleType
 
 _CSRC = Path(__file__).parent / "csrc"
 _SOURCES = (
-    "thinker_ops.cpp",
+    "ops.cpp",
+    "qwen3omni_cp.cu",
+    "talker_decode.cu",
     "thinker_attention.cu",
     "thinker_decode.cu",
     "thinker_moe.cu",

@@ -1,17 +1,20 @@
 // Copyright 2026 Fractalyze Inc. All rights reserved.
 //
-// The Python bindings of the thinker megakernels: the thinker slice of
-// decode-mk's s2mk/csrc/ops.cpp.
+// The Python bindings of Qwen3-Omni's megakernels: the thinker, talker and
+// code-predictor slice of decode-mk's s2mk/csrc/ops.cpp.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstring>
 #include <optional>
 
 #include "barrier.h"
 #include "layer.h"
+#include "qwen3omni_cp.h"
+#include "talker_decode.h"
 #include "thinker_attention.h"
 #include "thinker_decode.h"
 #include "thinker_moe.h"
@@ -45,9 +48,120 @@ ErrorRecord* MappedRecord(const torch::Tensor& error) {
   return static_cast<ErrorRecord*>(device);
 }
 
+// Checks a [num_layers, 8] table of LayerWeights pointers.
+const LayerWeights* LayerTable(const torch::Tensor& layers, const char* name) {
+  static_assert(sizeof(LayerWeights) == 8 * sizeof(int64_t));
+  TORCH_CHECK(layers.dim() == 2 && layers.size(1) == 8 && layers.size(0) > 0,
+              name, " must be [num_layers, 8]");
+  return Ptr<const LayerWeights>(layers, torch::kInt64, name);
+}
+
 void CheckNumel(const torch::Tensor& t, int64_t numel, const char* name) {
   TORCH_CHECK(t.numel() == numel, name, " must hold ", numel,
               " elements, got ", t.numel());
+}
+
+void CheckPrefetch(int64_t prefetch_bytes) {
+  TORCH_CHECK(0 <= prefetch_bytes && prefetch_bytes <= (1 << 30) &&
+                  prefetch_bytes % 16 == 0,
+              "prefetch_bytes must be a multiple of 16 in [0, 2^30], got ",
+              prefetch_bytes);
+}
+
+void RunCodePredictor(
+    const torch::Tensor& layers, const torch::Tensor& final_norm,
+    const torch::Tensor& heads, const torch::Tensor& embeddings,
+    const torch::Tensor& rope, const torch::Tensor& k_caches,
+    const torch::Tensor& v_caches, double eps, int64_t top_k, double top_p,
+    const torch::Tensor& talker_hidden, const torch::Tensor& code0_embed,
+    const torch::Tensor& uniforms,
+    const std::optional<torch::Tensor>& forced_codes, int64_t prefetch_bytes,
+    int64_t timeout_ns, const torch::Tensor& residual, const torch::Tensor& qkv,
+    const torch::Tensor& act, const torch::Tensor& logits,
+    const torch::Tensor& codes, const std::optional<torch::Tensor>& dump,
+    const std::optional<torch::Tensor>& profile, const torch::Tensor& sync,
+    const torch::Tensor& error, int64_t num_ctas, bool cooperative) {
+  using D = CpDims;
+  const LayerWeights* layer_table = LayerTable(layers, "layers");
+  const int num_layers = static_cast<int>(layers.size(0));
+  const int64_t frames = talker_hidden.numel() / D::kDim;
+  TORCH_CHECK(num_layers <= kCpMaxLayers, "at most ", kCpMaxLayers,
+              " layers, got ", num_layers);
+  TORCH_CHECK(frames > 0, "no frames");
+  const int max_rows = std::max({D::kQkvRows, D::kDim, 2 * D::kFfn, kCpVocab});
+  TORCH_CHECK(0 < num_ctas && num_ctas <= kMaxCtas &&
+                  (max_rows + num_ctas - 1) / num_ctas <= kMaxRowsPerCta,
+              num_ctas, " CTAs leave more than ", kMaxRowsPerCta,
+              " rows per CTA");
+  TORCH_CHECK(0 < top_k && top_k <= kCpMaxTopK, "top_k must be in [1, ",
+              kCpMaxTopK, "], got ", top_k);
+  CheckPrefetch(prefetch_bytes);
+  CheckNumel(final_norm, D::kDim, "final_norm");
+  CheckNumel(heads, int64_t{kCpHeads} * kCpVocab * D::kDim, "heads");
+  CheckNumel(embeddings, int64_t{kCpHeads} * kCpVocab * D::kDim, "embeddings");
+  CheckNumel(rope, int64_t{kCpPositions} * kHeadDim, "rope");
+  TORCH_CHECK(k_caches.numel() == num_layers && v_caches.numel() == num_layers,
+              "one key and one value cache per layer");
+  CheckNumel(talker_hidden, frames * D::kDim, "talker_hidden");
+  CheckNumel(code0_embed, frames * D::kDim, "code0_embed");
+  CheckNumel(uniforms, frames * kCpHeads * kCpVocab, "uniforms");
+  CheckNumel(residual, D::kDim, "residual");
+  CheckNumel(qkv, D::kQkvRows, "qkv");
+  CheckNumel(act, D::kFfn, "act");
+  CheckNumel(logits, frames * kCpHeads * kCpVocab, "logits");
+  CheckNumel(codes, frames * kCpHeads, "codes");
+  if (forced_codes.has_value()) {
+    CheckNumel(*forced_codes, frames * kCpHeads, "forced_codes");
+  }
+  if (dump.has_value()) {
+    CheckNumel(*dump, frames * kCpPositions * (num_layers + 1) * D::kDim,
+               "dump");
+  }
+  if (profile.has_value()) {
+    CheckNumel(*profile, num_ctas * kCpProfileWords, "profile");
+  }
+
+  const auto kBf16 = torch::kBFloat16;
+  const auto kF32 = torch::kFloat32;
+  const auto kI64 = torch::kInt64;
+  CodePredictorParams p{};
+  p.layers = layer_table;
+  p.num_layers = num_layers;
+  p.final_norm = Ptr<const __nv_bfloat16>(final_norm, kBf16, "final_norm");
+  p.heads = Ptr<const __nv_bfloat16>(heads, kBf16, "heads");
+  p.embeddings = Ptr<const __nv_bfloat16>(embeddings, kBf16, "embeddings");
+  p.rope = Ptr<const __nv_bfloat16>(rope, kBf16, "rope");
+  p.kv.k = Ptr<__nv_bfloat16* const>(k_caches, kI64, "k_caches");
+  p.kv.v = Ptr<__nv_bfloat16* const>(v_caches, kI64, "v_caches");
+  p.kv.max_seq = kCpPositions;
+  p.eps = static_cast<float>(eps);
+  p.top_k = static_cast<int>(top_k);
+  p.top_p = static_cast<float>(top_p);
+  p.num_frames = static_cast<int>(frames);
+  p.talker_hidden =
+      Ptr<const __nv_bfloat16>(talker_hidden, kBf16, "talker_hidden");
+  p.code0_embed = Ptr<const __nv_bfloat16>(code0_embed, kBf16, "code0_embed");
+  p.uniforms = Ptr<const float>(uniforms, kF32, "uniforms");
+  p.forced_codes = forced_codes.has_value()
+                       ? Ptr<const int64_t>(*forced_codes, kI64, "forced_codes")
+                       : nullptr;
+  p.prefetch_bytes = static_cast<int>(prefetch_bytes);
+  p.timeout_ns = timeout_ns;
+  p.residual = Ptr<float>(residual, kF32, "residual");
+  p.qkv = Ptr<float>(qkv, kF32, "qkv");
+  p.act = Ptr<__nv_bfloat16>(act, kBf16, "act");
+  p.logits = Ptr<float>(logits, kF32, "logits");
+  p.codes = Ptr<int64_t>(codes, kI64, "codes");
+  p.dump = dump.has_value() ? Ptr<float>(*dump, kF32, "dump") : nullptr;
+  p.profile =
+      profile.has_value() ? Ptr<int64_t>(*profile, kI64, "profile") : nullptr;
+  p.sync = Ptr<unsigned>(sync, torch::kInt32, "sync");
+  p.error = MappedRecord(error);
+
+  const c10::cuda::CUDAGuard guard(residual.device());
+  CheckOk(LaunchCodePredictor(p, static_cast<int>(num_ctas), cooperative,
+                              at::cuda::getCurrentCUDAStream()),
+          "code predictor launch");
 }
 
 // A params struct as a CPU uint8 tensor, and back: the thinker's blocks are
@@ -318,6 +432,126 @@ void RunThinkerDecode(
           "thinker decode launch");
 }
 
+torch::Tensor TalkerLayerParamsOf(
+    const torch::Tensor& norm, const torch::Tensor& wqkv,
+    const torch::Tensor& q_norm, const torch::Tensor& k_norm,
+    const torch::Tensor& wo, const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache, const torch::Tensor& block_table,
+    const torch::Tensor& moe_norm, const torch::Tensor& router,
+    const torch::Tensor& w13, const torch::Tensor& w2,
+    const torch::Tensor& shared_w13, const torch::Tensor& shared_w2,
+    const torch::Tensor& shared_gate) {
+  constexpr int64_t kD = kTalkerDim, kE = kTalkerExperts;
+  const auto kBf16 = torch::kBFloat16;
+  CheckNumel(norm, kD, "norm");
+  CheckNumel(wqkv, int64_t{kTalkerQkvRows} * kD, "wqkv");
+  CheckNumel(q_norm, kTalkerHeadDim, "q_norm");
+  CheckNumel(k_norm, kTalkerHeadDim, "k_norm");
+  CheckNumel(wo, kD * kTalkerQDim, "wo");
+  CheckNumel(moe_norm, kD, "moe_norm");
+  CheckNumel(router, kE * kD, "router");
+  CheckNumel(w13, kE * 2 * kTalkerExpertFfn * kD, "w13");
+  CheckNumel(w2, kE * kD * kTalkerExpertFfn, "w2");
+  CheckNumel(shared_w13, 2 * kTalkerSharedFfn * kD, "shared_w13");
+  CheckNumel(shared_w2, kD * kTalkerSharedFfn, "shared_w2");
+  CheckNumel(shared_gate, kD, "shared_gate");
+  TalkerLayerParams p{};
+  p.norm = Ptr<const __nv_bfloat16>(norm, kBf16, "norm");
+  p.wqkv = Ptr<const __nv_bfloat16>(wqkv, kBf16, "wqkv");
+  p.q_norm = Ptr<const __nv_bfloat16>(q_norm, kBf16, "q_norm");
+  p.k_norm = Ptr<const __nv_bfloat16>(k_norm, kBf16, "k_norm");
+  p.wo = Ptr<const __nv_bfloat16>(wo, kBf16, "wo");
+  p.kv = PagedKvOf(key_cache, value_cache, block_table, kTalkerKvHeads);
+  p.moe_norm = Ptr<const __nv_bfloat16>(moe_norm, kBf16, "moe_norm");
+  p.router = Ptr<const __nv_bfloat16>(router, kBf16, "router");
+  p.w13 = Ptr<const __nv_bfloat16>(w13, kBf16, "w13");
+  p.w2 = Ptr<const __nv_bfloat16>(w2, kBf16, "w2");
+  p.shared_w13 = Ptr<const __nv_bfloat16>(shared_w13, kBf16, "shared_w13");
+  p.shared_w2 = Ptr<const __nv_bfloat16>(shared_w2, kBf16, "shared_w2");
+  p.shared_gate = Ptr<const __nv_bfloat16>(shared_gate, kBf16, "shared_gate");
+  return StructBytes(p);
+}
+
+void RunTalkerDecode(
+    const torch::Tensor& layers, const torch::Tensor& seq_len,
+    const torch::Tensor& slot_mapping, const torch::Tensor& positions,
+    const torch::Tensor& cos_sin, const torch::Tensor& final_norm,
+    int64_t splits, double eps, int64_t timeout_ns,
+    const torch::Tensor& residual, const torch::Tensor& final_hidden,
+    const torch::Tensor& qkv, const torch::Tensor& partial_ml,
+    const torch::Tensor& partial_o, const torch::Tensor& router_logits,
+    const torch::Tensor& act, const std::optional<torch::Tensor>& hidden,
+    const std::optional<torch::Tensor>& profile, const torch::Tensor& sync,
+    const torch::Tensor& error, int64_t num_ctas) {
+  constexpr int64_t kD = kTalkerDim;
+  const int64_t items = kTalkerQHeads * splits;
+  TORCH_CHECK(0 < num_ctas && num_ctas <= kMaxCtas &&
+                  (kTalkerQkvRows + num_ctas - 1) / num_ctas <= kMaxRowsPerCta &&
+                  2 * ((kTalkerTopK * kTalkerExpertFfn + num_ctas - 1) / num_ctas) <=
+                      kMaxRowsPerCta &&
+                  (kTalkerTopK + 1) * ((kD + num_ctas - 1) / num_ctas) <=
+                      kMaxRowsPerCta,
+              "num_ctas ", num_ctas, " gives a CTA too many rows");
+  TORCH_CHECK(splits > 0 && items <= num_ctas, "splits ", splits, " needs ",
+              items, " CTAs, have ", num_ctas);
+  TORCH_CHECK(seq_len.is_cuda() && seq_len.scalar_type() == torch::kInt32 &&
+                  seq_len.numel() >= 1,
+              "seq_len must hold an int32 on the GPU");
+  TORCH_CHECK(slot_mapping.is_cuda() &&
+                  slot_mapping.scalar_type() == torch::kInt64 &&
+                  slot_mapping.numel() >= 1,
+              "slot_mapping must hold an int64 on the GPU");
+  TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 &&
+                  positions.dim() == 2 && positions.size(0) == 3 &&
+                  positions.size(1) >= 1,
+              "positions must be int64 [3, tokens] on the GPU");
+  TORCH_CHECK(cos_sin.dim() == 2 && cos_sin.size(1) == kTalkerHeadDim,
+              "cos_sin must be [positions, ", kTalkerHeadDim, "]");
+  CheckNumel(final_norm, kD, "final_norm");
+  CheckNumel(residual, kD, "residual");
+  CheckNumel(final_hidden, kD, "final_hidden");
+  CheckNumel(qkv, kTalkerQkvRows, "qkv");
+  CheckNumel(partial_ml, items * 2, "partial_ml");
+  CheckNumel(partial_o, items * kTalkerHeadDim, "partial_o");
+  CheckNumel(router_logits, kTalkerExperts + 1, "router_logits");
+  CheckNumel(act, kTalkerTopK * kTalkerExpertFfn + kTalkerSharedFfn, "act");
+  TalkerDecodeParams p{};
+  p.layers = StackedParams<TalkerLayerParams>(layers, "layers");
+  p.num_layers = static_cast<int>(layers.size(0));
+  p.seq_len = reinterpret_cast<const int32_t*>(seq_len.data_ptr());
+  p.slot_mapping = reinterpret_cast<const int64_t*>(slot_mapping.data_ptr());
+  p.positions = reinterpret_cast<const int64_t*>(positions.data_ptr());
+  p.positions_stride = positions.stride(0);
+  const auto kBf16 = torch::kBFloat16;
+  p.cos_sin = Ptr<const __nv_bfloat16>(cos_sin, kBf16, "cos_sin");
+  p.final_norm = Ptr<const __nv_bfloat16>(final_norm, kBf16, "final_norm");
+  p.splits = static_cast<int>(splits);
+  p.eps = static_cast<float>(eps);
+  p.timeout_ns = timeout_ns;
+  p.residual = Ptr<float>(residual, torch::kFloat32, "residual");
+  p.final_hidden = Ptr<__nv_bfloat16>(final_hidden, kBf16, "final_hidden");
+  p.qkv = Ptr<float>(qkv, torch::kFloat32, "qkv");
+  p.partial_ml = Ptr<float>(partial_ml, torch::kFloat32, "partial_ml");
+  p.partial_o = Ptr<float>(partial_o, torch::kFloat32, "partial_o");
+  p.router_logits = Ptr<float>(router_logits, torch::kFloat32, "router_logits");
+  p.act = Ptr<__nv_bfloat16>(act, kBf16, "act");
+  if (hidden.has_value()) {
+    CheckNumel(*hidden, (p.num_layers + 1) * kD, "hidden");
+    p.hidden = Ptr<float>(*hidden, torch::kFloat32, "hidden");
+  }
+  if (profile.has_value()) {
+    CheckNumel(*profile, num_ctas * p.num_layers * kTalkerBarriersPerLayer * 2,
+               "profile");
+    p.profile = Ptr<int64_t>(*profile, torch::kInt64, "profile");
+  }
+  p.sync = Ptr<unsigned>(sync, torch::kInt32, "sync");
+  p.error = MappedRecord(error);
+  const c10::cuda::CUDAGuard guard(residual.device());
+  CheckOk(LaunchTalkerDecode(p, static_cast<int>(num_ctas),
+                             at::cuda::getCurrentCUDAStream()),
+          "talker decode launch");
+}
+
 void RunThinkerPrefill(
     const torch::Tensor& attention, const torch::Tensor& moe, int64_t tokens,
     const torch::Tensor& seq_len, const torch::Tensor& slot_mapping,
@@ -453,6 +687,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("final_hidden"), py::arg("hidden"), py::arg("hidden_layer"),
         py::arg("profile"),
         py::arg("sync"), py::arg("error"), py::arg("num_ctas"));
+  m.def("run_code_predictor", &s2mk::RunCodePredictor,
+        "Runs N frames of Qwen3-Omni's code predictor in one launch.",
+        py::arg("layers"), py::arg("final_norm"), py::arg("heads"),
+        py::arg("embeddings"), py::arg("rope"), py::arg("k_caches"),
+        py::arg("v_caches"), py::arg("eps"), py::arg("top_k"),
+        py::arg("top_p"), py::arg("talker_hidden"), py::arg("code0_embed"),
+        py::arg("uniforms"), py::arg("forced_codes"),
+        py::arg("prefetch_bytes"), py::arg("timeout_ns"), py::arg("residual"),
+        py::arg("qkv"), py::arg("act"), py::arg("logits"), py::arg("codes"),
+        py::arg("dump"), py::arg("profile"), py::arg("sync"), py::arg("error"),
+        py::arg("num_ctas"), py::arg("cooperative"));
+  m.def("talker_layer_params", &s2mk::TalkerLayerParamsOf,
+        "A talker layer's weights and cache for the decode kernel, as CPU bytes.",
+        py::arg("norm"), py::arg("wqkv"), py::arg("q_norm"), py::arg("k_norm"),
+        py::arg("wo"), py::arg("key_cache"), py::arg("value_cache"),
+        py::arg("block_table"), py::arg("moe_norm"), py::arg("router"),
+        py::arg("w13"), py::arg("w2"), py::arg("shared_w13"),
+        py::arg("shared_w2"), py::arg("shared_gate"));
+  m.def("run_talker_decode", &s2mk::RunTalkerDecode,
+        "One decode step of Qwen3-Omni's talker, one launch.",
+        py::arg("layers"), py::arg("seq_len"), py::arg("slot_mapping"),
+        py::arg("positions"), py::arg("cos_sin"), py::arg("final_norm"),
+        py::arg("splits"), py::arg("eps"), py::arg("timeout_ns"),
+        py::arg("residual"), py::arg("final_hidden"), py::arg("qkv"),
+        py::arg("partial_ml"), py::arg("partial_o"), py::arg("router_logits"),
+        py::arg("act"), py::arg("hidden"), py::arg("profile"), py::arg("sync"),
+        py::arg("error"), py::arg("num_ctas"));
   m.attr("ERROR_RECORD_WORDS") =
       py::int_(sizeof(s2mk::ErrorRecord) / sizeof(int32_t));
   m.attr("SYNC_WORDS") = py::int_(s2mk::kSyncWords);

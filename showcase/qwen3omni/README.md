@@ -65,6 +65,40 @@ vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
   depends on them; at fixed caps every repeat gives the same text.
 - The kernels are built for sm_120a (RTX 5090).
 
+## Talker and code-predictor megakernels
+
+Two more switches put stage 1 on kernels from the same build: the talker's
+one-token decode steps, and its code predictor (codes 1 to 15 of each audio
+frame). They work with either deploy config; beside the thinker kernels:
+
+```bash
+PATH=$PWD/.venv/bin:$PATH \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+VLLM_OMNI_THINKER_MEGAKERNEL=1 VLLM_OMNI_THINKER_MEGAKERNEL_CTAS=64 \
+VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL=1 VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS=128 \
+VLLM_OMNI_TALKER_MEGAKERNEL=1 \
+VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96 \
+vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
+    --deploy-config showcase/qwen3omni/thinker_megakernel.yaml
+```
+
+| Switch | Effect |
+| --- | --- |
+| `VLLM_OMNI_TALKER_MEGAKERNEL=1` | The talker's one-token decode steps run on the talker kernel |
+| `VLLM_OMNI_TALKER_MEGAKERNEL_CTAS` | SMs a talker step takes; unset is 96, which leaves the thinker's decode its SMs |
+| `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1` | Every code-predictor call runs on the code-predictor kernel |
+| `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS` | SMs a code-predictor launch takes, leaving the rest to code2wav; unset is every SM |
+
+- The talker kernel reads the talker's bf16 weights and paged KV cache in
+  place; prompts and batches of two requests keep the stock forward.
+- The code predictor kernel is built when stage 1 loads its weights, so
+  vLLM's memory profile counts it. It draws each frame's 15 codes from
+  uniforms drawn up front: the same distribution as the stock sampler, not
+  the same random stream, so the audio differs from the stock arm's.
+- As with the thinker, the CTA counts change how the kernels split their
+  sums, so a prompt's audio depends on them; at fixed counts every repeat
+  gives the same audio.
+
 ## Request
 
 ```bash
