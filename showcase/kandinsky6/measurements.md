@@ -66,6 +66,59 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## The arm: SageAttention2 through blocks 6-53 of the stack
+
+Exact BF16 weights streamed from the mmapped checkpoint, SageAttention2 on
+`kandinsky6.visual_self` restricted to visual blocks 6-53, the platform default
+on blocks 0-5 and 54-59, SDPA on the two audio roles, compile at the platform
+default. **Median 177.7 s** a W1 request over nine timed requests (min 176.7,
+max 180.2, spread 1.9%; cold start 24.3 s).
+
+Set A against Track M's eager BF16 reference, with the measured floor
+(set mean 0.1455, set max 0.4160):
+
+| gate | number | limit | verdict |
+|---|---:|---:|---|
+| G1, the user's | mean **0.1543**, max 0.4591 | 0.15 / 0.25 | fails, mean over by 2.9% |
+| G2, floor-relative | **1.06x** the floor's mean, 1.10x its max | 1.25x | **passes** |
+| G3, distributional | set CLIP 0.3098 against 0.3098, **+0.00%** | +-2% | **passes** |
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| a5-waterfall-drone | motion | 0.0538 | 0.0590 |
+| a1-portrait-speech | face, speech | 0.0579 | 0.1068 |
+| a9-violinist | face, motion | 0.0837 | 0.1996 |
+| a4-chalkboard | text, face, speech | 0.1219 | 0.1612 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1350 | 0.1849 |
+| a7-cafe-menu | text, face | 0.1361 | 0.1530 |
+| a2-neon-signage | text, motion | 0.2291 | **0.2601** |
+| a8-skateboard-crash | motion, sharp-sound | 0.2710 | **0.3454** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2999 | **0.4591** |
+| **set** | | **0.1543** | **0.4591** |
+
+By category: sharp-sound 0.235, motion 0.179, text 0.162, face 0.139, speech
+0.090 -- the same ordering every arm here produces, and the opposite of what an
+attention-only screen on Kandinsky 6 **Lite** suggested.
+
+Against Sage2 on all 60 blocks (0.1858 mean, G2 1.28x, 165.9 s) **the schedule
+removes 17% of the error for 7% of the speed**, which is the difference between
+failing the working gate and passing it with room.
+
+### What a 0.4591 worst frame actually is
+
+`showcase-samples/compare-a3-sprint-start-sage2-mid-setA.jpg` puts eight frames
+of the worst prompt side by side, reference above arm. Same sprinter, same
+track, same camera move, same lighting, same background crowd -- **the arm
+frames the shot slightly tighter**. A global framing shift moves every pixel, so
+a per-frame perceptual metric scores it near its worst while a viewer would call
+both takes correct; the arm's CLIP agreement on that clip is -0.43%.
+
+a2 and a8 are a different matter: those lose rendered-signage glyphs and
+fast-motion detail that a viewer would notice. So this arm's error is **part
+sampling divergence and part real detail loss**, and a claim resting on a
+max-over-frames number has to say which it is made of. That is what G3 and the
+contact sheets are in this file for.
+
 ## Where the reference was generated matters as much as how
 
 Two of this host's server processes, started 40 minutes apart with compile on
