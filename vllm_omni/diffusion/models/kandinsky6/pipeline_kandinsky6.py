@@ -1471,11 +1471,12 @@ class Kandinsky6TI2VAPipeline(
         with torch.device(component_device), no_init_weights():
             vae = AutoencoderKLHunyuanVideo.from_config(vae_config)
         vae.to(dtype=torch.float16)
-        # The Hunyuan VAE tiles its spatial decode by default (256-px tiles every
-        # 192 px, so a third of the work is overlap). VLLM_OMNI_K6_VAE_TILING=0
-        # decodes whole frames instead -- faster when the GPU has room for it,
-        # which depends on what else is resident at decode time. Temporal
-        # (framewise) chunking is unaffected.
+        # Spatial tiling is decided after load, not here: the model registry sets
+        # vae.use_tiling from od_config.vae_use_tiling (--vae-use-tiling, default
+        # off), so a served decode is spatially untiled unless that flag is given.
+        # VLLM_OMNI_K6_VAE_TILING=0 only matters for code that builds this pipeline
+        # without the registry. Temporal (framewise) chunking, 16-frame chunks
+        # every 12, applies either way.
         if os.environ.get("VLLM_OMNI_K6_VAE_TILING", "1") == "0":
             vae.use_tiling = False
 

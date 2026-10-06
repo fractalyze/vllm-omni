@@ -198,8 +198,7 @@ held). The stage profiler synchronizes around each stage, so this request's
 | rest of `forward`, then mux and HTTP | ~0.3 |
 
 Text encoding, audio and muxing are under 1 s together. Almost all of the
-~20 s tail is the video VAE decode. Its 256-px tiles overlap by 64 px (a
-192-px stride), so roughly a third of that decode is recomputed overlap.
+~20 s tail is the video VAE decode.
 
 **The denoise step is compute-bound, and mostly GEMM** (GPU kernel time in the
 173.0 s denoise window, from the first attention kernel to the last):
@@ -231,10 +230,39 @@ twelve edge blocks over steps 2-10.
    edge blocks and step 1 changes no numerics the gate depends on, so it is
    the lever that cannot fail the gate. Halving the cuDNN call time would save
    about 15 s (-8%).
-3. **VAE decode, 18.9 s per request.** Decoding untiled, or with less tile
-   overlap, removes up to a third of it. It is post-denoise, so it cannot move
-   the trajectory, only the decode's own rounding.
+3. **VAE decode, 18.9 s per request.** It is already spatially untiled (see
+   the screen below). What is left is its temporal chunking (16 frames every
+   12, a quarter recomputed) and the decoder's own kernels. It is
+   post-denoise, so it cannot move the trajectory.
 4. **Streaming, at most 8.6 s per request.** Already overlapped. Little is left.
+
+### Screen: VAE tile overlap is not a lever, because the served decode is untiled
+
+Screened at 05:42-06:10 (informational; the headline is unchanged). The
+headline arm decoded a1 and b6 under four spatial-tiling settings: the default
+(256-px tiles every 192 px), 256:224, 384:352, and `VLLM_OMNI_K6_VAE_TILING=0`.
+Each setting ran on a fresh server with the stage profiler, under every GPU
+lock.
+
+| setting | `vae.decode`, a1 | `vae.decode`, b6 | video vs default |
+|---|---:|---:|---|
+| default | 18.92 s | 18.72 s | -- |
+| 256:224 | 18.92 s | 18.73 s | bit-identical |
+| 384:352 | 18.91 s | 18.73 s | bit-identical |
+| untiled | 18.85 s | 18.73 s | bit-identical |
+
+All four decodes are bit-identical (audio too), and their times agree within
+0.4%. The reason: vLLM-Omni's model registry sets `vae.use_tiling` from
+`od_config.vae_use_tiling` after the pipeline is built, and that flag
+(`--vae-use-tiling`) defaults to off. **Every served W1 decode on this branch,
+headline and gate runs included, has been spatially untiled.** The pipeline's
+own tiling switch never reached a server. Its comment is corrected here.
+
+So the 18.9 s has no spatial overlap to remove. What it still has: temporal
+chunking (16-frame chunks every 12 frames, so about a quarter of the frames
+are decoded twice and blended) and the decoder's own convolution kernels
+(fp16, not compiled). Both are post-denoise and unscreened. Larger temporal
+chunks are the next thing to try, if the GPU has the memory at decode time.
 
 ### Reference reproducibility on this host
 
