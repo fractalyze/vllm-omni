@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""ABBA comparison of two server arms on W1, in one session.
+"""ABBA comparison of server arms on W1, in one session.
 
 An arm here is a whole server configuration (checkpoint, flags, environment),
 so the unit of interleaving is a server *visit*: start the arm, warm up, time
 ``--repeats`` requests, stop it and wait for the GPU to drain. Visits run in the
 order A B B A, so a drift over the session -- the GPU warming toward its power
 cap, the page cache filling, a co-tenant arriving -- loads both arms equally
-instead of landing on whichever ran second.
+instead of landing on whichever ran second. With more arms (``--arm``, the
+first is the control) the order is the same mirror, A B C C B A: every arm's
+visits average to the session's midpoint, so a linear drift still cancels.
 
 Each arm is a JSON file::
 
@@ -24,9 +26,9 @@ attention config can be passed by path. The GPU locks are held for the whole
 comparison and the board is sampled throughout; the ledger row is
 ``contaminated`` if anything else touched the GPU.
 
-The reported delta is candidate vs control on the medians of all timed
-requests, with each arm's own min-max spread beside it: a delta inside the
-control's spread is null.
+The reported delta is each candidate vs the control on the medians of all
+timed requests, with each arm's own min-max spread beside it: a delta inside
+the control's spread is null. One ledger row per candidate.
 """
 
 from __future__ import annotations
@@ -115,6 +117,12 @@ def stop(proc: subprocess.Popen) -> None:
         time.sleep(2)
 
 
+def visit_order(n_arms: int) -> list[int]:
+    """Arm indices in mirrored order: 0 1 ... n-1 n-1 ... 1 0."""
+    forward = list(range(n_arms))
+    return forward + forward[::-1]
+
+
 def server_pids(proc: subprocess.Popen) -> list[int]:
     out = subprocess.run(["pgrep", "-g", str(os.getpgid(proc.pid))], capture_output=True, text=True, check=False)
     return [int(p) for p in out.stdout.split()]
@@ -122,8 +130,9 @@ def server_pids(proc: subprocess.Popen) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--control", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--control", type=Path, help="two-arm form: the control arm")
+    parser.add_argument("--candidate", type=Path, help="two-arm form: the candidate arm")
+    parser.add_argument("--arm", type=Path, action="append", default=[], help="N-arm form; the first is the control")
     parser.add_argument("--repeats", type=int, default=3, help="timed requests per visit")
     parser.add_argument("--prompts", type=Path, default=Path(__file__).parent / "prompts" / "setA.json")
     parser.add_argument("--prompt-index", type=int, default=0)
@@ -133,18 +142,22 @@ def main() -> None:
     parser.add_argument("--note", default="")
     args = parser.parse_args()
 
-    arms = {"A": load_arm(args.control), "B": load_arm(args.candidate)}
+    paths = args.arm or [args.control, args.candidate]
+    if len(paths) < 2 or any(p is None for p in paths):
+        parser.error("give --control and --candidate, or two or more --arm")
+    arms = [load_arm(p) for p in paths]
     prompt = json.loads(args.prompts.read_text())["prompts"][args.prompt_index]
-    run = run_id(f"ABBA-{arms['B']['name']}-vs-{arms['A']['name']}")
+    names = [arm["name"] for arm in arms]
+    run = run_id(f"ABBA-{'-vs-'.join(reversed(names)) if len(arms) == 2 else 'x'.join(names)}")
     ledger = Ledger(args.out)
     run_dir = ledger.run_dir(run)
     guard = GpuGuard(interval_s=1.0)
-    walls: dict[str, list[float]] = {"A": [], "B": []}
+    walls: list[list[float]] = [[] for _ in arms]
     visits = []
 
     with guard:
-        for visit_no, key in enumerate("ABBA"):
-            arm = arms[key]
+        for visit_no, index in enumerate(visit_order(len(arms))):
+            arm = arms[index]
             proc, cold_s = start(arm, run_dir / f"server-{visit_no}-{arm['name']}.log")
             for pid in server_pids(proc):
                 guard.add_own_pid(pid)
@@ -161,40 +174,54 @@ def main() -> None:
                         continue
                     record["requests"].append({"label": label, **result.as_dict()})
                     if repeat:
-                        walls[key].append(result.request_wall_s)
+                        walls[index].append(result.request_wall_s)
                     print(f"visit {visit_no} {arm['name']} {label}: {result.request_wall_s:.2f}s", flush=True)
             finally:
                 stop(proc)
             visits.append(record)
 
     gpu = guard.report()
-    a, b = walls["A"], walls["B"]
-    metrics: dict[str, object] = {}
-    if a and b:
-        metrics = {
-            "control_request_wall_s": spread(a),
-            "candidate_request_wall_s": spread(b),
-            "delta_pct": 100.0 * (statistics.median(b) - statistics.median(a)) / statistics.median(a),
-            "control_spread_pct": 100.0 * (max(a) - min(a)) / statistics.median(a),
-        }
-    row = LedgerRow(
-        run=run,
-        control=arms["A"]["name"],
-        candidate=arms["B"]["name"],
-        metrics=metrics,
-        verdict={"completed": bool(a and b), "trial": args.trial},
-        validity=validity_from_guard(gpu),
-        n_pairs=min(len(a), len(b)),
-        workload="W1",
-        gpu=gpu,
-        arms={"A": arms["A"], "B": arms["B"], "prompt_id": prompt["id"], "seed": args.seed, "order": "ABBA"},
-        env=environment_fingerprint(Path(sys.executable)),
-        output=f"runs/{run}/report.json",
-        note=args.note,
-    )
-    ledger.write_report(run, {"run": run, "visits": visits, "gpu": gpu, "metrics": metrics})
-    ledger.append(row)
-    print(json.dumps({"run": run, "validity": row.validity, **metrics}, indent=2))
+    control = walls[0]
+    summaries = {}
+    order = "".join("ABCDEFGH"[i] for i in visit_order(len(arms)))
+    for index in range(1, len(arms)):
+        candidate = walls[index]
+        metrics: dict[str, object] = {}
+        if control and candidate:
+            metrics = {
+                "control_request_wall_s": spread(control),
+                "candidate_request_wall_s": spread(candidate),
+                "delta_pct": 100.0
+                * (statistics.median(candidate) - statistics.median(control))
+                / statistics.median(control),
+                "control_spread_pct": 100.0 * (max(control) - min(control)) / statistics.median(control),
+            }
+        summaries[arms[index]["name"]] = metrics
+        ledger.append(
+            LedgerRow(
+                run=run,
+                control=arms[0]["name"],
+                candidate=arms[index]["name"],
+                metrics=metrics,
+                verdict={"completed": bool(control and candidate), "trial": args.trial},
+                validity=validity_from_guard(gpu),
+                n_pairs=min(len(control), len(candidate)),
+                workload="W1",
+                gpu=gpu,
+                arms={
+                    "control": arms[0],
+                    "candidate": arms[index],
+                    "prompt_id": prompt["id"],
+                    "seed": args.seed,
+                    "order": order,
+                },
+                env=environment_fingerprint(Path(sys.executable)),
+                output=f"runs/{run}/report.json",
+                note=args.note,
+            )
+        )
+    ledger.write_report(run, {"run": run, "order": order, "visits": visits, "gpu": gpu, "metrics": summaries})
+    print(json.dumps({"run": run, "validity": validity_from_guard(gpu), "order": order, **summaries}, indent=2))
 
 
 if __name__ == "__main__":
