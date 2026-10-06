@@ -19,6 +19,30 @@ npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="N
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 
 
+def _has_int8_scaled_mm() -> bool:
+    """Whether this GPU has an INT8 W8A8 GEMM at all.
+
+    CUTLASS's `dispatch_scaled_mm` refuses on sm_120 (consumer Blackwell, e.g.
+    RTX 5090) with "Int8 not supported on SM120. Use FP8 quantization instead,
+    or run on older arch (SM < 100)". The INT8 *path* is still worth testing
+    there -- weights quantize, parameters are created, offload staging works --
+    but a forward through the kernel cannot run, so the tests that call one are
+    skipped rather than left failing.
+    """
+    if not current_omni_platform.is_cuda():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    return major < 12
+
+
+int8_mm_available = pytest.mark.skipif(
+    not _has_int8_scaled_mm(), reason="no INT8 scaled_mm on this architecture (sm_120 and newer consumer parts)"
+)
+
+
 def test_int8_config_creation():
     """Test that Int8 config can be created."""
     config = build_quant_config("int8")
@@ -470,7 +494,20 @@ class TestInt8OnlineLinearMethod:
         layer = Module()
         layer.weight = Parameter(torch.randn(128, 64))
         method.process_weights_after_loading(layer)
-        mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
+
+        # Quantized once, on the device the kernel can run on, with the weight's
+        # own values. It is deliberately not `layer.weight` itself: that weight
+        # may be in host memory under layer-wise offload, where
+        # `scaled_int8_quant` has no implementation, so the method stages a copy.
+        # Comparing against the parameter directly would also raise here, since
+        # the two live on different devices.
+        from vllm_omni.quantization.int8_config import kernel_device
+
+        mock_deps["quant"].assert_called_once()
+        passed = mock_deps["quant"].call_args.args[0]
+        assert passed.device == kernel_device()
+        assert torch.equal(passed.cpu(), layer.weight.detach().cpu())
+        assert mock_deps["quant"].call_args.kwargs == {"scale": None}
 
 
 @npu_available
@@ -610,6 +647,7 @@ class TestNPUInt8Smoke:
 
 
 @cuda_available
+@int8_mm_available
 class TestCudaInt8Smoke:
     """Smoke tests using real CUDA kernels, only on CUDA"""
 
@@ -676,3 +714,79 @@ class TestCudaInt8Smoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+
+class TestOnlineQuantizationOfAnOffloadedWeight:
+    """Online INT8 has to quantize weights that are not on the accelerator.
+
+    ``scaled_int8_quant`` is a CUDA/NPU kernel with no CPU implementation, and
+    under layer-wise offload the DiT's weights are staged in host memory with
+    only the block being computed resident. Quantizing in place therefore failed
+    at load with "Could not run '_C::dynamic_scaled_int8_quant' with arguments
+    from the 'CPU' backend", before the server ever answered a request.
+    """
+
+    @staticmethod
+    def _recording_quantizer(seen: list[torch.device]):
+        def quantize(weight: torch.Tensor, scale=None):
+            seen.append(weight.device)
+            rows, columns = weight.shape
+            return (
+                torch.zeros((rows, columns), dtype=torch.int8),
+                torch.ones((rows, 1), dtype=torch.float32),
+                None,
+            )
+
+        return quantize
+
+    def test_the_weight_is_moved_to_the_device_the_kernel_runs_on(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm_omni.quantization import int8_config
+
+        seen: list[torch.device] = []
+        weight = torch.randn(4, 8, device="cpu")
+        moved_to: list[torch.device] = []
+        original_to = torch.Tensor.to
+
+        def recording_to(self, *args, **kwargs):
+            if args and isinstance(args[0], torch.device):
+                moved_to.append(args[0])
+            return original_to(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", recording_to)
+        int8_config.quantize_weight_where_the_kernel_runs(
+            weight, torch.device("cpu"), self._recording_quantizer(seen)
+        )
+        assert seen == [torch.device("cpu")]
+        # Already on the compute device: no copy, because the resident case must
+        # not pay for the offloaded one.
+        assert moved_to == []
+
+    def test_the_results_come_back_on_the_weights_own_device(self):
+        from vllm_omni.quantization import int8_config
+
+        weight = torch.randn(4, 8, device="cpu")
+        qweight, scale = int8_config.quantize_weight_where_the_kernel_runs(
+            weight, torch.device("cpu"), self._recording_quantizer([])
+        )
+        assert qweight.device == weight.device
+        assert scale.device == weight.device
+        assert qweight.shape == weight.shape
+        assert scale.shape == (weight.shape[0], 1), "one scale per output row"
+
+    def test_the_kernel_device_is_not_the_default_device(self, monkeypatch: pytest.MonkeyPatch):
+        """During an offloaded load the default device is host memory, which is
+        exactly where the kernel cannot run."""
+        from vllm_omni.quantization import int8_config
+
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        assert int8_config.kernel_device() == torch.device("cuda", 0)
+
+    def test_without_an_accelerator_it_falls_back_to_the_host(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm_omni.quantization import int8_config
+
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_cuda", lambda: False)
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_npu", lambda: False)
+        assert int8_config.kernel_device() == torch.device("cpu")

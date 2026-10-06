@@ -85,6 +85,77 @@ else:
 # TODO add sage3 attention backend
 
 
+def _resolve_variant(backend_kwargs: dict | None) -> dict | None:
+    """Pick a SageAttention accuracy variant from the role's quant spec.
+
+    Without a quant spec this returns None and the caller keeps using the
+    top-level ``sageattn`` dispatcher, which is what every release before this
+    did -- so an unset spec cannot change a served configuration.
+
+    With one, two knobs are honoured, both of which trade speed for accuracy:
+
+    ``quant.dtype_vo``
+        ``float16`` selects ``sageattn_qk_int8_pv_fp16_cuda`` with FP32
+        accumulation, so the probability-times-value product is no longer FP8.
+        ``fp8_e4m3`` (or unset) keeps the FP8 PV path.
+    ``quant.q_block_size``
+        ``1`` selects ``qk_quant_gran="per_thread"``, the finest INT8 scale
+        granularity for Q and K, so one outlier row poisons a smaller group.
+        Anything coarser selects ``per_warp``, which is what the dispatcher
+        picks.
+
+    ``smooth_k`` is always on: it subtracts K's per-channel mean before
+    quantizing, and on a channel with a large offset that is where most of
+    INT8 attention's error comes from. There is no reason to want it off, so
+    it is not a knob.
+
+    Why this mapping and not new fields: ``AttnQuantSpec`` is shared with the
+    other quantizing backends, and ``dtype_vo``/``q_block_size`` already mean
+    "what precision does the value path use" and "how fine are the scales".
+    Spelling the same intent twice would let the two disagree.
+    """
+    quant = (backend_kwargs or {}).get("quant")
+    if not quant:
+        return None
+    dtype_vo = quant.get("dtype_vo")
+    granularity = "per_thread" if int(quant.get("q_block_size", 1) or 1) == 1 else "per_warp"
+
+    if dtype_vo == "float16":
+        from sageattention.core import sageattn_qk_int8_pv_fp16_cuda
+
+        def call(q, k, v, causal, scale):
+            return sageattn_qk_int8_pv_fp16_cuda(
+                q,
+                k,
+                v,
+                tensor_layout="NHD",
+                is_causal=causal,
+                qk_quant_gran=granularity,
+                sm_scale=scale,
+                pv_accum_dtype="fp32",
+                smooth_k=True,
+            )
+
+        return {"name": f"qk_int8_pv_fp16_fp32accum_{granularity}", "call": call}
+
+    from sageattention.core import sageattn_qk_int8_pv_fp8_cuda
+
+    def call(q, k, v, causal, scale):
+        return sageattn_qk_int8_pv_fp8_cuda(
+            q,
+            k,
+            v,
+            tensor_layout="NHD",
+            is_causal=causal,
+            qk_quant_gran=granularity,
+            sm_scale=scale,
+            pv_accum_dtype="fp32+fp16",
+            smooth_k=True,
+        )
+
+    return {"name": f"qk_int8_pv_fp8_{granularity}", "call": call}
+
+
 class SageAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -115,8 +186,12 @@ class SageAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        if backend_kwargs:
-            logger.warning("SageAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+        self.variant = _resolve_variant(backend_kwargs)
+        if self.variant is not None:
+            logger.info_once("SAGE_ATTN using the %s variant from attention quant spec", self.variant["name"])
+        unused = {k for k in (backend_kwargs or {}) if k != "quant"}
+        if unused:
+            logger.warning("SageAttentionImpl ignoring backend_kwargs: %s", sorted(unused))
 
     def forward_cuda(
         self,
@@ -132,6 +207,15 @@ class SageAttentionImpl(AttentionImpl):
                 "SAGE_ATTN requires sageattention. Install with: "
                 "pip install git+https://github.com/thu-ml/SageAttention.git"
             )
+        # Two ways to pick a Sage variant, kept deliberately. A `quant` spec on
+        # this role's AttentionSpec is per *role*, so one arm can run a careful
+        # kernel on the 50,220-query visual self-attention and the default
+        # elsewhere; the environment switch below is per *process*. The spec
+        # wins where both are set, because the more specific statement of intent
+        # should, and because an arm file travels with the measurement while an
+        # environment variable does not.
+        if self.variant is not None:
+            return self.variant["call"](query, key, value, self.causal, self.softmax_scale)
         kernel, kernel_kwargs = _cuda_sage_kernel()
         output = kernel(
             query,

@@ -61,9 +61,22 @@ before acting on it.
   anywhere in the set. An arm that passes both sets is a headline candidate,
   however narrowly; the fastest such stack is the showcase's answer.
 - **Tiers** follow the world-model vocabulary (exact, reorder, approx,
-  lossy) and are still reported beside the gate: approx is mean LPIPS <= 0.05
-  and max <= 0.10, as in the Qwen-Image studies. A lossy change additionally
-  gets a look at the frames.
+  lossy) and are still reported alongside the gate, because the two answer
+  different questions: the gate says whether an arm may ship, the tier says
+  what to call it. Approx is mean LPIPS <= 0.05 and max <= 0.10, as in the
+  Qwen-Image studies; `reorder` additionally requires being inside the
+  pipeline's own noise floor, which on this host is **max LPIPS 0.0030**
+  (measured by running one arm twice at the same seed). An arm can be
+  adoptable and `lossy` at once, and saying so is the point: a showcase that
+  calls a lossy arm near-lossless is the failure this pair of numbers exists
+  to prevent. A lossy change additionally needs a distributional check (CLIP
+  score) and a look at the frames.
+- **Measure the noise floor before quoting any gate number.** Run one arm
+  twice at the same seed and score it against itself. On this pipeline that
+  is LPIPS mean 0.0023 / max 0.0030 on the video, which makes a 0.118 result
+  50x the floor rather than a number to argue about — and **SI-SDR -1.4 dB on
+  the audio**, which means the audio branch is not reproducible and the
+  gate's audio half cannot distinguish an arm from a rerun until it is.
 - **Prompts:** two disjoint sets of at least 8 prompts each. Each must
   include a face or person, rendered text, fast motion, and speech or a
   sharp sound event. The vault shows why: an FP8 recipe passed one 8-prompt

@@ -187,6 +187,646 @@ later, in the video path, most likely per-process kernel choice in the VAE
 decode, which the Inductor cache does not pin. Every G1 number above
 carries that ~0.02.
 
+## The block schedule: speed is linear in the band, quality is not resolvable by a screen
+
+`AttentionSpec.layers` turns "which attention kernel" into "which blocks get the
+fast kernel", so the band of exact blocks at the two ends of the stack is a dial.
+Three settings, all on the exact BF16 streamed arm with Sage2 on `visual_self`:
+
+| arm | exact blocks | request (steady) |
+|---|---:|---:|
+| Sage2 everywhere (`tuned.json`) | 0 | 164.8 s |
+| `sage2-wide` (3:57) | 6 | 170.6 s |
+| `sage2-mid` (6:54) | 12 | 179.1 s |
+| platform default everywhere | 60 | 231.8 s |
+
+**Speed is close to linear in the band**, at 0.97 s a request per block over the
+first six and 1.42 s over the next six. The kernel race predicts 1.07 s a block:
+60 blocks x (177.66 - 70.53) ms of attention over 10 steps is 64 s across the
+whole stack. The two intervals bracket that rather than matching it, which is
+what three points measured once each can support -- the useful form of the
+result is that the band is a latency dial of roughly 1 s a block, not that it is
+exactly linear.
+
+Each number above is the **second** request of its run. The first carries
+compilation -- `sage2-wide`'s was 185.9 s against its steady 170.6 s -- so an
+arm screened without a warm-up and compared against one screened with a warm-up
+reads 15 s slower than it is.
+
+### Quality, and why these screens cannot order the bands
+
+Two-prompt screens against the eager reference, with the full set for the one
+arm that has one:
+
+| arm | a1 | a2 | screen mean | full set A |
+|---|---:|---:|---:|---:|
+| Sage2 everywhere | 0.0676 | 0.2462 | 0.1569 (1.08x floor) | **0.1858 (1.28x)** |
+| `sage2-wide` | 0.0577 | **0.2828** | 0.1703 (1.17x) | — |
+| `sage2-mid` | 0.0579 | 0.2291 | 0.1435 (0.99x) | — |
+
+Two things are wrong with reading a gate off that table, and both are worth
+keeping.
+
+**The screen underestimates the set.** For the one arm where both numbers exist,
+two prompts gave 0.1569 and the nine-prompt set gave 0.1858 -- 18% higher, and
+across the bar. a1 is the easiest prompt for every arm measured here and a2 the
+one that separates them, which makes them a good pair for *choosing what to run*
+and a bad pair for deciding anything.
+
+**And the ordering inverts.** `sage2-wide` approximates six blocks fewer than
+Sage2-everywhere and scored *worse* on a2, 0.2828 against 0.2462. That cannot be
+a property of the band. It is what a difference of 0.02-0.05 looks like when the
+pipeline's own compile floor has a set mean of 0.1455: the bands are separated
+by less than the noise they are measured through, so a single sample per prompt
+cannot order them.
+
+So the band was chosen on the only signal that survives -- `sage2-mid` is the
+one band better than Sage2-everywhere on *both* screened prompts -- and the
+decision is made on its full nine-prompt set, not on the screen.
+
+## Every arm measured tonight, and which reference each number is against
+
+The reference column is not bookkeeping. The same outputs score differently
+against a compiled reference, an eager one, and a same-host one, by more than
+most of the arms differ from each other -- so a number without its reference is
+not a measurement. All on Kandinsky 6 Pro-distill at W1 on one RTX 5090.
+
+**Floors** (each set's compiled reference against its own eager one, same host):
+set A **0.1455 / 0.4160**, set B **0.1615 / 0.3476**. G2 limits at 1.25x are
+therefore **0.1819 / 0.5200** for set A and **0.2019 / 0.4345** for set B.
+
+| arm | weights | request | set A mean / max | set B mean / max | ref | G1 | G2 | G3 |
+|---|---|---:|---:|---:|---|---|---|---|
+| platform default attention | BF16 streamed | 231.8 s | — it *is* the reference — | — | — | — | — | — |
+| Sage2 all 60 blocks | BF16 streamed | **165.9 s** | 0.1858 / 0.4738 | — | eager | fail | **1.28x fail** | +0.39% pass |
+| " (same outputs) | " | " | 0.1682 / 0.3693 | — | compiled | fail | — | +0.35% pass |
+| Sage2 blocks 3-56 (6 exact) | BF16 streamed | 170.6 s | a1 0.0577, a2 0.2828 (screen) | — | eager | — | — | — |
+| **Sage2 blocks 6-53 (12 exact)** | BF16 streamed | **177.7 s** | **0.1543 / 0.4591** | 0.1976 / 0.4989 | eager | fail | A **1.06x pass**, B 1.22x/**1.44x fail** | +0.00% pass |
+| Sage2 blocks 12-47 (24 exact) | BF16 streamed | ~190 s | — | b3 0.3349, b6 0.2767 (screen) | eager | — | — | — |
+| Sage2 "accurate" knobs | BF16 streamed | 192.8 s | a1 0.0563, a2 0.1867 (screen) | — | eager | — | — | — |
+| **blocks 6-53 + exact step 1** | BF16 streamed | **182.6 s** | **0.1296 / 0.3560** | **0.1561 / 0.3380** | eager | A mean inside, maxes over | **A 0.89x/0.86x, B 0.97x/0.97x — BOTH PASS** | **-0.07% pass** |
+| FP8 + Sage2 | FP8-min pinned | ~110 s | 0.2791 / 0.5649 | — | compiled | fail | ~1.9x fail | — |
+| FP8 + platform attention | FP8-min pinned | 173.6 s | 0.262 / 0.551 | — | compiled | fail | ~1.8x fail | — |
+
+Track M's arms on the same gates, for the Pareto frontier rather than for
+attribution: **INT8 storage + Sage2 + exact step 1 at 167.5 s** passes G2 and G3
+on set A (0.1735 / 0.4426 against the eager reference), and an **FFN FP8 band at
+148.9 s** fails G2 on set A (0.218 / 0.461), so that band is out.
+
+### The best arm: one exact sampler step on top of the block schedule
+
+`sage2-mid` plus `VLLM_OMNI_K6_EXACT_ATTN_STEPS=1` -- the 12-block band with the
+**first sampler step exact** -- is the strongest arm either track measured:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| a5-waterfall-drone | motion | 0.0319 | 0.0351 |
+| a1-portrait-speech | face, speech | 0.0345 | 0.0661 |
+| a4-chalkboard | text, face, speech | 0.0997 | 0.1096 |
+| a7-cafe-menu | text, face | 0.1026 | 0.1113 |
+| a9-violinist | face, motion | 0.1207 | 0.1909 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1525 | 0.2471 |
+| a2-neon-signage | text, motion | 0.1670 | 0.1909 |
+| a8-skateboard-crash | motion, sharp-sound | 0.2397 | **0.3120** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2179 | **0.3560** |
+| **set** | | **0.1296** | **0.3560** |
+
+**It sits below the pipeline's own floor on both halves** -- 0.89x the floor's
+mean and 0.86x its max. The difference between this arm and the BF16 reference
+is *smaller than the difference between compiling that reference and running it
+eager*. It is also the first arm here inside G1's **mean** (0.1296 against
+0.15), and ties the reference on prompt agreement (-0.07%).
+
+**One exact sampler step is worth more than twelve exact blocks.** Against the
+same band without it (0.1543 mean, 177.7 s), the step cut the set mean **16% for
+4.9 s a request**; against doubling the band instead (`sage2-narrow`, ~190 s) it
+is both better and 6 s cheaper. That is the vault's Qwen-Image result -- an error
+injected at an early step grows about 20x by the final latent -- reproduced on a
+different model and a different approximation, and it says the trajectory
+position matters more than the stack position for attention error.
+
+### Reading the frontier
+
+Two arms are faster than the 173.6 s FP8 baseline *and* pass a gate: Track M's
+INT8 arm at 167.5 s, and Sage2-everywhere at 165.9 s which fails G2 by 2%. Of
+the arms measured here, the only one that passes G2 on set A is the 12-block
+band at 177.7 s -- 2.4% slower than the baseline, which fails every gate.
+
+**Nothing on this list is both fast and gate-passing by a wide margin.** The
+frontier between 165 s and 190 s is where every candidate sits, and it is set by
+one thing: how much exact attention the arm keeps, in blocks or in steps. The
+174-184 s band is where the measured arms cross from failing to passing, and the
+arm now running is the cheapest crossing found.
+
+## The verdict: one arm passes on both prompt sets
+
+**SageAttention2 on visual blocks 6-53, with the first sampler step exact**, on
+exact BF16 weights streamed from the mmapped checkpoint. Each set scored against
+its own floor -- that set's compiled reference against its own eager one, both on
+the same host, which is the only pairing that means anything.
+
+| set | arm mean / max | floor mean / max | ratio | G2 (1.25x) | G1 | G3 |
+|---|---:|---:|---:|---|---|---|
+| A (9 prompts) | **0.1296 / 0.3560** | 0.1455 / 0.4160 | **0.89x / 0.86x** | **passes** | mean inside, max over | **-0.07% passes** |
+| B (8 scorable) | **0.1561 / 0.3380** | 0.1615 / 0.3476 | **0.97x / 0.97x** | **passes** | both over | — |
+
+**All four ratios are below 1.0.** The difference between this arm and the BF16
+reference is smaller than the difference between compiling that reference and
+running it eager -- on both sets, on both the mean and the worst frame. It is not
+one set getting lucky.
+
+Median **182.6 s** on set A (n=9, 182.4-186.7) and **183.9 s** on set B (n=9,
+182.2-186.3), cold start 22-28 s. Against the platform-default reference at
+231.8 s -- the only other configuration that passes anything -- that is **-21%**.
+Against the FP8 baseline at 173.6 s it is 5% slower, and that baseline fails
+every gate at 0.262 / 0.551.
+
+It does **not** pass the user's absolute gate. Set A's mean is inside (0.1296
+against 0.15) and set B's is just over (0.1561); both sets' worst frames exceed
+0.25. Given that the pipeline's own compile setting moves a worst frame by 0.416
+on set A and 0.348 on set B, no arm can clear a 0.25 absolute max here -- the
+reference cannot clear it against itself.
+
+### What fixed the prompt that failed everything else
+
+b6-train-platform was the single prompt that failed set B for every earlier arm,
+at 0.4989 against a 0.4345 limit. The block schedule alone could not reach it;
+doubling the band to 24 exact blocks took it to 0.3326 for 12 s a request. One
+exact *sampler step* took it to **0.3380** for 4.9 s, and did better on b3
+besides (0.2774 against 0.3349).
+
+| arm | b3 mean / max | b6 mean / max | request |
+|---|---:|---:|---:|
+| blocks 6-53 (12 exact) | 0.3307 / 0.3646 | 0.4387 / **0.4989** | 178.3 s |
+| blocks 12-47 (24 exact) | 0.3349 / 0.3681 | 0.2767 / 0.3326 | ~190 s |
+| **blocks 6-53 + exact step 1** | **0.2774 / 0.3084** | 0.2494 / **0.3380** | **~184 s** |
+
+The frames say why, more clearly than the numbers do.
+`showcase-samples/compare-b6-the-prompt-that-decided-it.jpg` puts eight frames of
+b6 across the reference, the band alone, and the band with an exact first step.
+The band-alone row is **framed differently** -- a wider, lower camera, different
+platform geometry, the station sign reduced to a shorter word -- while the
+exact-step row sits back on the reference's framing with its signage detail
+restored.
+
+So an error in the first sampler step changes **which sample the trajectory lands
+on**, and an error later only perturbs detail within the sample already chosen.
+That is a different kind of failure from the one a block-level approximation
+causes, and it is why a single exact step buys more than twelve exact blocks:
+the block schedule was reducing the size of a perturbation that had already sent
+the trajectory somewhere else.
+
+**Trajectory position beats stack position.** An exact first step is worth more
+than twelve more exact blocks and costs less than half as much, which is the
+vault's Qwen-Image finding -- an error injected at an early step grows about 20x
+by the final latent -- reproduced on a different model and a different
+approximation.
+
+## Set B is 28% harder than set A, which is why there are two sets
+
+The same arm, the same eight-of-nine prompts it could be scored on (Track M's
+eager set B reference is missing `b9-piano-tuner`), median 178.3 s a request:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| b8-surf-barrel | motion | 0.0536 | 0.0671 |
+| b5-glassblower | motion, face | 0.0682 | 0.0714 |
+| b1-newsreader | face, text, speech | 0.0972 | 0.1377 |
+| b2-market-haggle | face, speech, motion | 0.1410 | 0.1597 |
+| b7-child-birthday | face, sharp-sound | 0.1996 | **0.2699** |
+| b4-tennis-serve | motion, sharp-sound, face | 0.2517 | **0.2736** |
+| b3-storefront-sign | text, motion | 0.3307 | **0.3646** |
+| b6-train-platform | text, motion, sharp-sound | **0.4387** | **0.4989** |
+| **8-prompt set** | | **0.1976** | **0.4989** |
+
+Set A was 0.1543 for the same arm. The reason the sets disagree is in the
+categories: **B has two text-plus-motion prompts and they are its two worst**,
+where A has one. PLAN.md requires two disjoint sets on exactly this evidence --
+the vault's `c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09`, where an
+FP8 recipe passed one 8-prompt set at LPIPS 0.034 and failed another at 0.162 --
+and this is that case reproduced on a different model and a different
+approximation.
+
+**Set B has no floor-relative verdict here.** A floor is the compiled reference
+against the eager one *for that set*, and set B's compiled reference is still
+generating. Substituting set A's floor would be the easy wrong thing: set B's
+prompts are not set A's, and the difficulty ordering above is exactly what a
+floor would also pick up. The scorer reports G2 as **undecided** when no floor
+is supplied rather than falling back, and that is what it reports for set B.
+
+`b9-piano-tuner` is generated here but unscored, and named rather than dropped:
+a set mean over eight of nine prompts is a different gate, and this study has
+already had a partial set read the opposite of its full one.
+
+## The arm: SageAttention2 through blocks 6-53 of the stack
+
+Exact BF16 weights streamed from the mmapped checkpoint, SageAttention2 on
+`kandinsky6.visual_self` restricted to visual blocks 6-53, the platform default
+on blocks 0-5 and 54-59, SDPA on the two audio roles, compile at the platform
+default. **Median 177.7 s** a W1 request over nine timed requests (min 176.7,
+max 180.2, spread 1.9%; cold start 24.3 s).
+
+Set A against Track M's eager BF16 reference, with the measured floor
+(set mean 0.1455, set max 0.4160):
+
+| gate | number | limit | verdict |
+|---|---:|---:|---|
+| G1, the user's | mean **0.1543**, max 0.4591 | 0.15 / 0.25 | fails, mean over by 2.9% |
+| G2, floor-relative | **1.06x** the floor's mean, 1.10x its max | 1.25x | **passes** |
+| G3, distributional | set CLIP 0.3098 against 0.3098, **+0.00%** | +-2% | **passes** |
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| a5-waterfall-drone | motion | 0.0538 | 0.0590 |
+| a1-portrait-speech | face, speech | 0.0579 | 0.1068 |
+| a9-violinist | face, motion | 0.0837 | 0.1996 |
+| a4-chalkboard | text, face, speech | 0.1219 | 0.1612 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1350 | 0.1849 |
+| a7-cafe-menu | text, face | 0.1361 | 0.1530 |
+| a2-neon-signage | text, motion | 0.2291 | **0.2601** |
+| a8-skateboard-crash | motion, sharp-sound | 0.2710 | **0.3454** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2999 | **0.4591** |
+| **set** | | **0.1543** | **0.4591** |
+
+By category: sharp-sound 0.235, motion 0.179, text 0.162, face 0.139, speech
+0.090 -- the same ordering every arm here produces, and the opposite of what an
+attention-only screen on Kandinsky 6 **Lite** suggested.
+
+Against Sage2 on all 60 blocks (0.1858 mean, G2 1.28x, 165.9 s) **the schedule
+removes 17% of the error for 7% of the speed**, which is the difference between
+failing the working gate and passing it with room.
+
+### What a 0.4591 worst frame actually is
+
+`showcase-samples/compare-a3-sprint-start-sage2-mid-setA.jpg` puts eight frames
+of the worst prompt side by side, reference above arm. Same sprinter, same
+track, same camera move, same lighting, same background crowd -- **the arm
+frames the shot slightly tighter**. A global framing shift moves every pixel, so
+a per-frame perceptual metric scores it near its worst while a viewer would call
+both takes correct; the arm's CLIP agreement on that clip is -0.43%.
+
+a2 and a8 are a different matter: those lose rendered-signage glyphs and
+fast-motion detail that a viewer would notice. So this arm's error is **part
+sampling divergence and part real detail loss**, and a claim resting on a
+max-over-frames number has to say which it is made of. That is what G3 and the
+contact sheets are in this file for.
+
+## Where the reference was generated matters as much as how
+
+Two of this host's server processes, started 40 minutes apart with compile on
+and no determinism flags, produced **byte-identical MP4s** on the same prompts
+and seeds. Compiled execution is therefore not run-to-run random. Inductor
+benchmarks candidate kernels, picks by measured latency, and **caches the choice
+on disk** (`/tmp/torchinductor_$USER`, 1.2 GB here); once that cache is warm the
+choice is fixed and so is the output.
+
+So this pipeline has three different floors, with three different causes:
+
+| pairing | LPIPS mean / max | cause |
+|---|---:|---|
+| same host, warm cache, two processes | **0.0000 / 0.0000** | none; bit-identical |
+| different hosts, both compiled | 0.0272 / 0.0636 (a1) | each host's autotune choices |
+| same host, compiled vs eager | 0.1455 / 0.4160 | two fixed, different kernel sets |
+
+### What that does to every number above
+
+An arm scored against a reference from another machine is charged for that
+machine's autotune choices as well as for its own approximation. Scoring four
+arms against a reference generated **here**, on a1 and a2, the two prompts for
+which both sides exist locally:
+
+| arm | a1 mean / max | a2 mean / max | 2-prompt mean |
+|---|---:|---:|---:|
+| Sage2 everywhere | 0.0422 / 0.0486 | 0.1999 / 0.2134 | 0.1210 |
+| **`sage2-mid`** (blocks 6-53) | **0.0194 / 0.0369** | **0.1657 / 0.1827** | **0.0925** |
+| `sage2-wide` (blocks 3-56) | 0.0271 / 0.0354 | 0.2157 / 0.2283 | 0.1214 |
+| `sage2-accurate` | 0.0582 / 0.1090 | 0.2099 / 0.2356 | 0.1340 |
+
+The same Sage2 arm's a1 reads **0.0676** against the remote eager reference,
+**0.0422** against the remote compiled one, and the scheduled arm reads
+**0.0194** against a local control. The arm did not change; the reference did.
+
+And the band ordering, which [the band section](#the-block-schedule-speed-is-linear-in-the-band-quality-is-not-resolvable-by-a-screen)
+reports as unresolvable, resolves cleanly once the cross-host term is gone:
+twelve exact blocks are worth 24% of the error, six are worth nothing, and the
+accuracy knobs are the worst of the four. **That earlier conclusion was about
+the measurement, not about the arms**, and it is left in place above rather than
+rewritten, because the sequence is the point: a difference that sits under the
+noise of one comparison can be plain in a better-conditioned one.
+
+### What to do instead
+
+Pin `TORCHINDUCTOR_CACHE_DIR` to a shared path and prime it once, for the
+reference and every arm. It costs nothing, keeps compiled speed, and removes a
+term that was larger than the effects being measured -- without
+`TORCHINDUCTOR_DETERMINISTIC` and without falling back to eager.
+
+## The pipeline's own numerical floor is larger than the gate
+
+Track M measured it on set A: the same BF16 checkpoint through the same weight
+path at the same seeds, **compiled against eager**.
+
+| | set mean | set max |
+|---|---:|---:|
+| floor (BF16 compiled vs BF16 eager) | **0.1455** | **0.4160** |
+| the user's gate (G1) | 0.15 | 0.25 |
+| G2 limits (1.25x the floor) | 0.1819 | 0.5200 |
+
+**Turning `torch.compile` on and off moves a single frame by LPIPS 0.416.** The
+mechanism is Inductor's timing-based kernel selection, which Track M confirmed
+by checking that two *eager* processes are byte-identical while two compiled ones
+are not.
+
+That single row reframes the whole exercise. An absolute bar of max 0.25 is
+below the pipeline's own compile setting, so **the reference cannot be shown to
+pass the user's literal gate against itself** -- not because the model is
+unstable in any way a viewer would notice, but because LPIPS on a 121-frame clip
+counts the worst frame anywhere and a differently-scheduled kernel moves it. A
+gate that only a bit-exact change can pass is measuring the harness.
+
+Hence the three bars reported side by side in this file. G1 is the user's and
+stays. G2 is floor-relative: within 1.25x the floor on both halves. G3 is
+distributional. **G2 and G3 are coordinator-chosen pending the user.**
+
+### What that does to the arms
+
+Scored against the eager reference, which is the pairing G2 is defined against:
+
+| arm | request | G1 mean / max | G2 (x floor) | G3 |
+|---|---:|---:|---:|---|
+| BF16 streamed + Sage2 everywhere | 165.9 s | 0.1858 / 0.4738 | 1.28x / 1.14x — **fails** | +0.39%, passes |
+| FP8-min + Sage2 | ~110 s | 0.2791 / 0.5649 (vs compiled ref) | ~1.9x — fails | — |
+| FP8-min + platform attention | 175.5 s | 0.262 / 0.551 (vs compiled ref) | ~1.8x — fails | — |
+
+Sage2 everywhere misses G2 **by 2%** on the mean. Every FP8 arm misses it by
+nearly a factor of two, which is the same conclusion the weight-error table
+reaches from the other end: FP8's error is a property of the format, not of
+anything that can be tuned.
+
+Note what a compiled arm scored against an eager reference is carrying: the
+compile-vs-eager difference *and* its own approximation. The same Sage2 outputs
+against the *compiled* set A reference are 0.1682 / 0.3693. Both pairings are in
+the ledger and they answer different questions; the eager one is what G2 is
+defined against.
+
+## One-byte weights are closed on sm_120, so the lever is which blocks approximate
+
+*(Track M, 05:40: one-byte **storage** is open. The weight-only INT8 path,
+INT8 weights with BF16 GEMMs (`DiffusionInt8Config(weight_only=True)`, PR #28),
+runs on sm_120. What stays closed is an INT8 **GEMM**. See the headline section
+at the top for its numbers: it passes set A and fails set B.)*
+
+### INT8 would be the right format and has no kernel here
+
+The weight-error table below says INT8 at per-output-row scales costs 2.9x less
+than FP8 E4M3 at the same one byte per weight. It cannot be spent on this GPU.
+CUTLASS's own dispatch refuses:
+
+    RuntimeError: dispatch_scaled_mm, scaled_mm_helper.hpp:34,
+    Int8 not supported on SM120. Use FP8 quantization instead, or run on
+    older arch (SM < 100).
+
+reached by the repo's CUDA smoke test for `Int8LinearMethod.apply` rather than
+inferred from a serving failure. The weight-only route is closed too: vLLM's
+online quantization registry has no INT8 linear, its supported online weight
+keys being FP8 (per-tensor, per-channel, per-128-block) and the MX formats.
+
+So the one-byte formats available on consumer Blackwell are FP8 E4M3 and the MX
+family, which share E4M3's 3-bit mantissa, and NVFP4, which has fewer bits
+still. With the scale-invariance result below, **no sub-BF16 weight format on
+this GPU gets under ~2.6% relative weight error**, and 2.6% measures LPIPS 0.262
+against the BF16 reference -- against a 0.15 limit. The weights have to stay
+BF16, and precision is not the lever for either track.
+
+One real bug came out of the attempt and is fixed:
+`Int8OnlineLinearMethod.process_weights_after_loading` called the CUDA-only
+`scaled_int8_quant` on `layer.weight` wherever it happened to be, which under
+layer-wise offload is host memory -- so online INT8 plus offload died during
+load on *any* architecture, not only this one.
+
+### SageAttention's accuracy knobs are dominated
+
+With the weights fixed at BF16, attention is the only lever, and Sage2's default
+dispatch is too lossy (0.1682/0.3693, below). `arms/sage2-accurate.json` turns on
+the accuracy settings -- INT8 QK at per-thread granularity, PV in FP16 with FP32
+accumulation instead of FP8, smooth_k -- and is worse on both axes:
+
+| arm | a1 mean/max | a2 mean/max | request |
+|---|---:|---:|---:|
+| Sage2, default dispatch | 0.0495 / 0.0865 | 0.1551 / 0.1780 | 163.9 s |
+| Sage2, accuracy knobs on | 0.0563 / 0.0941 | 0.1867 / 0.2148 | 192.8 s |
+
+A two-prompt screen, which is enough to stop an arm and never enough to pass
+one. The mechanism is in the dispatcher: on sm_120 `sageattn` already selects
+`pv_accum_dtype="fp32+fp16"`, a two-level accumulation, so FP16 PV with FP32
+accumulation is not an upgrade over what the default already does, and
+per-thread QK granularity costs time at 50,220 queries without buying it back.
+**An accuracy knob is only an improvement relative to what the default actually
+does**, which has to be read out of the dispatcher rather than assumed from the
+knob's name.
+
+### What was missing was a way to approximate *some* blocks
+
+Both endpoints are measured and neither is adoptable -- Sage2 on all 60 blocks
+is 165.9 s and LPIPS 0.1682/0.3693, the platform default is 232.2 s and exact --
+and nothing in between could be expressed, because an attention config is
+per-role and a role spans every block. `AttentionSpec.layers` now takes a
+half-open range of layer indices, and a layer outside it falls through to the
+rest of the existing lookup, so:
+
+```json
+{"per_role": {"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN", "layers": "6:54"}}}}
+```
+
+puts the fast kernel through blocks 6-53 and leaves the platform default at both
+ends, where a perturbation has the most of the network left to amplify it or
+lands nearly in the output. The server log confirms it resolves both ways for
+the same role:
+
+    Resolved diffusion attention backend 'SAGE_ATTN' for role='kandinsky6.visual_self' via attention_config.per_role
+    Resolved diffusion attention backend 'CUDNN_ATTN' for role='kandinsky6.visual_self' (platform default)
+
+## What actually limits W1 on one 5090, and what a one-byte weight costs
+
+Three measurements that together pick the arms worth running. All on
+Kandinsky 6 **Pro-distill** at W1 (864x480, 121 frames, 10 PiFlow steps,
+guidance 1.0, audio on; 50,220 visual tokens through 60 blocks), scored against
+Track M's canonical BF16 reference for prompt set A.
+
+### The streamed BF16 arm is compute-bound with the platform's attention
+
+The Pro DiT is **56.14 GiB** in BF16 -- 60 visual blocks of 0.899 GiB, four text
+blocks totalling 2.13 GiB, 0.09 GiB of embeddings and heads -- which fits
+neither the 32 GB board nor the 60 GB host. It runs from the mmapped checkpoint
+(`--enable-distributed-layerwise-offload --dlo-no-use-allgather`), so every one
+of the 10 steps re-reads all of it.
+
+| streamed BF16 arm | s/step | request (median) |
+|---|---:|---:|
+| platform default attention (cuDNN), = the reference's configuration | 21.9 | ~240 s |
+| `arms/tuned.json` (Sage2 on `visual_self` and `video_audio_cross`) | 14.3-14.6 | **165.9 s** |
+
+During the run `iostat` showed **1.67 GB/s** from `nvme0n1` with `Cached:
+59.4 GB` and `Mapped: 57.0 GB`: about 24 GB of each step's 60.3 GB comes from
+the device and 36 GB from the page cache, a hit rate near 0.6 -- which is what
+LRU gives for a sequential rescan of a working set 1.06x the cache.
+
+So the stream is worth about 15 s/step, cuDNN's compute about 22 s, and Sage2
+takes the arm down **to the stream's floor and no further**. Two things follow.
+A faster attention kernel is worth a third of this arm's wall time, not the
+-37.4% it was worth on the pinned FP8 arm. And 14.5 s/step is the floor for BF16
+weights however fast attention gets, so an arm that wants to be fast has to cut
+bytes *and* keep the GEMMs fast.
+
+### SageAttention2 fails the user's gate on exact weights
+
+The same arm's quality, so the only difference from the reference is the
+attention kernel:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| G1 limits | | 0.15 | 0.25 |
+| a5-waterfall-drone | motion | 0.0451 | 0.0478 |
+| a1-portrait-speech | face, speech | 0.0495 | 0.0865 |
+| a4-chalkboard | text, face, speech | 0.1391 | 0.1756 |
+| a2-neon-signage | text, motion | 0.1551 | 0.1780 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1570 | 0.2128 |
+| a9-violinist | face, motion | 0.1806 | **0.2822** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2435 | **0.3277** |
+| a7-cafe-menu | text, face | 0.2634 | **0.2908** |
+| a8-skateboard-crash | motion, sharp-sound | 0.2805 | **0.3693** |
+| **set** | | **0.1682** | **0.3693** |
+
+Four of nine prompts over the max. This is the Lite screen's failure (mean
+0.118, max 0.375) reproduced on Pro against a real reference, and it refutes an
+inference worth recording because it was wrong in an instructive way: the FP8
+stack with Sage2 scored 0.2791 and FP8 alone 0.262, from which we had reasoned
+that attention was worth about 0.017. It is worth 0.168. Perceptual errors of
+this kind do not add -- the larger one hides the smaller -- so a stacked
+measurement attributes nothing to its smaller component.
+
+### FP8's weight error ignores scale granularity; INT8's does not
+
+`tools/weight_quant_error.py` quantizes the checkpoint's own tensors and reports
+the relative error of one quantize/dequantize round trip,
+`||W - dequant(quant(W))||_F / ||W||_F`. It needs no GPU, no server and no video,
+because it asks only about the weights. Median over 14 sampled 2-D weights
+spread across the stack:
+
+| format | per-tensor scale | per-output-row scale |
+|---|---:|---:|
+| FP8 E4M3 | 0.02645 | 0.02643 |
+| INT8 | 0.02057 | **0.00908** |
+
+**FP8's error does not care about the scale.** E4M3 carries its own 4-bit
+exponent, so a finer scale only slides the matrix along the exponent ladder
+while the quantization step stays at the 3-bit mantissa. It holds even for the
+sampled tensor whose amax is 76x its median row's
+(`va_modulation.out_layer`, where per-row INT8 is 2.5x better and per-row FP8 is
+1.01x better).
+
+That retires three hypotheses at once, before any of them cost a GPU hour: a
+per-row FP8 checkpoint, a wider FP8 keep profile, and FP8 scale tuning in
+general. It also explains the two things the gate numbers had made puzzling --
+why the measured 0.262 did not move between the `minimal` (15 tensors kept in
+BF16) and `sensitive` (367) keep profiles, since the error is per-weight and
+uniform rather than concentrated; and why a per-row-weight plus
+per-token-activation FP8 recipe scored *worse* at 0.338-0.364, since the weight
+half bought nothing and the activation half added a second error.
+
+INT8 is fixed point, so there the scale **is** the step, and a per-row scale buys
+real precision: 2.9x less error than FP8 for the same one byte per weight. The
+recipe DB's MiniMax-H3 entry, the nearest joint video+audio analogue, used INT8
+linears for the same reason (inherited evidence,
+`/data/jooman/k6/db/EVIDENCE.md`).
+
+vLLM-Omni serves it from the exact published checkpoint with no conversion step:
+`--diffusion-quantization-config int8` is `DiffusionInt8Config`, which quantizes
+each tensor as the checkpoint streams -- per-output-channel weight scales with
+dynamic per-token activation scales, so the GEMMs run on INT8 tensor cores, and
+`ignored_layers` can hold named layers in BF16 without rebuilding anything.
+
+## The quality gate: SageAttention on Kandinsky 6 is lossy, not approx
+
+This is the section that decides whether the speed numbers below are
+adoptable, and the answer is no for the attention arms.
+
+Scored the way [PLAN.md](PLAN.md) sets the gate: the same checkpoint, the same
+prompts, the same seeds, LPIPS per frame against the arm the model ships with
+— which is cuDNN in bf16 and so *is* the BF16 reference the gate asks for.
+Prompt set A, eight prompts, Kandinsky 6 Lite at W1's geometry. (Lite because
+Pro does not fit a 32 GB card with its text encoder.)
+
+| arm | set mean LPIPS | set max | verdict | prompts over the 0.10 max |
+|---|---:|---:|---|---:|
+| gate limits for `approx` | 0.05 | 0.10 | — | — |
+| `arms/tuned.json` (Sage2) | **0.1178** | **0.3745** | **FAILS** | 6 of 8 |
+| `arms/sage3.json` (Sage3) | **0.2530** | **0.5310** | **FAILS** | 8 of 8 |
+| *the same arm twice* | 0.0023 | 0.0030 | passes | 0 |
+
+### The last row is the one that makes the rest quotable
+
+Running the shipped arm twice — same prompt, same seed, same configuration —
+gives LPIPS mean 0.0023, max 0.0030, PSNR 52.3 dB. That is the **noise floor**
+of this pipeline, and it cost one extra request. Without it, 0.1178 is a
+number you have to argue about. With it, Sage2's mean is **50x the floor** and
+its max is **125x**, so neither failure is measurement noise and neither needs
+defending.
+
+### The failure is prompt-dependent, by a factor of 62
+
+Sage2, per prompt:
+
+| prompt | LPIPS mean | LPIPS max | PSNR | SSIM |
+|---|---:|---:|---:|---:|
+| a1 face close-up | 0.0046 | 0.0060 | 47.8 dB | 0.995 |
+| a2 person speaking | 0.0146 | 0.0173 | 41.2 dB | 0.991 |
+| a7 sharp sound | 0.0883 | 0.1311 | 33.3 dB | 0.964 |
+| a4 text on screen | 0.1006 | 0.1124 | 28.9 dB | 0.933 |
+| a5 fast motion | 0.1228 | 0.1908 | 33.2 dB | 0.939 |
+| a8 sharp sound + music | 0.1295 | 0.1506 | 28.9 dB | 0.881 |
+| a6 fast motion, crowd | 0.1983 | 0.3072 | 25.2 dB | 0.860 |
+| **a3 rendered text** | **0.2839** | **0.3745** | **20.4 dB** | **0.598** |
+
+Best on a face at 0.0046 — twice the noise floor, which anyone would call
+lossless. Worst on rendered text at 0.2839, with SSIM 0.598. **Had this been
+scored on one prompt, and had that prompt been the face, the arm would have
+been published as `reorder` tier.**
+
+That is `c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09` reproduced on
+a different model family with a different kernel: an INT8/FP8 attention recipe
+that is near-lossless on faces and destroys rendered text. It is the reason
+PLAN.md demands two disjoint prompt sets and why both of them require a text
+prompt.
+
+### What the kernel-level error did and did not predict
+
+The attention-kernel rel L2 against fp32 (0.039 for Sage2, 0.188 for Sage3)
+got the **order** right: Sage3 is 4.8x the kernel error and lands at 2.1x the
+set mean LPIPS. It got the **tier** wrong. A kernel rel L2 of 0.039 reads as
+small, and on an image it is lossy. **A kernel error is not a tier**, and the
+upper-bound argument in the attention-race section — that synthetic
+activations overstate a quantizing kernel's error — did not save it.
+
+### The audio half of the gate is not usable yet
+
+SI-SDR is **−1.4 dB for the control**: the same arm, same seed, run twice. At
+−1.4 dB the two audio tracks are substantially different signals, so the audio
+metric cannot currently distinguish an arm from a rerun. The video half of the
+same control is clean (LPIPS 0.0023, PSNR 52.3 dB), so this is the audio
+branch, not the harness. No audio figure in this document is quoted as an arm
+effect, and the audio branch needs a seeded deterministic path before the
+gate's audio half means anything.
+
+### What is adoptable
+
+`arms/lossless.json` moves only the two cheap audio roles to `TORCH_SDPA` and
+leaves `visual_self` on the platform default. Both are dense bf16 kernels
+computing the same operation as cuDNN, so the output should sit at the noise
+floor, and the swap was worth about 1.9 ms a block on a Pro-shaped block —
+roughly 114 ms a step over 60 blocks. Small and free, which is the opposite
+trade from the arm above.
+
 ## End to end: Kandinsky 6 Lite at W1's geometry
 
 The measurements above are one synthetic Pro block. This is a whole request.
@@ -290,8 +930,11 @@ python examples/offline_inference/text_to_video/text_to_video.py \
     --diffusion-attention-config showcase/kandinsky6/compute/arms/tuned.json
 ```
 
-It is still **ungated on quality**: `approx` tier by attention-kernel error on
-synthetic activations, never scored against a BF16 reference.
+> **It fails the quality gate.** When this was written its only accuracy
+> evidence was an attention-kernel error on synthetic activations. Scored
+> properly (see the gate section above) it is set mean LPIPS 0.1178 against a
+> 0.05 limit, so the arm is **lossy**, not `approx`, and the −23% is a lossy
+> speed number rather than an adoptable default.
 
 ### Two numbers for Track M
 
@@ -762,3 +1405,43 @@ and a session script spends the window.
 `attn_race.py --arms` takes the arm list; dropping `FLASHINFER_ATTN` on sm_120
 saves about 90 s a role. `python block_profile.py --list-shapes` prints the
 derived token counts the table's shapes come from.
+
+The served arms and their gate numbers:
+
+```bash
+cd showcase/kandinsky6/compute
+# One arm's W1 outputs for a prompt set, from real served requests.
+#   --offload dlo-mmap    exact BF16 weights, the reference's own weight path
+#   --offload layerwise   a pre-quantized checkpoint staged from pinned host RAM
+#   --quantization '{"method": "..."}'   quantize at load from the exact checkpoint
+#   --resident-layers N   keep N leading DiT blocks on the device. Lossless, and
+#                         it does not survive compilation on this model -- see
+#                         gate_pro.py's docstring.
+python run_when_free.py --need-free-gib 30 -- python gate_pro.py \
+    --arm arms/sage2-mid.json --name sage2-mid --offload dlo-mmap \
+    --out-dir /data/jooman/k6/results/gate-pro/sage2-mid
+
+# All three gates at once, with a contact sheet for whichever prompt scored worst.
+./score_arm.sh /data/jooman/k6/results/gate-pro/sage2-mid /data/jooman/k6/ref-eager/setA
+
+# G1 and G2. The floor comes from the reference measured against itself,
+# compiled against eager; without it G2 reports "undecided" rather than a pass.
+python gate_pro_score.py --arm-dir /data/jooman/k6/results/gate-pro/sage2-mid \
+    --reference-dir /data/jooman/k6/ref-eager/setA \
+    --g2-floor-mean 0.1455 --g2-floor-max 0.4160
+
+# G3 and the contact sheet. CPU by default: the GPU belongs to whatever is timed.
+CUDA_VISIBLE_DEVICES= python clip_gate.py \
+    --arm-dir /data/jooman/k6/results/gate-pro/sage2-mid \
+    --reference-dir /data/jooman/k6/ref-eager/setA --contact-sheet sheet.jpg
+```
+
+Scoring runs on the GPU unless `CUDA_VISIBLE_DEVICES=` is set, and it takes the
+host locks for that reason: a scorer that ignores them steals memory from a
+timed run, which happened once here and cost a measurement.
+
+What a one-byte weight costs, without a GPU at all:
+
+```bash
+python showcase/kandinsky6/tools/weight_quant_error.py --limit 24
+```

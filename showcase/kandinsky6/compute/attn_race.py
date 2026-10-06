@@ -210,6 +210,53 @@ def accuracy(candidate: torch.Tensor, reference: torch.Tensor) -> dict:
     }
 
 
+# SageAttention accuracy variants, as callables taking (q, k, v, scale) in
+# NHD layout. The registered SAGE_ATTN backend calls the top-level `sageattn`
+# dispatcher, which on sm_120 picks `qk_int8_pv_fp8_cuda` with
+# `pv_accum_dtype="fp32+fp16"` and `qk_quant_gran="per_warp"` -- the fastest
+# variant, and the one the quality gate rejected as lossy. These are the knobs
+# that trade it back:
+#
+#   qk_quant_gran  per_warp -> per_thread: finer INT8 scales for Q and K, so
+#                  one outlier row poisons a smaller group.
+#   PV path        fp8 -> fp16 with fp32 accumulation: the value-times-
+#                  probability product stops being FP8.
+#   smooth_k       subtract K's per-channel mean before quantizing, which is
+#                  where most of INT8 attention's error comes from on a
+#                  channel with a large offset.
+#
+# Raced directly rather than through the backend because the backend exposes
+# none of them yet: measuring first says whether plumbing them is worth it.
+def sage_variants() -> dict:
+    from sageattention.core import sageattn_qk_int8_pv_fp8_cuda, sageattn_qk_int8_pv_fp16_cuda
+
+    def fp8(gran):
+        def run(q, k, v, scale):
+            return sageattn_qk_int8_pv_fp8_cuda(
+                q, k, v, tensor_layout="NHD", is_causal=False, qk_quant_gran=gran,
+                sm_scale=scale, pv_accum_dtype="fp32+fp16", smooth_k=True,
+            )
+
+        return run
+
+    def fp16(gran, smooth_v):
+        def run(q, k, v, scale):
+            return sageattn_qk_int8_pv_fp16_cuda(
+                q, k, v, tensor_layout="NHD", is_causal=False, qk_quant_gran=gran,
+                sm_scale=scale, pv_accum_dtype="fp32", smooth_k=True, smooth_v=smooth_v,
+            )
+
+        return run
+
+    return {
+        "sage_fp8_perwarp": fp8("per_warp"),
+        "sage_fp8_perthread": fp8("per_thread"),
+        "sage_fp16fp32_perwarp": fp16("per_warp", False),
+        "sage_fp16fp32_perthread": fp16("per_thread", False),
+        "sage_fp16fp32_perthread_smoothv": fp16("per_thread", True),
+    }
+
+
 def build_attention(role: Role, backend: str):
     """An ``Attention`` layer for ``role`` with ``backend`` pinned."""
     from vllm_omni.diffusion.attention.layer import Attention
@@ -336,6 +383,83 @@ def race_role(role: Role, arms: list[str], args, device, dtype) -> dict:
     }
 
 
+def race_sage_variants(role: Role, args, device, dtype) -> dict:
+    """Time and score SageAttention's accuracy variants against fp32.
+
+    The dense control is the registered CUDNN_ATTN backend, so the table has
+    the same reference point as the backend race above.
+    """
+    q, k, v = make_activations(role, device, dtype, seed=args.seed)
+    reference = None if args.no_accuracy else reference_attention_fp32(
+        q, k, v, score_budget_gib=args.ref_score_budget_gib
+    )
+    scale = 1.0 / (role.head_dim**0.5)
+
+    arms: dict[str, object] = {}
+    errors: dict[str, str] = {}
+    try:
+        control = build_attention(role, "CUDNN_ATTN")
+        arms["cudnn_dense"] = lambda qq, kk, vv, _s: control(qq, kk, vv, None)
+    except Exception as exc:
+        errors["cudnn_dense"] = f"{type(exc).__name__}: {exc}"
+    try:
+        arms.update(sage_variants())
+    except Exception as exc:
+        errors["sage_variants"] = f"{type(exc).__name__}: {exc}"
+
+    accuracies: dict[str, dict] = {}
+    for label, run in list(arms.items()):
+        try:
+            with torch.inference_mode():
+                out = run(q, k, v, scale)
+            if reference is not None:
+                accuracies[label] = accuracy(out, reference)
+            del out
+        except Exception as exc:
+            errors[label] = f"{type(exc).__name__}: {exc}"
+            arms.pop(label)
+    del reference
+    torch.accelerator.empty_cache()
+
+    live = list(arms)
+    order: list[str] = []
+    for _ in range(args.rounds):
+        order.extend(live)
+        order.extend(reversed(live))
+
+    samples: dict[str, list[float]] = {label: [] for label in live}
+    with torch.inference_mode():
+        for label in order:
+            run = arms[label]
+            for _ in range(args.warmups):
+                run(q, k, v, scale)
+            torch.accelerator.synchronize()
+            for _ in range(args.repeats):
+                start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                run(q, k, v, scale)
+                stop.record()
+                torch.accelerator.synchronize()
+                samples[label].append(start.elapsed_time(stop))
+
+    timings = {}
+    for label, values in samples.items():
+        median = statistics.median(values)
+        timings[label] = {
+            "median_ms": round(median, 4),
+            "min_ms": round(min(values), 4),
+            "max_ms": round(max(values), 4),
+            "spread_pct": round(100.0 * (max(values) - min(values)) / median, 2),
+            "samples": len(values),
+            "achieved_tflops": round(role.tflop / (median / 1e3), 1),
+        }
+
+    del arms, q, k, v
+    torch.accelerator.empty_cache()
+    return {"role": role.name, "q": role.q, "kv": role.kv, "heads": role.heads, "head_dim": role.head_dim,
+            "tflop_per_call": round(role.tflop, 3), "timings": timings, "accuracy": accuracies, "errors": errors}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arms", default=",".join(DEFAULT_ARMS), help="comma-separated backend names")
@@ -356,6 +480,12 @@ def main() -> int:
         action="store_true",
         help="run without the GPU locks and without the foreign-process check. Correctness checks only: "
         "a timing taken without the locks is not a measurement and must never be recorded as one.",
+    )
+    parser.add_argument(
+        "--sage-variants",
+        action="store_true",
+        help="race SageAttention's accuracy variants (INT8 granularity, FP16-vs-FP8 PV, smooth_v) "
+        "against CUDNN_ATTN instead of racing the registered backends",
     )
     parser.add_argument("--allow-foreign-gpu", action="store_true")
     args = parser.parse_args()
@@ -422,7 +552,10 @@ def main() -> int:
         # FLOPs.
         save()
         for role in roles:
-            results.append(race_role(role, arms, args, device, dtype))
+            if args.sage_variants:
+                results.append(race_sage_variants(role, args, device, dtype))
+            else:
+                results.append(race_role(role, arms, args, device, dtype))
             save()
         payload["complete"] = True
         save()

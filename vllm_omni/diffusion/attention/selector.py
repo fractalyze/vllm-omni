@@ -104,6 +104,7 @@ def get_attn_backend_for_role(
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
     allow_trtllm_default: bool = True,
+    layer_index: int | None = None,
 ) -> tuple[type[AttentionBackend], AttentionSpec | None]:
     """
     Get attention backend for a specific attention role.
@@ -113,6 +114,9 @@ def get_attn_backend_for_role(
       2. attention_config.per_role[role_category]   — category fallback
       3. attention_config.default                   — global default
       4. Platform default                           — hardware-specific
+
+    A spec carrying a ``layers`` range is skipped for layers outside it, and the
+    lookup continues as though it were absent.
 
     Args:
         role: Attention role string (e.g. "self", "cross", "joint",
@@ -134,6 +138,7 @@ def get_attn_backend_for_role(
         spec, source = attention_config.resolve_with_source(
             role=role,
             role_category=role_category,
+            layer_index=layer_index,
         )
 
     if spec is not None:

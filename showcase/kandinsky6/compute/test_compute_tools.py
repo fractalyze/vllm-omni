@@ -241,6 +241,12 @@ class AttentionArmConfigTest(parameterized.TestCase):
     # role_category each call site passes alongside.
     K6_ROLES = (
         ("kandinsky6.visual_self", "self"),
+        # The exact-attention schedule's fallback role. A visual self-attention
+        # call routed through it resolves to the platform default, because no
+        # arm config names it -- that is how `VLLM_OMNI_K6_EXACT_ATTN_STEPS` and
+        # `_BLOCKS` make individual calls exact without a second backend
+        # setting. It belongs here because the port really does pass it.
+        ("kandinsky6.visual_self_exact", "self"),
         ("kandinsky6.text_self", "self"),
         ("kandinsky6.audio_self", "self"),
         ("kandinsky6.text_cross", "cross"),
@@ -280,6 +286,59 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # The two cheap audio roles only. Dense bf16 either way, so this arm
+        # is the one expected to sit at the gate's noise floor -- `tuned.json`
+        # does not (set mean LPIPS 0.118 against a 0.05 limit).
+        "lossless.json": {
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        # `tuned.json` without Sage on video_audio_cross. That call is 0.19 ms
+        # a block, so dropping it costs almost no speed and removes one of the
+        # two quantized paths -- the cheapest thing to try against the gate's
+        # max limit.
+        "sage2-visual-only.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        # The band dial: the same Sage2 kernel on the same roles, restricted to a
+        # range of visual blocks so the ends of the stack keep exact attention.
+        # Only the range differs between the three, which is the point -- the
+        # band is the free parameter once the weights are BF16 and the kernel is
+        # chosen.
+        "sage2-wide.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        "sage2-mid.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        "sage2-narrow.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        # The same roles, with Sage's accuracy knobs on: FP16 PV with FP32
+        # accumulation and per-thread INT8 granularity.
+        "sage2-accurate.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        # tuned.json with Sage3 (FP4) on the dominant call. Its kernel is
+        # 1.27x Sage2's, so this is the fastest arm worth gating -- the
+        # objective is the fastest config that passes, and on Pro the first
+        # prompt left error budget to spend.
+        "sage3-tuned.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN_3",
+            "kandinsky6.video_audio_cross": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
     }
 
     # Roles that receive a padding mask, so a mask-rejecting backend must
@@ -294,6 +353,10 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_arm_resolves_exactly_the_roles_it_claims(self, filename):
         import json
@@ -313,6 +376,10 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_no_mask_rejecting_backend_on_a_masked_role(self, filename):
         """SageAttention raises on attn_mask, and the two text roles get one.
@@ -326,6 +393,10 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_the_named_backends_exist_in_the_registry(self, filename):
         """A backend name that is not a registry member would only fail at
@@ -516,3 +587,461 @@ class OutputDeltaControlTest(absltest.TestCase):
         self.assertTrue(result["control_is_finite"])
         self.assertTrue(result["same"]["comparable"])
         self.assertEqual(result["same"]["outputs"][0]["rel_l2"], 0.0)
+
+
+class NablaGeometryTest(parameterized.TestCase):
+    """The port's NABLA path needs both patched latent dims divisible by 8.
+
+    `fractal_flatten(..., block_mask=True)` patches the grid in 8x8 tiles, so
+    a grid whose H or W is not a multiple of 8 fails the reshape. That rules
+    out W1 (31 x 30 x 54) and the 512x320 smoke (7 x 20 x 32), which is why
+    `--geometry nabla-ok` exists. Asserted here so a backlog item that says
+    "NABLA at W1" is contradicted by the test suite rather than by an hour of
+    GPU time.
+    """
+
+    @parameterized.named_parameters(
+        ("w1", "w1", False),
+        ("smoke", "smoke", False),
+        ("nabla_ok", "nabla-ok", True),
+    )
+    def test_sparse_params_accepts_only_a_divisible_grid(self, geometry, expected_ok):
+        import torch
+        from block_profile import GEOMETRIES, PRO, Shapes, sparse_params
+
+        shapes = Shapes(**GEOMETRIES[geometry])
+        if expected_ok:
+            params = sparse_params(PRO, shapes, torch.device("cpu"), threshold=0.9)
+            blocks = shapes.latent_frames * (shapes.latent_h // 8) * (shapes.latent_w // 8)
+            # The prior must be block-granular, or it will not broadcast
+            # against nabla_block_mask's (B, h, S/64, S/64) scores.
+            self.assertEqual(tuple(params["sta_mask"].shape), (blocks, blocks))
+            self.assertEqual(blocks, shapes.visual_tokens // 64)
+            self.assertTrue(params["to_fractal"])
+        else:
+            with self.assertRaisesRegex(ValueError, "divisible by 8"):
+                sparse_params(PRO, shapes, torch.device("cpu"), threshold=0.9)
+
+    def test_the_fractal_reorder_itself_rejects_w1(self):
+        """The constraint is the port's, not this harness's: show it failing
+        in `fractal_flatten` directly."""
+        import torch
+
+        from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import fractal_flatten
+
+        frames, height, width = 31, 30, 54  # W1's patched latent grid
+        x = torch.zeros(frames, height, width, 8)
+        rope = torch.zeros(frames, height, width, 1, 4, 2, 2)
+        with self.assertRaises(RuntimeError):
+            fractal_flatten(x, rope, (frames, height, width), block_mask=True)
+
+
+class GateTierTest(parameterized.TestCase):
+    """The two bars are separate and both are reported.
+
+    The adoption gate (mean <= 0.15, max <= 0.25) says whether an arm may
+    ship; the `approx` tier (0.05 / 0.10) says what to call it. An arm can
+    clear the first and still be `lossy`, and a showcase that collapses the
+    two is how a lossy arm gets published as near-lossless.
+    """
+
+    @parameterized.named_parameters(
+        # (set_mean, set_max, noise_floor_max, expected tier)
+        ("identical", 0.0, 0.0, None, "exact"),
+        ("inside_the_noise_floor", 0.001, 0.0025, 0.0030, "reorder"),
+        ("above_the_floor_but_tight", 0.01, 0.02, 0.0030, "approx"),
+        ("no_floor_measured_never_reorder", 0.001, 0.0025, None, "approx"),
+        ("sage2_on_set_a", 0.1178, 0.3745, 0.0030, "lossy"),
+        ("mean_ok_max_not", 0.02, 0.2, 0.0030, "lossy"),
+    )
+    def test_tier(self, set_mean, set_max, floor, expected):
+        from gate_score import tier
+
+        self.assertEqual(tier(set_mean, set_max, floor), expected)
+
+    def test_sage2_on_set_a_passes_the_mean_and_fails_the_max(self):
+        """The measured numbers, as a regression on the limits themselves: if
+        someone widens a limit, this says which conclusion changes."""
+        from gate_score import ADOPTION_MAX_LPIPS, ADOPTION_MEAN_LPIPS
+
+        set_mean, set_max = 0.1178, 0.3745
+        self.assertLessEqual(set_mean, ADOPTION_MEAN_LPIPS)
+        self.assertGreater(set_max, ADOPTION_MAX_LPIPS)
+
+    def test_the_adoption_bar_is_looser_than_the_approx_tier(self):
+        from gate_score import (
+            ADOPTION_MAX_LPIPS,
+            ADOPTION_MEAN_LPIPS,
+            APPROX_MAX_LPIPS,
+            APPROX_MEAN_LPIPS,
+        )
+
+        self.assertGreater(ADOPTION_MEAN_LPIPS, APPROX_MEAN_LPIPS)
+        self.assertGreater(ADOPTION_MAX_LPIPS, APPROX_MAX_LPIPS)
+
+
+class SageAccuracySpecTest(absltest.TestCase):
+    """`arms/sage2-accurate.json` must actually select the accurate variant.
+
+    The arm differs from `sage2-visual-only.json` only in a `quant` block, so
+    a resolver that silently ignored it would leave two files that look
+    different and behave identically -- and the gate numbers would be
+    attributed to a knob that never took effect.
+    """
+
+    def _quant_of(self, filename, role="kandinsky6.visual_self"):
+        import json
+
+        from vllm_omni.diffusion.data import build_attention_config
+
+        path = Path(__file__).resolve().parent / "arms" / filename
+        config = build_attention_config(json.loads(path.read_text()))
+        spec, _ = config.resolve_with_source(role=role, role_category="self")
+        return spec.backend_kwargs()
+
+    def test_the_accurate_arm_selects_the_fp16_fp32accum_per_thread_variant(self):
+        from vllm_omni.diffusion.attention.backends.sage_attn import _resolve_variant
+
+        variant = _resolve_variant(self._quant_of("sage2-accurate.json"))
+        self.assertIsNotNone(variant)
+        self.assertEqual(variant["name"], "qk_int8_pv_fp16_fp32accum_per_thread")
+
+    def test_the_plain_arm_keeps_the_dispatcher(self):
+        """No quant spec means the top-level dispatcher, which is what every
+        release before this knob used."""
+        from vllm_omni.diffusion.attention.backends.sage_attn import _resolve_variant
+
+        self.assertIsNone(_resolve_variant(self._quant_of("sage2-visual-only.json")))
+        self.assertIsNone(_resolve_variant(self._quant_of("tuned.json")))
+
+
+class ServeFlagsTest(parameterized.TestCase):
+    """The flag list is the arm's definition, so it is tested without a GPU.
+
+    Two arms are only comparable if their server flags differ in exactly the
+    thing under test. These assert the two offload modes are the ones the
+    showcase's own serve scripts use, and that asking for an unknown one fails
+    loudly rather than silently serving the default -- which would produce a
+    plausible number for the wrong configuration.
+    """
+
+    def test_the_bf16_mode_matches_the_reference_serve_script(self):
+        from gate_pro import serve_flags
+
+        script = (Path(__file__).resolve().parents[1] / "serve" / "serve_pro_bf16_ref.sh").read_text()
+        flags = serve_flags("dlo-mmap", None, None)
+        for flag in ("--enable-distributed-layerwise-offload", "--dlo-no-use-allgather",
+                     "--disable-multithread-weight-load"):
+            self.assertIn(flag, flags)
+            self.assertIn(flag, script)
+        self.assertNotIn("--enable-layerwise-offload", flags)
+
+    def test_the_fp8_mode_matches_the_baseline_serve_script(self):
+        from gate_pro import serve_flags
+
+        script = (Path(__file__).resolve().parents[1] / "serve" / "serve_pro_fp8.sh").read_text()
+        flags = serve_flags("layerwise", None, None)
+        self.assertIn("--enable-layerwise-offload", flags)
+        self.assertIn("--enable-layerwise-offload", script)
+        self.assertNotIn("--enable-distributed-layerwise-offload", flags)
+
+    @parameterized.parameters("layerwise", "dlo-mmap")
+    def test_the_attention_config_is_the_only_other_difference(self, offload):
+        from gate_pro import serve_flags
+
+        shipped = serve_flags(offload, None, None)
+        armed = serve_flags(offload, '{"per_role": {}}', None)
+        self.assertEqual(armed[: len(shipped)], shipped)
+        self.assertEqual(armed[len(shipped):], ["--diffusion-attention-config", '{"per_role": {}}'])
+
+    def test_an_unknown_offload_mode_is_refused(self):
+        from gate_pro import serve_flags
+
+        with self.assertRaisesRegex(ValueError, "unknown offload mode"):
+            serve_flags("resident", None, None)
+
+
+class ReferenceManifestRoundTripTest(absltest.TestCase):
+    """A gate run's own manifest has to be readable as a reference.
+
+    Set B has no canonical BF16 reference, so one has to be generated here and
+    then scored against -- which only works if the directory a gate run writes
+    is the shape ``_reference_settings`` reads. This asserts the round trip
+    rather than trusting that two dict literals in the same file agree.
+    """
+
+    def test_a_gate_manifest_is_a_reference_manifest(self):
+        import json
+        import tempfile
+
+        from gate_pro import _reference_settings
+
+        prompts = [
+            {"id": "b1-newsreader", "categories": ["face", "speech"]},
+            {"id": "b2-market-haggle", "categories": ["speech"]},
+        ]
+        geometry = {"width": 864, "height": 480, "num_frames": 121,
+                    "num_inference_steps": 10, "guidance_scale": 1.0}
+        manifest = {
+            "arm": "bf16-stream-control",
+            "items": {
+                entry["id"]: {
+                    "categories": entry["categories"],
+                    "request_wall_s": 175.0,
+                    "started": 1791300000.0,
+                    "seed": 42,
+                    "geometry": geometry,
+                }
+                for entry in prompts
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(manifest))
+            seeds, read_geometry = _reference_settings(path, prompts)
+
+        self.assertEqual(seeds, {"b1-newsreader": 42, "b2-market-haggle": 42})
+        self.assertEqual(read_geometry, geometry)
+
+
+class LoadTimeQuantizationFlagTest(absltest.TestCase):
+    """Load-time quantization is a flag on the exact checkpoint, not a new one.
+
+    The offline converter writes per-*tensor* scales because vLLM's serialized
+    fp8 method cannot read per-row ones. vLLM's online methods can, so the
+    better recipe is reachable without a converter at all -- provided the flag
+    is passed and provided it is the only difference from the arm it is
+    compared with.
+    """
+
+    def test_the_method_name_reaches_the_server(self):
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, "fp8_per_channel")
+        self.assertEqual(flags[-2:], ["--diffusion-quantization-config", "fp8_per_channel"])
+
+    def test_vllm_knows_the_method_and_it_is_per_output_row(self):
+        """Guards the name against a vLLM bump, and the recipe against a typo:
+        ``fp8_per_tensor`` is also a valid name and is the thing being replaced."""
+        from vllm.config.quantization import resolve_quantization_config
+
+        args = resolve_quantization_config("fp8_per_channel", None)
+        group_shape = args.linear.weight.scale.group_shape
+        self.assertEqual((group_shape.row, group_shape.col), (-1, 1))
+        self.assertIsNone(args.linear.activation, "weight-only: activations stay BF16")
+
+    def test_no_quantization_leaves_the_flag_list_alone(self):
+        from gate_pro import serve_flags
+
+        self.assertEqual(serve_flags("layerwise", None, None), serve_flags("layerwise", None, None, None))
+
+
+class OffloadPlacementTest(absltest.TestCase):
+    """Resident blocks and text-encoder offload, validated against vLLM-Omni's own parser.
+
+    This arm is weight-traffic-bound -- 60.3 GB re-read per step -- so where a
+    tensor lives is a performance lever, and neither of these two placements has
+    a CLI flag. The emitted config is checked by the parser that will consume it
+    rather than against a literal, because the schema lives in another repo path
+    and a silently rejected config would serve the default arm under the
+    candidate's name.
+    """
+
+    def _parsed(self, flags):
+        import json
+
+        from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
+
+        self.assertIn("--diffusion-offload-config", flags)
+        payload = flags[flags.index("--diffusion-offload-config") + 1]
+        return parse_diffusion_offload_config(json.loads(payload))
+
+    def test_the_plain_arms_keep_the_legacy_flags(self):
+        """No extras means byte-identical flags to the reference serve script;
+        the public config is only reached when something needs it."""
+        from gate_pro import serve_flags
+
+        for offload in ("layerwise", "dlo-mmap"):
+            flags = serve_flags(offload, None, None)
+            self.assertNotIn("--diffusion-offload-config", flags)
+
+    def test_resident_blocks_resolve_to_the_streaming_backend(self):
+        from vllm_omni.diffusion.offloader.config import DLOTransfer, OffloadStrategy, _public_strategy
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, resident_layers=5)
+        parsed = self._parsed(flags)
+        self.assertEqual(parsed.layer_options["dit"].resident_layers, 5)
+        self.assertEqual(parsed.layer_options["dit"].weight_transfer, DLOTransfer.RANK_LOCAL)
+        self.assertEqual(_public_strategy(parsed), OffloadStrategy.DISTRIBUTED_LAYER_WISE)
+        self.assertIn("--enable-distributed-layerwise-offload", flags)
+
+    def test_the_allgather_flag_is_not_passed_beside_the_config(self):
+        """`_validate_legacy_layer_options` rejects that pair outright, so the
+        server would refuse to start."""
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, resident_layers=5, offload_text_encoder=True)
+        self.assertNotIn("--dlo-no-use-allgather", flags)
+
+    def test_offloading_the_text_encoder_selects_it(self):
+        from gate_pro import serve_flags
+
+        parsed = self._parsed(serve_flags("dlo-mmap", None, None, None, offload_text_encoder=True))
+        self.assertEqual(parsed.components, frozenset({"dit", "text_encoder"}))
+
+    def test_a_streamed_arm_without_resident_blocks_still_streams(self):
+        """Rank-local with no resident block resolves to plain layer-wise, which
+        stages from pinned host memory -- a different arm. The backend flag is
+        what keeps it the streamed one."""
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, offload_text_encoder=True)
+        self.assertIn("--enable-distributed-layerwise-offload", flags)
+
+
+class WorkingGateTest(parameterized.TestCase):
+    """G2, the floor-relative gate, including its refusal to guess a floor.
+
+    The literal gate is absolute, and on this pipeline a rerun of the same
+    configuration in a fresh process already moves LPIPS because Inductor picks
+    kernels by timing. An absolute bar below that movement is a bar on the noise,
+    not on the arm. These tests pin the arithmetic and, more importantly, that a
+    missing floor is reported as undecided rather than treated as zero -- which
+    would restate the literal gate under a second name and look like a second
+    opinion.
+    """
+
+    def test_an_arm_at_the_floor_passes(self):
+        from gate_pro_score import g2_verdict
+
+        verdict = g2_verdict(0.196, 0.269, 0.196, 0.269)
+        self.assertTrue(verdict["passes"])
+        self.assertAlmostEqual(verdict["mean_over_floor"], 1.0)
+
+    def test_an_arm_inside_the_slack_passes_and_outside_fails(self):
+        from gate_pro_score import g2_verdict
+
+        self.assertTrue(g2_verdict(0.24, 0.33, 0.196, 0.269)["passes"])
+        self.assertFalse(g2_verdict(0.26, 0.33, 0.196, 0.269)["passes"])
+
+    def test_either_half_can_fail_it(self):
+        from gate_pro_score import g2_verdict
+
+        self.assertFalse(g2_verdict(0.20, 0.40, 0.196, 0.269)["passes"], "max over the limit")
+        self.assertFalse(g2_verdict(0.30, 0.28, 0.196, 0.269)["passes"], "mean over the limit")
+
+    @parameterized.parameters((None, 0.269), (0.196, None), (None, None))
+    def test_a_missing_floor_is_undecided_not_a_pass(self, floor_mean, floor_max):
+        from gate_pro_score import g2_verdict
+
+        verdict = g2_verdict(0.01, 0.02, floor_mean, floor_max)
+        self.assertFalse(verdict["decidable"])
+        self.assertNotIn("passes", verdict)
+
+
+class DistributionalGateTest(absltest.TestCase):
+    """G3's verdict: two-sided, and undefined rather than passing at zero.
+
+    CLIP cannot tell a better video from a differently-wrong one, so an arm
+    whose prompt agreement rises is drifting just as much as one whose
+    agreement falls. A one-sided test would pass exactly the case this check
+    exists to catch.
+    """
+
+    def test_a_small_move_either_way_passes(self):
+        from clip_gate import g3_verdict
+
+        self.assertTrue(g3_verdict(0.3110, 0.3099)["passes"])
+        self.assertTrue(g3_verdict(0.3099 * 0.99, 0.3099)["passes"])
+
+    def test_a_rise_past_the_tolerance_fails_like_a_fall(self):
+        from clip_gate import g3_verdict
+
+        self.assertFalse(g3_verdict(0.3099 * 1.05, 0.3099)["passes"])
+        self.assertFalse(g3_verdict(0.3099 * 0.95, 0.3099)["passes"])
+
+    def test_a_zero_reference_is_undecided(self):
+        from clip_gate import g3_verdict
+
+        self.assertFalse(g3_verdict(0.3, 0.0)["decidable"])
+
+
+class BandedArmTest(parameterized.TestCase):
+    """The three banded arms differ only in their layer range.
+
+    They exist to measure one dial, so anything else differing between them
+    would make the curve measure two things at once.
+    """
+
+    BANDS = {"sage2-wide.json": "3:57", "sage2-mid.json": "6:54", "sage2-narrow.json": "12:48"}
+
+    def _arm(self, filename):
+        import json
+
+        return json.loads((Path(__file__).resolve().parent / "arms" / filename).read_text())
+
+    @parameterized.parameters(*sorted(BANDS))
+    def test_the_range_is_the_only_difference_from_the_others(self, filename):
+        import copy
+
+        reference = copy.deepcopy(self._arm("sage2-mid.json"))
+        candidate = copy.deepcopy(self._arm(filename))
+        for arm in (reference, candidate):
+            arm["per_role"]["kandinsky6"]["visual_self"].pop("layers")
+        self.assertEqual(candidate, reference)
+
+    @parameterized.parameters(*sorted(BANDS.items()))
+    def test_each_band_is_the_range_it_is_named_for(self, filename, layers):
+        self.assertEqual(self._arm(filename)["per_role"]["kandinsky6"]["visual_self"]["layers"], layers)
+
+    @parameterized.parameters(*sorted(BANDS.items()))
+    def test_the_range_is_symmetric_about_a_sixty_block_stack(self, filename, layers):
+        """Kandinsky 6 Pro has 60 visual blocks and the schedule protects both
+        ends, so an asymmetric band would be measuring two changes."""
+        start, stop = (int(part) for part in layers.split(":"))
+        self.assertEqual(start, 60 - stop, f"{filename}: {start} exact at the front, {60 - stop} at the back")
+
+
+class CompileDynamicFlagTest(parameterized.TestCase):
+    """Static-shape compilation, which this workload can use and does not by default.
+
+    The platform compiles the DiT with `dynamic=True`, which is right for a
+    server that sees many geometries. These arms only ever run W1, so
+    specialising on 50,220 tokens is available for free -- except that changing
+    compilation changes which kernels run, and on this pipeline that is worth
+    LPIPS 0.1455 against a differently-compiled reference. Hence the flag is
+    opt-in and absent by default.
+    """
+
+    def test_absent_by_default_so_the_platform_decides(self):
+        from gate_pro import serve_flags
+
+        self.assertNotIn("--diffusion-compile-dynamic", serve_flags("dlo-mmap", None, None))
+
+    def test_turning_it_off_uses_the_negative_flag(self):
+        """vLLM renders a boolean field as a flag pair. Passing a value --
+        `--diffusion-compile-dynamic false` -- is rejected at argument parsing
+        with "unrecognized arguments: false", which is how this was found: two
+        arms died at start-up before the server ever loaded a weight."""
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, compile_dynamic=False)
+        self.assertIn("--no-diffusion-compile-dynamic", flags)
+        self.assertNotIn("--diffusion-compile-dynamic", flags)
+        self.assertNotIn("false", flags)
+
+    def test_asking_for_the_default_emits_nothing(self):
+        """Dynamic is already the platform default, so a flag for it would be a
+        no-op that still changes the recorded command."""
+        from gate_pro import serve_flags
+
+        self.assertEqual(serve_flags("dlo-mmap", None, None, compile_dynamic=True),
+                         serve_flags("dlo-mmap", None, None))
+
+    def test_vllm_omni_still_defaults_to_dynamic(self):
+        """If upstream ever flips this, the arm stops being a change and the
+        comparison it is in becomes a null result that looks like a win."""
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+        self.assertIs(OmniDiffusionConfig.__dataclass_fields__["diffusion_compile_dynamic"].default, True)
