@@ -21,7 +21,7 @@ Qwen3-Omni-30B-A3B (AWQ-4bit) text and speech on a single RTX 5090 with [vLLM-Om
 ## What's inside
 
 - **Megakernels for RTX 5090 (sm_120a):** the thinker's decode steps and short prompt chunks, the talker's decode steps and its code predictor each run on one kernel launch, reading the checkpoint's own weight packing.
-- **Deterministic Marlin MoE:** vLLM's Marlin MoE always gives identical requests the same text, through the deterministic alignment kernels of vLLM PR [#48032](https://github.com/vllm-project/vllm/pull/48032).
+- **Deterministic Marlin MoE:** vLLM's Marlin MoE always gives identical requests the same text, through the deterministic alignment kernels of vLLM PR 48032.
 - **A shorter path to first audio:** the talker starts at the thinker's first token, ships its first audio frame with its prefill step, and decodes it straight to the API; the three stages share the GPU under CUDA MPS.
 
 Every other change is behind a `VLLM_OMNI_*` environment switch, off by default.
@@ -32,9 +32,9 @@ Three text prompts, five times each, after one warm-up request; RTX 5090, batch 
 
 | Configuration | TTFT | TTFA | TTFA, probes | Text, tok/s | RTF |
 | --- | --: | --: | --: | --: | --: |
-| stock vLLM-Omni | 57 ms (49–60) | 213 ms (206–220) | 214 ms (206–215) | 64.1 (64.1–64.9) | 0.112 (0.104–0.114) |
-| deterministic Marlin | 18 ms (17–19) | 42 ms (39–43) | 41 ms (40–43) | 185.2 (185.2–188.7) | 0.058 (0.057–0.060) |
-| **kernels** | **16 ms** (15–17) | **23 ms** (21–24) | **23 ms** (21–24) | **238.1** (238.1–238.1) | **0.052** (0.052–0.053) |
+| stock vLLM-Omni | 56 ms (49–60) | 214 ms (206–226) | 213 ms (206–215) | 64.1 (64.1–64.9) | 0.111 (0.104–0.114) |
+| deterministic Marlin | 16 ms (14–16) | 39 ms (37–41) | 38 ms (37–43) | 188.7 (188.7–188.7) | 0.059 (0.057–0.061) |
+| **kernels** | 16 ms (15–21) | **23 ms** (21–25) | **23 ms** (22–25) | **238.1** (238.1–238.1) | **0.052** (0.051–0.053) |
 
 - TTFT and TTFA are time to the first streamed text token and the first audio chunk. RTF is generation time over audio length.
 - TTFA, probes: 15 more requests on the same server right after the timed ones, the three prompts cycled five times.
@@ -47,7 +47,7 @@ Quality: each reply's audio transcribed by [Qwen/Qwen3-ASR-1.7B](https://hugging
 | deterministic Marlin | 2.64% | 6.3% | 0.0% | 0.2% | 1, 1, 1 |
 | **kernels** | **1.01%** | 2.2% | 0.0% | 0.6% | 1, 1, 1 |
 
-Each prompt repeats one text, so a prompt's errors count five times. The protocol, commits, configs and environment of every arm are in [`measurements.md`](https://github.com/fractalyze/vllm-omni/blob/9122317a9f62fff0bec41ebda94662020f73109c/showcase/qwen3omni/measurements.md).
+Each prompt repeats one text, so a prompt's errors count five times. The protocol, commits, configs and environment of every arm are in [`measurements.md`](https://github.com/fractalyze/vllm-omni/blob/17853986e6369f76431258efdb0b28787539dd55/showcase/qwen3omni/measurements.md).
 
 ## Quick start
 
