@@ -681,7 +681,7 @@ def kernel_device() -> torch.device:
 def quantize_weight_where_the_kernel_runs(
     weight: torch.Tensor,
     compute_device: torch.device,
-    quantize: Callable[..., tuple[torch.Tensor, torch.Tensor, Any]] = ops.scaled_int8_quant,
+    quantize: Callable[..., tuple[torch.Tensor, torch.Tensor, Any]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``weight`` on ``compute_device``, returning results where it lives.
 
@@ -697,6 +697,10 @@ def quantize_weight_where_the_kernel_runs(
     offloaded and a resident one is untouched. The move is one layer's weight at
     a time, which is the same bound the offload path already works to.
     """
+    # Resolved here rather than bound as a default argument: a default is
+    # captured at import, which would make `ops.scaled_int8_quant` unpatchable
+    # and silently break every test that asserts this method quantizes.
+    quantize = quantize or ops.scaled_int8_quant
     staged = weight if weight.device == compute_device else weight.to(compute_device)
     qweight, weight_scale, _ = quantize(staged, scale=None)
     if qweight.device != weight.device:
