@@ -676,3 +676,79 @@ class TestCudaInt8Smoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+
+class TestOnlineQuantizationOfAnOffloadedWeight:
+    """Online INT8 has to quantize weights that are not on the accelerator.
+
+    ``scaled_int8_quant`` is a CUDA/NPU kernel with no CPU implementation, and
+    under layer-wise offload the DiT's weights are staged in host memory with
+    only the block being computed resident. Quantizing in place therefore failed
+    at load with "Could not run '_C::dynamic_scaled_int8_quant' with arguments
+    from the 'CPU' backend", before the server ever answered a request.
+    """
+
+    @staticmethod
+    def _recording_quantizer(seen: list[torch.device]):
+        def quantize(weight: torch.Tensor, scale=None):
+            seen.append(weight.device)
+            rows, columns = weight.shape
+            return (
+                torch.zeros((rows, columns), dtype=torch.int8),
+                torch.ones((rows, 1), dtype=torch.float32),
+                None,
+            )
+
+        return quantize
+
+    def test_the_weight_is_moved_to_the_device_the_kernel_runs_on(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm_omni.quantization import int8_config
+
+        seen: list[torch.device] = []
+        weight = torch.randn(4, 8, device="cpu")
+        moved_to: list[torch.device] = []
+        original_to = torch.Tensor.to
+
+        def recording_to(self, *args, **kwargs):
+            if args and isinstance(args[0], torch.device):
+                moved_to.append(args[0])
+            return original_to(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", recording_to)
+        int8_config.quantize_weight_where_the_kernel_runs(
+            weight, torch.device("cpu"), self._recording_quantizer(seen)
+        )
+        assert seen == [torch.device("cpu")]
+        # Already on the compute device: no copy, because the resident case must
+        # not pay for the offloaded one.
+        assert moved_to == []
+
+    def test_the_results_come_back_on_the_weights_own_device(self):
+        from vllm_omni.quantization import int8_config
+
+        weight = torch.randn(4, 8, device="cpu")
+        qweight, scale = int8_config.quantize_weight_where_the_kernel_runs(
+            weight, torch.device("cpu"), self._recording_quantizer([])
+        )
+        assert qweight.device == weight.device
+        assert scale.device == weight.device
+        assert qweight.shape == weight.shape
+        assert scale.shape == (weight.shape[0], 1), "one scale per output row"
+
+    def test_the_kernel_device_is_not_the_default_device(self, monkeypatch: pytest.MonkeyPatch):
+        """During an offloaded load the default device is host memory, which is
+        exactly where the kernel cannot run."""
+        from vllm_omni.quantization import int8_config
+
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        assert int8_config.kernel_device() == torch.device("cuda", 0)
+
+    def test_without_an_accelerator_it_falls_back_to_the_host(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm_omni.quantization import int8_config
+
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_cuda", lambda: False)
+        monkeypatch.setattr(int8_config.current_omni_platform, "is_npu", lambda: False)
+        assert int8_config.kernel_device() == torch.device("cpu")
