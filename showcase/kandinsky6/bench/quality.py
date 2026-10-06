@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import json
 import statistics
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +53,10 @@ import torch
 # bound what the pixels allow us to claim.
 APPROX_MEAN_LPIPS = 0.05
 APPROX_MAX_LPIPS = 0.10
+# The user's adoption gate for this showcase (PLAN.md): an arm is a headline
+# candidate when every prompt set passes it. Max is the worst single frame.
+GATE_MEAN_LPIPS = 0.15
+GATE_MAX_LPIPS = 0.25
 
 MEL_BINS = 128
 MEL_FFT = 1024
@@ -294,9 +297,40 @@ def score_set(
         "encode_floor_lpips_mean": floor_mean,
         "tier": tier_for(set_mean, set_max, floor_mean=floor_mean),
         "gate_pass_approx": set_mean <= APPROX_MEAN_LPIPS and set_max <= APPROX_MAX_LPIPS,
+        "gate_pass": set_mean <= GATE_MEAN_LPIPS and set_max <= GATE_MAX_LPIPS,
         "by_category": by_category,
         "per_prompt": [s.as_dict() for s in scores],
     }
+
+
+def _reencode(source: Path, target: Path, *, crf: int) -> None:
+    """Re-encode ``source``'s video with libx264 at ``crf``, copying its audio.
+
+    PyAV rather than the ffmpeg CLI: the hosts have the libraries (through PyAV)
+    but not the binary.
+    """
+    import av
+
+    with av.open(str(source)) as src, av.open(str(target), "w") as dst:
+        vin = src.streams.video[0]
+        vout = dst.add_stream("libx264", rate=vin.average_rate)
+        vout.width, vout.height = vin.codec_context.width, vin.codec_context.height
+        vout.pix_fmt = "yuv420p"
+        vout.options = {"crf": str(crf)}
+        ain = src.streams.audio[0] if src.streams.audio else None
+        aout = dst.add_stream_from_template(ain) if ain is not None else None
+        for frame in src.decode(vin):
+            for packet in vout.encode(frame.reformat(format="yuv420p")):
+                dst.mux(packet)
+        for packet in vout.encode():
+            dst.mux(packet)
+        if ain is not None:
+            src.seek(0)
+            for packet in src.demux(ain):
+                if packet.dts is None:
+                    continue
+                packet.stream = aout
+                dst.mux(packet)
 
 
 def encode_floor(reference: Path, *, crf: int = 18) -> dict[str, Any]:
@@ -308,24 +342,7 @@ def encode_floor(reference: Path, *, crf: int = 18) -> dict[str, Any]:
     """
     with tempfile.TemporaryDirectory() as tmp:
         again = Path(tmp) / "reencoded.mp4"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(reference),
-                "-c:v",
-                "libx264",
-                "-crf",
-                str(crf),
-                "-c:a",
-                "copy",
-                str(again),
-            ],
-            check=True,
-        )
+        _reencode(reference, again, crf=crf)
         video = score_video(reference, again)
         audio = score_audio(reference, again)
     return {
@@ -341,9 +358,11 @@ def encode_floor(reference: Path, *, crf: int = 18) -> dict[str, Any]:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Score a candidate MP4 against a reference MP4.")
-    parser.add_argument("reference", type=Path)
-    parser.add_argument("candidate", type=Path, nargs="?")
+    parser = argparse.ArgumentParser(description="Score candidate MP4s against BF16 reference MP4s.")
+    parser.add_argument("reference", type=Path, help="reference MP4, or a directory of <prompt id>.mp4")
+    parser.add_argument("candidate", type=Path, nargs="?", help="candidate MP4, or a directory like the reference")
+    parser.add_argument("--prompts", type=Path, help="prompt-set JSON (required for directories)")
+    parser.add_argument("--out", type=Path, help="write the set report as JSON here")
     parser.add_argument("--floor", action="store_true", help="report the encode floor of the reference instead")
     args = parser.parse_args()
 
@@ -352,6 +371,32 @@ def main() -> None:
         return
     if args.candidate is None:
         parser.error("a candidate is required unless --floor is given")
+
+    if args.reference.is_dir():
+        if args.prompts is None:
+            parser.error("--prompts is required when scoring directories")
+        prompts = json.loads(args.prompts.read_text())["prompts"]
+        pairs = [
+            (p["id"], p["categories"], args.reference / f"{p['id']}.mp4", args.candidate / f"{p['id']}.mp4")
+            for p in prompts
+        ]
+        missing = [str(path) for _, _, ref, cand in pairs for path in (ref, cand) if not path.exists()]
+        if missing:
+            raise SystemExit(f"missing MP4s: {missing}")
+        report = score_set(pairs)
+        if args.out:
+            args.out.write_text(json.dumps(report, indent=2))
+        summary = {k: v for k, v in report.items() if k not in ("per_prompt",)}
+        summary["per_prompt"] = {
+            s["prompt_id"]: {
+                "lpips_mean": round(s["video"]["lpips_mean"], 4),
+                "lpips_max": round(s["video"]["lpips_max"], 4),
+            }
+            for s in report["per_prompt"]
+        }
+        print(json.dumps(summary, indent=2))
+        return
+
     video = score_video(args.reference, args.candidate)
     out = {
         "video": {k: v for k, v in video.items() if k != "lpips_per_frame"},

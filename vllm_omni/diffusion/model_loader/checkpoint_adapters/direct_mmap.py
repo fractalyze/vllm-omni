@@ -98,6 +98,34 @@ class _Magi2DirectMmapAdapter:
         )
 
 
+class _Kandinsky6DirectMmapAdapter:
+    """Kandinsky 6's TP1 direct-mmap contract.
+
+    This is what lets the BF16 Pro DiT (60.3 GB) run on a host with less RAM
+    than that: each block is staged from the mmapped checkpoint instead of
+    being copied into host memory first. At TP1 the vLLM parallel linears'
+    weight loaders are exact copies, so they are allowed. The published bundle
+    stores 767 small tensors (norms, embeddings; 131 MB) in FP32 while the module
+    is built in the model dtype; the ordinary loader casts them on copy, and the
+    transform casts them during staging so both paths compute the same thing.
+    The dtype is captured here, at planning time, because under rank-local mmap
+    the parameter is later replaced by its file-backed view, which carries the
+    checkpoint's dtype instead.
+    """
+
+    def policy_for(
+        self,
+        runtime_name: str,
+        target: torch.Tensor,
+    ) -> DirectMmapTensorPolicy:
+        del runtime_name
+        dtype = target.dtype
+        return DirectMmapTensorPolicy(
+            allow_custom_loader=True,
+            transform=lambda tensor: tensor.to(dtype),
+        )
+
+
 def get_direct_mmap_adapter(pipeline: nn.Module) -> DirectMmapAdapter | None:
     """Return a loader-owned adapter without requiring a pipeline flag."""
     from vllm_omni.diffusion.models.magi2.modeling_magi2 import (
@@ -120,6 +148,13 @@ def get_direct_mmap_adapter(pipeline: nn.Module) -> DirectMmapAdapter | None:
 
     if any(isinstance(module, Cosmos3VFMTransformer) for module in pipeline.modules()):
         return _Cosmos3DirectMmapAdapter()
+
+    from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import (
+        Kandinsky6Transformer3DModel,
+    )
+
+    if any(isinstance(module, Kandinsky6Transformer3DModel) for module in pipeline.modules()):
+        return _Kandinsky6DirectMmapAdapter()
     return None
 
 

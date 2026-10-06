@@ -54,10 +54,16 @@ before acting on it.
   `/data/jooman/k6/ref/`.
 - **Video:** LPIPS per frame (mean and max over frames), PSNR, SSIM against
   the reference. **Audio:** log-mel L1 and SI-SDR against the reference.
+- **Adoption gate (set by the user, 2026-10-06):** per prompt set, LPIPS
+  mean <= 0.15 **and** max <= 0.25 against the same-checkpoint BF16
+  reference, on **both** prompt sets. "Mean" is the mean over the set's
+  prompts of each prompt's mean over frames; "max" is the single worst frame
+  anywhere in the set. An arm that passes both sets is a headline candidate,
+  however narrowly; the fastest such stack is the showcase's answer.
 - **Tiers** follow the world-model vocabulary (exact, reorder, approx,
-  lossy). Gate for approx: mean LPIPS <= 0.05 and max <= 0.10 over a prompt
-  set, as in the Qwen-Image studies. A lossy change additionally needs a
-  distributional check (CLIP score) and a look at the frames.
+  lossy) and are still reported beside the gate: approx is mean LPIPS <= 0.05
+  and max <= 0.10, as in the Qwen-Image studies. A lossy change additionally
+  gets a look at the frames.
 - **Prompts:** two disjoint sets of at least 8 prompts each. Each must
   include a face or person, rendered text, fast motion, and speech or a
   sharp sound event. The vault shows why: an FP8 recipe passed one 8-prompt
