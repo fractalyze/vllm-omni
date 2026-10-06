@@ -536,7 +536,7 @@ class DiffusionParallelConfig:
         return cls(**{key: value for key, value in values.items() if value is not None})
 
 
-def _build_disk_quant_config(disk_qc: dict[str, Any], method: str | None) -> "QuantizationConfig | None":
+def build_disk_quant_config(disk_qc: dict[str, Any], method: str | None) -> "QuantizationConfig | None":
     """The quantization config a checkpoint declares for its own stored weights.
 
     A ``quantization_config`` inside a checkpoint describes weights that are
@@ -557,6 +557,13 @@ def _build_disk_quant_config(disk_qc: dict[str, Any], method: str | None) -> "Qu
         from vllm.model_executor.layers.quantization import get_quantization_config
 
         return get_quantization_config(name).from_config(dict(disk_qc))
+    if name == "int8":
+        # The factory builds DiffusionInt8Config from keyword arguments, which
+        # default to *online* INT8; from_config is the reader that marks a
+        # declared int8 checkpoint serialized (and keeps ``weight_only``).
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+        return DiffusionInt8Config.from_config(dict(disk_qc))
     return build_quant_config(disk_qc)
 
 
@@ -586,7 +593,7 @@ class TransformerConfig:
         disk_qc = params.get("quantization_config")
         if isinstance(disk_qc, dict):
             raw_quant_method = disk_qc.get("quant_method", disk_qc.get("method"))
-            quant_config = _build_disk_quant_config(disk_qc, raw_quant_method)
+            quant_config = build_disk_quant_config(disk_qc, raw_quant_method)
             if quant_config is not None:
                 quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 

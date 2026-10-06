@@ -1107,6 +1107,26 @@ def _adapt_k6_weight_name(name: str) -> str:
     return f"audio_vae.native.{rest}"
 
 
+def _normalize_quantized_source(key: str, tensor: Tensor) -> Tensor:
+    """A quantized checkpoint's tensor, as the quantized DiT should load it.
+
+    An odd source dtype (e.g. FP32) is normalized to BF16 so the quantizer sees
+    what it expects. Two kinds of tensor are passed through unchanged:
+
+    - already-quantized weights (FP8): casting them up to BF16 would lose the
+      packing the FP8 linear expects and silently undo the quantization the
+      checkpoint ships;
+    - quantization scales (``*_scale``): they are FP32 by construction, and
+      rounding one to BF16 moves every weight it multiplies by up to 0.2% --
+      the same size as the per-row INT8 rounding error it is there to undo.
+    """
+    if not tensor.is_floating_point() or tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        return tensor
+    if key.endswith("_scale"):
+        return tensor
+    return tensor.to(torch.bfloat16)
+
+
 def _resolve_quant_config(od_config, transformer_config: dict):
     """The quantization config to build the DiT with.
 
@@ -1115,8 +1135,10 @@ def _resolve_quant_config(od_config, transformer_config: dict):
     convention ``TransformerConfig.from_dict`` already follows for disk-declared
     quantization elsewhere in the repo.
 
-    A disk-declared method is resolved through **vLLM's** registry rather than
-    vLLM-Omni's ``build_quant_config``. The two disagree on the name ``fp8``:
+    A disk-declared method is resolved by ``build_disk_quant_config``, which
+    sends ``fp8`` and ``compressed-tensors`` to **vLLM's** registry and every
+    other method (``int8`` among them, which vLLM's registry does not have) to
+    vLLM-Omni's ``build_quant_config``. The two registries disagree on ``fp8``:
     Omni maps it to ``DiffusionFp8Config``, which quantizes BF16 weights
     *online* and so creates plain BF16 parameters with no ``weight_scale``. A
     config stored inside a checkpoint describes weights that are already on
@@ -1147,9 +1169,9 @@ def _resolve_quant_config(od_config, transformer_config: dict):
             f"transformer/config.json has a quantization_config without a quant_method; got keys {sorted(on_disk)}"
         )
 
-    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm_omni.diffusion.data import build_disk_quant_config
 
-    resolved = get_quantization_config(method).from_config(dict(on_disk))
+    resolved = build_disk_quant_config(dict(on_disk), method)
     logger.warning(
         "Kandinsky 6: using the checkpoint's own %s quantization (%s), %d layer(s) left wide",
         method,
@@ -1548,17 +1570,8 @@ class Kandinsky6TI2VAPipeline(
                     key = name[len("transformer.") :]
                     if is_pp_missing_parameter(key, self.transformer):
                         continue
-                    # Normalize an odd source dtype (e.g. fp32) to BF16 so the
-                    # quantizer sees what it expects. An already-quantized
-                    # tensor is skipped: casting fp8 weights up to BF16 would
-                    # both lose the packing the FP8 linear expects and silently
-                    # undo the quantization the checkpoint ships.
-                    if (
-                        quant_config is not None
-                        and tensor.is_floating_point()
-                        and tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
-                    ):
-                        tensor = tensor.to(torch.bfloat16)
+                    if quant_config is not None:
+                        tensor = _normalize_quantized_source(key, tensor)
                 name = _adapt_k6_weight_name(name)
                 yield name, tensor
 
