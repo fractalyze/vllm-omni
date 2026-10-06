@@ -1013,12 +1013,25 @@ class CompileDynamicFlagTest(parameterized.TestCase):
 
         self.assertNotIn("--diffusion-compile-dynamic", serve_flags("dlo-mmap", None, None))
 
-    @parameterized.parameters((True, "true"), (False, "false"))
-    def test_the_choice_reaches_the_server_as_a_string(self, value, expected):
+    def test_turning_it_off_uses_the_negative_flag(self):
+        """vLLM renders a boolean field as a flag pair. Passing a value --
+        `--diffusion-compile-dynamic false` -- is rejected at argument parsing
+        with "unrecognized arguments: false", which is how this was found: two
+        arms died at start-up before the server ever loaded a weight."""
         from gate_pro import serve_flags
 
-        flags = serve_flags("dlo-mmap", None, None, compile_dynamic=value)
-        self.assertEqual(flags[flags.index("--diffusion-compile-dynamic") + 1], expected)
+        flags = serve_flags("dlo-mmap", None, None, compile_dynamic=False)
+        self.assertIn("--no-diffusion-compile-dynamic", flags)
+        self.assertNotIn("--diffusion-compile-dynamic", flags)
+        self.assertNotIn("false", flags)
+
+    def test_asking_for_the_default_emits_nothing(self):
+        """Dynamic is already the platform default, so a flag for it would be a
+        no-op that still changes the recorded command."""
+        from gate_pro import serve_flags
+
+        self.assertEqual(serve_flags("dlo-mmap", None, None, compile_dynamic=True),
+                         serve_flags("dlo-mmap", None, None))
 
     def test_vllm_omni_still_defaults_to_dynamic(self):
         """If upstream ever flips this, the arm stops being a change and the

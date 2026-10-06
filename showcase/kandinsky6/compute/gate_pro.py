@@ -140,7 +140,7 @@ def serve_flags(
         flags += ["--diffusion-compile-mode", compile_mode]
     if quantization:
         flags += ["--diffusion-quantization-config", quantization]
-    if compile_dynamic is not None:
+    if compile_dynamic is False:
         # The platform compiles the DiT with dynamic=True, which is right for a
         # server that sees many geometries and wrong for this one: W1 is the only
         # shape these arms ever run, so dynamic=False lets Inductor specialise on
@@ -149,7 +149,11 @@ def serve_flags(
         # which kernels run, and on this pipeline that is worth LPIPS 0.1455
         # against a differently-compiled reference, so an arm built this way has
         # to be scored against a reference built the same way.
-        flags += ["--diffusion-compile-dynamic", "true" if compile_dynamic else "false"]
+        # vLLM renders a boolean field as a flag pair, not as a value-taking
+        # option: `--diffusion-compile-dynamic false` is rejected with
+        # "unrecognized arguments: false". The negative form is what turns it
+        # off, and the positive form is the default, so `True` emits nothing.
+        flags += ["--no-diffusion-compile-dynamic"]
     return flags
 
 
