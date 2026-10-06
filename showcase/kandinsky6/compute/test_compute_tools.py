@@ -516,3 +516,51 @@ class OutputDeltaControlTest(absltest.TestCase):
         self.assertTrue(result["control_is_finite"])
         self.assertTrue(result["same"]["comparable"])
         self.assertEqual(result["same"]["outputs"][0]["rel_l2"], 0.0)
+
+
+class NablaGeometryTest(parameterized.TestCase):
+    """The port's NABLA path needs both patched latent dims divisible by 8.
+
+    `fractal_flatten(..., block_mask=True)` patches the grid in 8x8 tiles, so
+    a grid whose H or W is not a multiple of 8 fails the reshape. That rules
+    out W1 (31 x 30 x 54) and the 512x320 smoke (7 x 20 x 32), which is why
+    `--geometry nabla-ok` exists. Asserted here so a backlog item that says
+    "NABLA at W1" is contradicted by the test suite rather than by an hour of
+    GPU time.
+    """
+
+    @parameterized.named_parameters(
+        ("w1", "w1", False),
+        ("smoke", "smoke", False),
+        ("nabla_ok", "nabla-ok", True),
+    )
+    def test_sparse_params_accepts_only_a_divisible_grid(self, geometry, expected_ok):
+        import torch
+
+        from block_profile import GEOMETRIES, PRO, Shapes, sparse_params
+
+        shapes = Shapes(**GEOMETRIES[geometry])
+        if expected_ok:
+            params = sparse_params(PRO, shapes, torch.device("cpu"), threshold=0.9)
+            blocks = shapes.latent_frames * (shapes.latent_h // 8) * (shapes.latent_w // 8)
+            # The prior must be block-granular, or it will not broadcast
+            # against nabla_block_mask's (B, h, S/64, S/64) scores.
+            self.assertEqual(tuple(params["sta_mask"].shape), (blocks, blocks))
+            self.assertEqual(blocks, shapes.visual_tokens // 64)
+            self.assertTrue(params["to_fractal"])
+        else:
+            with self.assertRaisesRegex(ValueError, "divisible by 8"):
+                sparse_params(PRO, shapes, torch.device("cpu"), threshold=0.9)
+
+    def test_the_fractal_reorder_itself_rejects_w1(self):
+        """The constraint is the port's, not this harness's: show it failing
+        in `fractal_flatten` directly."""
+        import torch
+
+        from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import fractal_flatten
+
+        frames, height, width = 31, 30, 54  # W1's patched latent grid
+        x = torch.zeros(frames, height, width, 8)
+        rope = torch.zeros(frames, height, width, 1, 4, 2, 2)
+        with self.assertRaises(RuntimeError):
+            fractal_flatten(x, rope, (frames, height, width), block_mask=True)
