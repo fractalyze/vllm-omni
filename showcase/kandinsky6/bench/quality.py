@@ -116,9 +116,15 @@ def read_audio(path: Path) -> tuple[np.ndarray, int]:
 
 def _lpips_net(cache: dict[str, Any]) -> Any:
     if "lpips" not in cache:
+        import contextlib
+        import sys
+
         import lpips as lpips_lib
 
-        cache["lpips"] = lpips_lib.LPIPS(net="alex").to(_device()).eval()
+        # lpips announces itself on stdout, which would corrupt the JSON this
+        # module prints there.
+        with contextlib.redirect_stdout(sys.stderr):
+            cache["lpips"] = lpips_lib.LPIPS(net="alex").to(_device()).eval()
     return cache["lpips"]
 
 

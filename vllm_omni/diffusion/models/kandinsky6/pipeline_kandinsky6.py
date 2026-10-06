@@ -47,7 +47,11 @@ from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .kandinsky6_transformer import Kandinsky6Transformer3DModel
+from .kandinsky6_transformer import (
+    Kandinsky6Transformer3DModel,
+    exact_attention_steps,
+    set_exact_attention_step,
+)
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
@@ -837,7 +841,10 @@ def piflow_denoise_loop(  # noqa: PLR0913
     eps = scheduler.eps
     scheduler.set_timesteps(num_steps, device=device)
 
+    exact_steps = exact_attention_steps()
     for segment in scheduler.segments(num_steps):
+        if exact_steps:
+            set_exact_attention_step(_raw_dit(dit), segment.step_index < exact_steps)
         tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
         tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
         sigma_src = shift_timesteps(tau_src, shift)
