@@ -262,18 +262,74 @@ def test_self_attention_attends_over_tokens_for_batched_and_unbatched_inputs(bat
         out = attn(hidden, rotary_emb=rope)
 
         heads = channels // head_dim
-        q = attn.query_norm(attn.to_query(x).reshape(tokens, heads, head_dim))
-        k = attn.key_norm(attn.to_key(x).reshape(tokens, heads, head_dim))
-        v = attn.to_value(x).reshape(tokens, heads, head_dim)
+        # The projections are `skip_bias_add=True`, so each returns
+        # (output, bias) and `_add_bias` applies it -- see that method.
+        q = attn.query_norm(attn._add_bias(attn.to_query(x)).reshape(tokens, heads, head_dim))
+        k = attn.key_norm(attn._add_bias(attn.to_key(x)).reshape(tokens, heads, head_dim))
+        v = attn._add_bias(attn.to_value(x)).reshape(tokens, heads, head_dim)
         q = apply_rotary(q, rope).type_as(q)
         k = apply_rotary(k, rope).type_as(k)
         ref = torch.nn.functional.scaled_dot_product_attention(
             q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
         ).transpose(0, 1)
-        expected = attn.out_layer(ref.reshape(tokens, channels))
+        expected = attn._add_bias(attn.out_layer(ref.reshape(tokens, channels)))
 
     assert out.shape == (hidden.shape[:-1] + (channels,))
     torch.testing.assert_close(out.reshape(tokens, channels), expected, rtol=1e-4, atol=1e-5)
+
+
+def test_attention_biases_are_added_once_outside_the_gemm():
+    """The four attention projections skip cuBLAS's bias epilogue and add the
+    bias themselves, and the result must be unchanged by that.
+
+    Why the projections are built this way: on sm_120 an `addmm` carrying a
+    bias is 21.5% slower than the same GEMM without one, while adding the
+    identical bias as a separate elementwise kernel costs 7.4% -- cuBLAS
+    dispatches a worse kernel when a bias is present. At W1's 50,220 visual
+    tokens that is about 4 s of a 183 s request.
+
+    The regression this guards is the cheap one: `skip_bias_add=True` makes the
+    layer *return* the bias instead of applying it, so a call site that forgets
+    `_add_bias` silently drops the bias entirely and still produces
+    correctly-shaped output. Comparing against the fused configuration catches
+    both a dropped bias and a doubly-applied one."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import Kandinsky6Attention
+
+    torch.manual_seed(0)
+    channels, head_dim, tokens = 24, 12, 7
+    with set_current_diffusion_config(_sdpa_config()):
+        attn = Kandinsky6Attention(channels, head_dim, engine="sdpa").eval()
+    with torch.no_grad():
+        for param in attn.parameters():
+            param.normal_(std=0.2)
+
+    projections = (attn.to_query, attn.to_key, attn.to_value, attn.out_layer)
+    for layer in projections:
+        assert layer.skip_bias_add, "the GEMM must not fold the bias in"
+        assert layer.return_bias, "the layer must hand the bias back to be added"
+        assert layer.bias is not None, "there is still a bias to add"
+
+    x = torch.randn(tokens, channels)
+    rope = torch.randn(tokens, 1, head_dim // 2, 2, 2)
+    with torch.no_grad():
+        out = attn(x, rotary_emb=rope)
+        # The configuration this replaced: cuBLAS folds the bias into the GEMM
+        # and `_add_bias` has nothing left to do.
+        for layer in projections:
+            layer.skip_bias_add = False
+        fused = attn(x, rotary_emb=rope)
+
+    torch.testing.assert_close(out, fused, rtol=1e-5, atol=1e-6)
+
+    # And the bias is genuinely doing something, so the comparison above is not
+    # two zeros agreeing.
+    with torch.no_grad():
+        for layer in projections:
+            layer.skip_bias_add = True
+            layer.bias.zero_()
+        unbiased = attn(x, rotary_emb=rope)
+    assert not torch.allclose(out, unbiased, rtol=1e-3, atol=1e-4)
 
 
 def test_modulation_projections_are_zero_initialized():

@@ -678,7 +678,8 @@ class Kandinsky6Attention(nn.Module):
             num_channels,
             bias=True,
             gather_output=False,
-            return_bias=False,
+            skip_bias_add=True,
+            return_bias=True,
             quant_config=quant_config,
             prefix=child_prefix(prefix, "to_query"),
         )
@@ -687,7 +688,8 @@ class Kandinsky6Attention(nn.Module):
             num_channels,
             bias=True,
             gather_output=False,
-            return_bias=False,
+            skip_bias_add=True,
+            return_bias=True,
             quant_config=quant_config,
             prefix=child_prefix(prefix, "to_key"),
         )
@@ -696,7 +698,8 @@ class Kandinsky6Attention(nn.Module):
             num_channels,
             bias=True,
             gather_output=False,
-            return_bias=False,
+            skip_bias_add=True,
+            return_bias=True,
             quant_config=quant_config,
             prefix=child_prefix(prefix, "to_value"),
         )
@@ -707,7 +710,8 @@ class Kandinsky6Attention(nn.Module):
             num_channels,
             bias=True,
             input_is_parallel=True,
-            return_bias=False,
+            skip_bias_add=True,
+            return_bias=True,
             quant_config=quant_config,
             prefix=child_prefix(prefix, "out_layer"),
         )
@@ -749,6 +753,35 @@ class Kandinsky6Attention(nn.Module):
                 skip_sequence_parallel=not sequence_parallel,
             )
 
+    @staticmethod
+    def _add_bias(projected: tuple[Tensor, Tensor | None]) -> Tensor:
+        """Apply the bias the projection skipped.
+
+        The four projections here are declared ``skip_bias_add=True``, so each
+        returns ``(output, bias)`` and the bias is added by this one line
+        instead of by cuBLAS's GEMM epilogue. That is not a style choice and it
+        is not free: at W1 the visual stream is 50,220 tokens, and on sm_120
+        ``addmm`` with a bias is **21.5% slower** than the same GEMM without one,
+        while adding the identical bias as a separate elementwise kernel costs
+        **7.4%**. A bias is N values against an M*N output and cannot account
+        for 21%, so the cost is not the arithmetic -- cuBLAS dispatches a
+        different and worse kernel when a bias is present. Unfusing it recovers
+        ~14% of the four large projections, about 4 s of a 183 s request
+        (``showcase/kandinsky6/compute/gemm_census.py --backends default``).
+
+        This is the opposite of the usual advice to fuse epilogues into the
+        GEMM, and it holds only where the fused form costs a tile change. The
+        small-M projections in this model (audio at 218 rows, text at 256) show
+        no penalty either way, so this applies unconditionally here only because
+        the same class serves both and the change is free on the small shapes.
+
+        ``add_`` rather than ``+``: the output is freshly allocated by the GEMM,
+        and at the QKV shape a second copy would be a 1.65 GB allocation on a
+        board with about 7 GiB spare.
+        """
+        output, bias = projected
+        return output if bias is None else output.add_(bias)
+
     def _attention_for_call(self) -> nn.Module:
         if self.attn_exact is not None and (self.always_exact or self.step_exact):
             return self.attn_exact
@@ -773,9 +806,11 @@ class Kandinsky6Attention(nn.Module):
         is_self_attention = encoder_hidden_states is None
         kv_input = hidden_states if is_self_attention else encoder_hidden_states
 
-        query = self.to_query(hidden_states).reshape(*hidden_states.shape[:-1], self.num_heads, self.head_dim)
-        key = self.to_key(kv_input).reshape(*kv_input.shape[:-1], self.num_heads, self.head_dim)
-        value = self.to_value(kv_input).reshape(*kv_input.shape[:-1], self.num_heads, self.head_dim)
+        query = self._add_bias(self.to_query(hidden_states)).reshape(
+            *hidden_states.shape[:-1], self.num_heads, self.head_dim
+        )
+        key = self._add_bias(self.to_key(kv_input)).reshape(*kv_input.shape[:-1], self.num_heads, self.head_dim)
+        value = self._add_bias(self.to_value(kv_input)).reshape(*kv_input.shape[:-1], self.num_heads, self.head_dim)
         query = self.query_norm(query)
         key = self.key_norm(key)
         if rotary_emb_q is not None:
@@ -829,7 +864,7 @@ class Kandinsky6Attention(nn.Module):
 
         if strip_output_batch:
             out = out[0]
-        return self.out_layer(out.flatten(-2, -1))
+        return self._add_bias(self.out_layer(out.flatten(-2, -1)))
 
 
 # ---------------------------------------------------------------------------
