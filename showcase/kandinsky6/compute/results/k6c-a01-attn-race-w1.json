@@ -1,0 +1,685 @@
+{
+  "shapes": {
+    "visual_tokens": 50220,
+    "audio_len": 218,
+    "text_len": 256,
+    "q_tokens_override": null
+  },
+  "arms_requested": [
+    "CUDNN_ATTN",
+    "TORCH_SDPA",
+    "FLASH_ATTN",
+    "FLASHINFER_ATTN",
+    "SAGE_ATTN",
+    "SAGE_ATTN_3"
+  ],
+  "dtype": "torch.bfloat16",
+  "torch": "2.13.0+cu132",
+  "device": "NVIDIA GeForce RTX 5090",
+  "locks_held": "run_when_free.py pid 1194558: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "foreign_gpu_procs": [],
+  "abba_rounds": 2,
+  "repeats_per_visit": 3,
+  "roles": [
+    {
+      "role": "visual_self",
+      "q": 50220,
+      "kv": 50220,
+      "heads": 32,
+      "head_dim": 128,
+      "tflop_per_call": 41.321,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 177.6615,
+          "min_ms": 176.7363,
+          "max_ms": 178.7693,
+          "spread_pct": 1.14,
+          "samples": 12,
+          "achieved_tflops": 232.6,
+          "all_ms": [
+            176.7491,
+            176.7545,
+            176.7363,
+            177.6763,
+            177.6686,
+            177.6479,
+            178.462,
+            178.5202,
+            178.7693,
+            177.6543,
+            177.6199,
+            177.7514
+          ]
+        },
+        "TORCH_SDPA": {
+          "median_ms": 194.1202,
+          "min_ms": 193.5734,
+          "max_ms": 194.6463,
+          "spread_pct": 0.55,
+          "samples": 12,
+          "achieved_tflops": 212.9,
+          "all_ms": [
+            193.5933,
+            193.5758,
+            193.5734,
+            193.6643,
+            193.6357,
+            193.6357,
+            194.6154,
+            194.6463,
+            194.6099,
+            194.6023,
+            194.5916,
+            194.5762
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 70.5285,
+          "min_ms": 70.2233,
+          "max_ms": 70.8406,
+          "spread_pct": 0.88,
+          "samples": 12,
+          "achieved_tflops": 585.9,
+          "all_ms": [
+            70.2261,
+            70.2233,
+            70.4967,
+            70.5604,
+            70.6967,
+            70.804,
+            70.4767,
+            70.4537,
+            70.725,
+            70.4672,
+            70.562,
+            70.8406
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 55.5284,
+          "min_ms": 54.9063,
+          "max_ms": 55.8066,
+          "spread_pct": 1.62,
+          "samples": 12,
+          "achieved_tflops": 744.1,
+          "all_ms": [
+            55.5508,
+            55.5354,
+            55.4189,
+            55.5214,
+            54.9162,
+            54.9063,
+            55.586,
+            55.538,
+            55.4445,
+            55.141,
+            55.75,
+            55.8066
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002322,
+          "max_abs": 0.00015,
+          "mean_abs": 1.3e-05,
+          "cosine": 0.99999738,
+          "ref_rms": 0.007304
+        },
+        "TORCH_SDPA": {
+          "rel_l2": 0.002322,
+          "max_abs": 0.000152,
+          "mean_abs": 1.3e-05,
+          "cosine": 0.99999738,
+          "ref_rms": 0.007304
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.038957,
+          "max_abs": 0.001691,
+          "mean_abs": 0.000227,
+          "cosine": 0.99924088,
+          "ref_rms": 0.007304
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.188251,
+          "max_abs": 0.007907,
+          "mean_abs": 0.001097,
+          "cosine": 0.98229402,
+          "ref_rms": 0.007304
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "ValueError: FLASH_ATTN was explicitly selected but is unsupported (Blackwell requires CuTe FlashAttention-4 (flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). Select a compatible backend.",
+        "FLASHINFER_ATTN": "DSLUserCodeError: \n\u001b[91m\u001b[1merror:\u001b[0m expects arch to be one of [base_dsl.Arch.sm_100a, base_dsl.Arch.sm_100f, base_dsl.Arch.sm_110a, base_dsl.Arch.sm_110f, base_dsl.Arch.sm_103a, base_dsl.Arch.sm_103f], but got sm_120a\n   \u001b[94m-->\u001b[0m /data/jooman/k6/venv/lib/python3.12/site-packages/flashinfer/cute_dsl/attention/fmha/fmha.py:291\n    |\n289 |     def _make_qk_tiled_mma(self, cta_group):\n290 |         \"\"\"Build the QK tiled MMA. Override in subclasses to target a different arch.\"\"\"\n291 |         return sm100_utils.make_trivial_tiled_mma(\n    |         \u001b[91m^\u001b[0m\n  \u001b[92msuggestion:\u001b[0m tcgen05 MMA requires datacenter Blackwell (sm_100 / sm_103). On consumer Blackwell\n              (sm_120 / sm_121) use the warp-level cute.nvgpu.warp.MmaF16BF16Op; see the\n              blackwell_geforce dense_gemm / blockscaled_gemm examples.\n"
+      }
+    },
+    {
+      "role": "text_cross",
+      "q": 50220,
+      "kv": 256,
+      "heads": 32,
+      "head_dim": 128,
+      "tflop_per_call": 0.211,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 1.1273,
+          "min_ms": 1.1235,
+          "max_ms": 1.1493,
+          "spread_pct": 2.29,
+          "samples": 12,
+          "achieved_tflops": 186.9,
+          "all_ms": [
+            1.1493,
+            1.1357,
+            1.1332,
+            1.1305,
+            1.1277,
+            1.1275,
+            1.1249,
+            1.1255,
+            1.1247,
+            1.1245,
+            1.1235,
+            1.1271
+          ]
+        },
+        "TORCH_SDPA": {
+          "median_ms": 1.1759,
+          "min_ms": 1.173,
+          "max_ms": 1.1809,
+          "spread_pct": 0.67,
+          "samples": 12,
+          "achieved_tflops": 179.1,
+          "all_ms": [
+            1.1809,
+            1.1796,
+            1.1802,
+            1.178,
+            1.1755,
+            1.1753,
+            1.173,
+            1.1734,
+            1.1738,
+            1.1756,
+            1.1761,
+            1.1773
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 0.9464,
+          "min_ms": 0.9408,
+          "max_ms": 0.956,
+          "spread_pct": 1.61,
+          "samples": 12,
+          "achieved_tflops": 222.6,
+          "all_ms": [
+            0.9522,
+            0.9467,
+            0.956,
+            0.9461,
+            0.945,
+            0.9481,
+            0.9461,
+            0.946,
+            0.9531,
+            0.9453,
+            0.9408,
+            0.9492
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 3.728,
+          "min_ms": 3.7243,
+          "max_ms": 3.7442,
+          "spread_pct": 0.53,
+          "samples": 12,
+          "achieved_tflops": 56.5,
+          "all_ms": [
+            3.7336,
+            3.7243,
+            3.7249,
+            3.7276,
+            3.7255,
+            3.7285,
+            3.7297,
+            3.7289,
+            3.7442,
+            3.7259,
+            3.7288,
+            3.7273
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002164,
+          "max_abs": 0.003295,
+          "mean_abs": 0.000167,
+          "cosine": 0.9999975,
+          "ref_rms": 0.101104
+        },
+        "TORCH_SDPA": {
+          "rel_l2": 0.002164,
+          "max_abs": 0.003295,
+          "mean_abs": 0.000167,
+          "cosine": 0.99999762,
+          "ref_rms": 0.101104
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.036339,
+          "max_abs": 0.051433,
+          "mean_abs": 0.002903,
+          "cosine": 0.99933946,
+          "ref_rms": 0.101104
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.186111,
+          "max_abs": 0.253113,
+          "mean_abs": 0.014838,
+          "cosine": 0.98269272,
+          "ref_rms": 0.101104
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "ValueError: FLASH_ATTN was explicitly selected but is unsupported (Blackwell requires CuTe FlashAttention-4 (flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). Select a compatible backend.",
+        "FLASHINFER_ATTN": "DSLUserCodeError: \n\u001b[91m\u001b[1merror:\u001b[0m expects arch to be one of [base_dsl.Arch.sm_100a, base_dsl.Arch.sm_100f, base_dsl.Arch.sm_110a, base_dsl.Arch.sm_110f, base_dsl.Arch.sm_103a, base_dsl.Arch.sm_103f], but got sm_120a\n   \u001b[94m-->\u001b[0m /data/jooman/k6/venv/lib/python3.12/site-packages/flashinfer/cute_dsl/attention/fmha/fmha.py:291\n    |\n289 |     def _make_qk_tiled_mma(self, cta_group):\n290 |         \"\"\"Build the QK tiled MMA. Override in subclasses to target a different arch.\"\"\"\n291 |         return sm100_utils.make_trivial_tiled_mma(\n    |         \u001b[91m^\u001b[0m\n  \u001b[92msuggestion:\u001b[0m tcgen05 MMA requires datacenter Blackwell (sm_100 / sm_103). On consumer Blackwell\n              (sm_120 / sm_121) use the warp-level cute.nvgpu.warp.MmaF16BF16Op; see the\n              blackwell_geforce dense_gemm / blockscaled_gemm examples.\n"
+      }
+    },
+    {
+      "role": "video_audio_cross",
+      "q": 50220,
+      "kv": 218,
+      "heads": 32,
+      "head_dim": 128,
+      "tflop_per_call": 0.179,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 1.131,
+          "min_ms": 1.1256,
+          "max_ms": 1.1553,
+          "spread_pct": 2.63,
+          "samples": 12,
+          "achieved_tflops": 158.6,
+          "all_ms": [
+            1.1553,
+            1.1342,
+            1.131,
+            1.1308,
+            1.1354,
+            1.131,
+            1.1291,
+            1.1354,
+            1.1315,
+            1.1274,
+            1.1256,
+            1.1293
+          ]
+        },
+        "TORCH_SDPA": {
+          "median_ms": 1.168,
+          "min_ms": 1.1649,
+          "max_ms": 1.1712,
+          "spread_pct": 0.54,
+          "samples": 12,
+          "achieved_tflops": 153.6,
+          "all_ms": [
+            1.1693,
+            1.1672,
+            1.1649,
+            1.1684,
+            1.1712,
+            1.1682,
+            1.1697,
+            1.1678,
+            1.1663,
+            1.1706,
+            1.1666,
+            1.1669
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 0.9454,
+          "min_ms": 0.9389,
+          "max_ms": 0.9513,
+          "spread_pct": 1.31,
+          "samples": 12,
+          "achieved_tflops": 189.7,
+          "all_ms": [
+            0.9513,
+            0.9463,
+            0.9489,
+            0.9476,
+            0.9468,
+            0.9389,
+            0.9409,
+            0.942,
+            0.942,
+            0.9444,
+            0.9468,
+            0.9433
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 3.736,
+          "min_ms": 3.7337,
+          "max_ms": 3.755,
+          "spread_pct": 0.57,
+          "samples": 12,
+          "achieved_tflops": 48.0,
+          "all_ms": [
+            3.7355,
+            3.738,
+            3.7339,
+            3.7441,
+            3.7357,
+            3.7414,
+            3.755,
+            3.7337,
+            3.7358,
+            3.7409,
+            3.7362,
+            3.7342
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002162,
+          "max_abs": 0.003727,
+          "mean_abs": 0.000179,
+          "cosine": 0.99999774,
+          "ref_rms": 0.108737
+        },
+        "TORCH_SDPA": {
+          "rel_l2": 0.002155,
+          "max_abs": 0.003727,
+          "mean_abs": 0.000178,
+          "cosine": 0.99999774,
+          "ref_rms": 0.108737
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.036385,
+          "max_abs": 0.060701,
+          "mean_abs": 0.003122,
+          "cosine": 0.99933785,
+          "ref_rms": 0.108737
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.228934,
+          "max_abs": 0.946407,
+          "mean_abs": 0.019129,
+          "cosine": 0.97372437,
+          "ref_rms": 0.108737
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "ValueError: FLASH_ATTN was explicitly selected but is unsupported (Blackwell requires CuTe FlashAttention-4 (flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). Select a compatible backend.",
+        "FLASHINFER_ATTN": "DSLUserCodeError: \n\u001b[91m\u001b[1merror:\u001b[0m expects arch to be one of [base_dsl.Arch.sm_100a, base_dsl.Arch.sm_100f, base_dsl.Arch.sm_110a, base_dsl.Arch.sm_110f, base_dsl.Arch.sm_103a, base_dsl.Arch.sm_103f], but got sm_120a\n   \u001b[94m-->\u001b[0m /data/jooman/k6/venv/lib/python3.12/site-packages/flashinfer/cute_dsl/attention/fmha/fmha.py:291\n    |\n289 |     def _make_qk_tiled_mma(self, cta_group):\n290 |         \"\"\"Build the QK tiled MMA. Override in subclasses to target a different arch.\"\"\"\n291 |         return sm100_utils.make_trivial_tiled_mma(\n    |         \u001b[91m^\u001b[0m\n  \u001b[92msuggestion:\u001b[0m tcgen05 MMA requires datacenter Blackwell (sm_100 / sm_103). On consumer Blackwell\n              (sm_120 / sm_121) use the warp-level cute.nvgpu.warp.MmaF16BF16Op; see the\n              blackwell_geforce dense_gemm / blockscaled_gemm examples.\n"
+      }
+    },
+    {
+      "role": "audio_video_cross",
+      "q": 218,
+      "kv": 50220,
+      "heads": 16,
+      "head_dim": 128,
+      "tflop_per_call": 0.09,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 2.4975,
+          "min_ms": 2.4919,
+          "max_ms": 2.5356,
+          "spread_pct": 1.75,
+          "samples": 12,
+          "achieved_tflops": 35.9,
+          "all_ms": [
+            2.524,
+            2.5115,
+            2.5356,
+            2.5006,
+            2.4986,
+            2.4996,
+            2.4964,
+            2.4932,
+            2.4936,
+            2.4956,
+            2.4922,
+            2.4919
+          ]
+        },
+        "TORCH_SDPA": {
+          "median_ms": 0.5933,
+          "min_ms": 0.5878,
+          "max_ms": 0.6288,
+          "spread_pct": 6.91,
+          "samples": 12,
+          "achieved_tflops": 151.2,
+          "all_ms": [
+            0.593,
+            0.5938,
+            0.5917,
+            0.5956,
+            0.5936,
+            0.5935,
+            0.6288,
+            0.6079,
+            0.5917,
+            0.5916,
+            0.5906,
+            0.5878
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 1.8824,
+          "min_ms": 1.8771,
+          "max_ms": 1.9116,
+          "spread_pct": 1.83,
+          "samples": 12,
+          "achieved_tflops": 47.6,
+          "all_ms": [
+            1.8821,
+            1.9116,
+            1.8872,
+            1.8832,
+            1.8788,
+            1.8843,
+            1.8841,
+            1.8789,
+            1.8791,
+            1.8826,
+            1.8791,
+            1.8771
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 2.7108,
+          "min_ms": 2.7053,
+          "max_ms": 2.7158,
+          "spread_pct": 0.39,
+          "samples": 12,
+          "achieved_tflops": 33.1,
+          "all_ms": [
+            2.7095,
+            2.7158,
+            2.7112,
+            2.7158,
+            2.7104,
+            2.7127,
+            2.7109,
+            2.7076,
+            2.7156,
+            2.7053,
+            2.7082,
+            2.7108
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002315,
+          "max_abs": 0.000118,
+          "mean_abs": 1.3e-05,
+          "cosine": 0.99999726,
+          "ref_rms": 0.007321
+        },
+        "TORCH_SDPA": {
+          "rel_l2": 0.002296,
+          "max_abs": 0.000118,
+          "mean_abs": 1.3e-05,
+          "cosine": 0.9999975,
+          "ref_rms": 0.007321
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.038833,
+          "max_abs": 0.00151,
+          "mean_abs": 0.000227,
+          "cosine": 0.99924576,
+          "ref_rms": 0.007321
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.187978,
+          "max_abs": 0.006415,
+          "mean_abs": 0.001098,
+          "cosine": 0.98235279,
+          "ref_rms": 0.007321
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "ValueError: FLASH_ATTN was explicitly selected but is unsupported (Blackwell requires CuTe FlashAttention-4 (flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). Select a compatible backend.",
+        "FLASHINFER_ATTN": "DSLUserCodeError: \n\u001b[91m\u001b[1merror:\u001b[0m expects arch to be one of [base_dsl.Arch.sm_100a, base_dsl.Arch.sm_100f, base_dsl.Arch.sm_110a, base_dsl.Arch.sm_110f, base_dsl.Arch.sm_103a, base_dsl.Arch.sm_103f], but got sm_120a\n   \u001b[94m-->\u001b[0m /data/jooman/k6/venv/lib/python3.12/site-packages/flashinfer/cute_dsl/attention/fmha/fmha.py:291\n    |\n289 |     def _make_qk_tiled_mma(self, cta_group):\n290 |         \"\"\"Build the QK tiled MMA. Override in subclasses to target a different arch.\"\"\"\n291 |         return sm100_utils.make_trivial_tiled_mma(\n    |         \u001b[91m^\u001b[0m\n  \u001b[92msuggestion:\u001b[0m tcgen05 MMA requires datacenter Blackwell (sm_100 / sm_103). On consumer Blackwell\n              (sm_120 / sm_121) use the warp-level cute.nvgpu.warp.MmaF16BF16Op; see the\n              blackwell_geforce dense_gemm / blockscaled_gemm examples.\n"
+      }
+    },
+    {
+      "role": "audio_self",
+      "q": 218,
+      "kv": 218,
+      "heads": 16,
+      "head_dim": 128,
+      "tflop_per_call": 0.0,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 0.0344,
+          "min_ms": 0.0314,
+          "max_ms": 0.0403,
+          "spread_pct": 25.83,
+          "samples": 12,
+          "achieved_tflops": 11.3,
+          "all_ms": [
+            0.0403,
+            0.0372,
+            0.0352,
+            0.0361,
+            0.0343,
+            0.0337,
+            0.0324,
+            0.0314,
+            0.0324,
+            0.0349,
+            0.033,
+            0.0346
+          ]
+        },
+        "TORCH_SDPA": {
+          "median_ms": 0.0253,
+          "min_ms": 0.0234,
+          "max_ms": 0.0293,
+          "spread_pct": 23.37,
+          "samples": 12,
+          "achieved_tflops": 15.4,
+          "all_ms": [
+            0.0252,
+            0.0292,
+            0.0235,
+            0.0253,
+            0.0279,
+            0.0249,
+            0.0238,
+            0.0234,
+            0.0248,
+            0.0256,
+            0.0293,
+            0.0253
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 0.0556,
+          "min_ms": 0.0529,
+          "max_ms": 0.0645,
+          "spread_pct": 20.86,
+          "samples": 12,
+          "achieved_tflops": 7.0,
+          "all_ms": [
+            0.0645,
+            0.0577,
+            0.0545,
+            0.0576,
+            0.0555,
+            0.0548,
+            0.0568,
+            0.054,
+            0.0529,
+            0.0579,
+            0.0557,
+            0.0547
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 0.1447,
+          "min_ms": 0.1383,
+          "max_ms": 0.1663,
+          "spread_pct": 19.34,
+          "samples": 12,
+          "achieved_tflops": 2.7,
+          "all_ms": [
+            0.1663,
+            0.1545,
+            0.1476,
+            0.1469,
+            0.143,
+            0.1398,
+            0.1492,
+            0.1457,
+            0.1438,
+            0.141,
+            0.1403,
+            0.1383
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002167,
+          "max_abs": 0.002261,
+          "mean_abs": 0.000179,
+          "cosine": 0.99999762,
+          "ref_rms": 0.108348
+        },
+        "TORCH_SDPA": {
+          "rel_l2": 0.002161,
+          "max_abs": 0.002261,
+          "mean_abs": 0.000178,
+          "cosine": 0.99999762,
+          "ref_rms": 0.108348
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.036393,
+          "max_abs": 0.032027,
+          "mean_abs": 0.00311,
+          "cosine": 0.99933755,
+          "ref_rms": 0.108348
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.234675,
+          "max_abs": 0.48094,
+          "mean_abs": 0.019333,
+          "cosine": 0.97239816,
+          "ref_rms": 0.108348
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "ValueError: FLASH_ATTN was explicitly selected but is unsupported (Blackwell requires CuTe FlashAttention-4 (flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). Select a compatible backend.",
+        "FLASHINFER_ATTN": "DSLUserCodeError: \n\u001b[91m\u001b[1merror:\u001b[0m expects arch to be one of [base_dsl.Arch.sm_100a, base_dsl.Arch.sm_100f, base_dsl.Arch.sm_110a, base_dsl.Arch.sm_110f, base_dsl.Arch.sm_103a, base_dsl.Arch.sm_103f], but got sm_120a\n   \u001b[94m-->\u001b[0m /data/jooman/k6/venv/lib/python3.12/site-packages/flashinfer/cute_dsl/attention/fmha/fmha.py:291\n    |\n289 |     def _make_qk_tiled_mma(self, cta_group):\n290 |         \"\"\"Build the QK tiled MMA. Override in subclasses to target a different arch.\"\"\"\n291 |         return sm100_utils.make_trivial_tiled_mma(\n    |         \u001b[91m^\u001b[0m\n  \u001b[92msuggestion:\u001b[0m tcgen05 MMA requires datacenter Blackwell (sm_100 / sm_103). On consumer Blackwell\n              (sm_120 / sm_121) use the warp-level cute.nvgpu.warp.MmaF16BF16Op; see the\n              blackwell_geforce dense_gemm / blockscaled_gemm examples.\n"
+      }
+    }
+  ]
+}
