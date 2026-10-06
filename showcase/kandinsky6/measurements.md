@@ -303,6 +303,43 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## Specialising the compiler on W1's fixed shapes buys nothing
+
+The served pipeline already compiles -- "Regional compilation applied to 188
+module(s) for repeated blocks" -- with `dynamic=True`. That is the right default
+for a server that sees many geometries and arguably the wrong one here, since
+these arms only ever run W1's 31 x 30 x 54 = 50,220 visual tokens.
+`--no-diffusion-compile-dynamic` lets Inductor specialise on that.
+
+Two prompts an arm, and a *static control* beside the static arm, because
+changing compilation changes which kernels run and a static arm scored against a
+dynamic reference would read as a quality regression that is really a
+kernel-choice difference:
+
+| | a1 | a2 |
+|---|---:|---:|
+| `sage2-mid` + exact step 1, dynamic | 184.3 s | 182.8 s |
+| the same arm, **static** | 177.9 s | 185.3 s |
+| platform default, dynamic | 245.4 s | 231.8 s |
+| platform default, **static** | 230.3 s | 235.4 s |
+
+**No effect worth reporting.** The sign flips between the two prompts in both
+pairs -- a1 is faster static and a2 is slower -- and the difference is smaller
+than the spread within a single arm's own run (1.9-4.1% across the nine-prompt
+sets above). Whatever Inductor gains from knowing the shape is already available
+to it, presumably because the dynamic shapes are specialised on their first call
+and never vary afterwards.
+
+So the compile lever on this pipeline is **already fully spent by the platform
+default**, which is the same answer the four `--diffusion-compile-mode` values
+gave earlier: no value helps, and both CUDA-graph modes raise. The gains at W1
+are in attention and in weight traffic, not in the compiler.
+
+One thing it is worth doing anyway: **pin `TORCHINDUCTOR_CACHE_DIR`**. Not for
+speed -- for the reason in the reference-provenance section, that an arm and its
+reference must compile to the same kernels or the comparison carries a term
+larger than the effect.
+
 ## Every arm measured tonight, and which reference each number is against
 
 The reference column is not bookkeeping. The same outputs score differently
