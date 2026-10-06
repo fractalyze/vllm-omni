@@ -687,3 +687,49 @@ class SageAccuracySpecTest(absltest.TestCase):
 
         self.assertIsNone(_resolve_variant(self._quant_of("sage2-visual-only.json")))
         self.assertIsNone(_resolve_variant(self._quant_of("tuned.json")))
+
+
+class ServeFlagsTest(parameterized.TestCase):
+    """The flag list is the arm's definition, so it is tested without a GPU.
+
+    Two arms are only comparable if their server flags differ in exactly the
+    thing under test. These assert the two offload modes are the ones the
+    showcase's own serve scripts use, and that asking for an unknown one fails
+    loudly rather than silently serving the default -- which would produce a
+    plausible number for the wrong configuration.
+    """
+
+    def test_the_bf16_mode_matches_the_reference_serve_script(self):
+        from gate_pro import serve_flags
+
+        script = (Path(__file__).resolve().parents[1] / "serve" / "serve_pro_bf16_ref.sh").read_text()
+        flags = serve_flags("dlo-mmap", None, None)
+        for flag in ("--enable-distributed-layerwise-offload", "--dlo-no-use-allgather",
+                     "--disable-multithread-weight-load"):
+            self.assertIn(flag, flags)
+            self.assertIn(flag, script)
+        self.assertNotIn("--enable-layerwise-offload", flags)
+
+    def test_the_fp8_mode_matches_the_baseline_serve_script(self):
+        from gate_pro import serve_flags
+
+        script = (Path(__file__).resolve().parents[1] / "serve" / "serve_pro_fp8.sh").read_text()
+        flags = serve_flags("layerwise", None, None)
+        self.assertIn("--enable-layerwise-offload", flags)
+        self.assertIn("--enable-layerwise-offload", script)
+        self.assertNotIn("--enable-distributed-layerwise-offload", flags)
+
+    @parameterized.parameters("layerwise", "dlo-mmap")
+    def test_the_attention_config_is_the_only_other_difference(self, offload):
+        from gate_pro import serve_flags
+
+        shipped = serve_flags(offload, None, None)
+        armed = serve_flags(offload, '{"per_role": {}}', None)
+        self.assertEqual(armed[: len(shipped)], shipped)
+        self.assertEqual(armed[len(shipped):], ["--diffusion-attention-config", '{"per_role": {}}'])
+
+    def test_an_unknown_offload_mode_is_refused(self):
+        from gate_pro import serve_flags
+
+        with self.assertRaisesRegex(ValueError, "unknown offload mode"):
+            serve_flags("resident", None, None)

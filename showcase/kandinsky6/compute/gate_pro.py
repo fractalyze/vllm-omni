@@ -47,6 +47,37 @@ from serve import Arm, start_server, stop_server  # noqa: E402
 W1 = dict(width=864, height=480, num_frames=121, num_inference_steps=10, guidance_scale=1.0)
 REFERENCE_SEED = 42
 DEFAULT_CKPT = "/data/jooman/k6/ckpt/pro-distill-fp8-min"
+BF16_CKPT = "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers"
+
+# How an arm gets the DiT's weights to the GPU. The two modes are not
+# interchangeable: the FP8 DiT is 29 GB and fits in pinned host memory, so
+# plain layerwise offload stages it from RAM, while the BF16 DiT is 60.3 GB on
+# a 60 GB host and cannot be copied anywhere -- distributed layerwise offload
+# without AllGather binds every tensor to the mmapped checkpoint and streams it
+# from NVMe through the page cache. ``serve/serve_pro_bf16_ref.sh`` is the
+# reference's own script and these are its flags, so an arm asked for
+# ``dlo-mmap`` is served the way Track M's references were.
+OFFLOAD_FLAGS = {
+    "layerwise": ["--enable-layerwise-offload"],
+    "dlo-mmap": ["--enable-distributed-layerwise-offload", "--dlo-no-use-allgather"],
+}
+
+
+def serve_flags(offload: str, attention_config: str | None, compile_mode: str | None) -> list[str]:
+    """The ``vllm serve`` flags for one arm, beyond the model.
+
+    Separated from :func:`main` because this is the part a reader has to trust:
+    two arms are only comparable if the flag list differs in exactly the thing
+    under test, and that is checkable here without a GPU.
+    """
+    if offload not in OFFLOAD_FLAGS:
+        raise ValueError(f"unknown offload mode {offload!r}; expected one of {sorted(OFFLOAD_FLAGS)}")
+    flags = ["--num-gpus", "1", *OFFLOAD_FLAGS[offload], "--disable-multithread-weight-load"]
+    if attention_config is not None:
+        flags += ["--diffusion-attention-config", attention_config]
+    if compile_mode:
+        flags += ["--diffusion-compile-mode", compile_mode]
+    return flags
 
 
 def _reference_settings(manifest_path: Path, prompts: list[dict]) -> tuple[dict[str, int], dict]:
@@ -89,7 +120,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arm", required=True, help="an arms/*.json attention config, or 'shipped'")
     parser.add_argument("--name", required=True, help="arm name, used in the ledger and the output dir")
-    parser.add_argument("--ckpt", default=DEFAULT_CKPT)
+    parser.add_argument("--ckpt", default=None, help=f"default: {DEFAULT_CKPT}, or {BF16_CKPT} with --offload dlo-mmap")
+    parser.add_argument(
+        "--offload",
+        choices=sorted(OFFLOAD_FLAGS),
+        default="layerwise",
+        help="how the DiT reaches the GPU: 'layerwise' stages the FP8 DiT from pinned host RAM, "
+        "'dlo-mmap' streams the BF16 DiT from NVMe the way the reference server does",
+    )
     parser.add_argument("--compile-mode", default=None, help="--diffusion-compile-mode for this arm")
     parser.add_argument("--prompts", type=Path, default=BENCH / "prompts" / "setA.json")
     parser.add_argument("--out-dir", type=Path, required=True)
@@ -111,18 +149,19 @@ def main() -> int:
     seeds, geometry = _reference_settings(args.reference_manifest, prompts)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # The same flags Track M's serve_pro_fp8.sh passes, so an arm measured
-    # here is comparable with their baseline: anything else would make the
-    # attention config only one of several differences.
-    cli_args = ["--num-gpus", "1", "--enable-layerwise-offload", "--disable-multithread-weight-load"]
-    if args.arm != "shipped":
-        cli_args += ["--diffusion-attention-config", Path(args.arm).read_text()]
-    if args.compile_mode:
-        cli_args += ["--diffusion-compile-mode", args.compile_mode]
+    # The same flags Track M's serve scripts pass, so an arm measured here is
+    # comparable with their baseline and their reference: anything else would
+    # make the attention config only one of several differences.
+    checkpoint = args.ckpt or (BF16_CKPT if args.offload == "dlo-mmap" else DEFAULT_CKPT)
+    cli_args = serve_flags(
+        args.offload,
+        None if args.arm == "shipped" else Path(args.arm).read_text(),
+        args.compile_mode,
+    )
 
     arm = Arm(
         name=args.name,
-        model=args.ckpt,
+        model=checkpoint,
         cli_args=cli_args,
         env={
             "HF_HOME": "/data/jooman/hf",
@@ -133,14 +172,16 @@ def main() -> int:
             # reason.
             "MALLOC_MMAP_THRESHOLD_": "131072",
         },
-        notes=f"Track C gate generation, arm={args.arm}, compile_mode={args.compile_mode}",
+        notes=f"Track C gate generation, arm={args.arm}, offload={args.offload}, compile_mode={args.compile_mode}",
     )
 
     manifest = {
         "arm": args.name,
         "attention_config": args.arm,
         "compile_mode": args.compile_mode,
-        "checkpoint": args.ckpt,
+        "checkpoint": checkpoint,
+        "offload": args.offload,
+        "cli_args": cli_args,
         "geometry": geometry,
         "seeds": seeds,
         "prompt_set": prompt_set.get("set"),
