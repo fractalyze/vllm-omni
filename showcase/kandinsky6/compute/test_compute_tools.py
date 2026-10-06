@@ -912,3 +912,30 @@ class WorkingGateTest(parameterized.TestCase):
         verdict = g2_verdict(0.01, 0.02, floor_mean, floor_max)
         self.assertFalse(verdict["decidable"])
         self.assertNotIn("passes", verdict)
+
+
+class DistributionalGateTest(absltest.TestCase):
+    """G3's verdict: two-sided, and undefined rather than passing at zero.
+
+    CLIP cannot tell a better video from a differently-wrong one, so an arm
+    whose prompt agreement rises is drifting just as much as one whose
+    agreement falls. A one-sided test would pass exactly the case this check
+    exists to catch.
+    """
+
+    def test_a_small_move_either_way_passes(self):
+        from clip_gate import g3_verdict
+
+        self.assertTrue(g3_verdict(0.3110, 0.3099)["passes"])
+        self.assertTrue(g3_verdict(0.3099 * 0.99, 0.3099)["passes"])
+
+    def test_a_rise_past_the_tolerance_fails_like_a_fall(self):
+        from clip_gate import g3_verdict
+
+        self.assertFalse(g3_verdict(0.3099 * 1.05, 0.3099)["passes"])
+        self.assertFalse(g3_verdict(0.3099 * 0.95, 0.3099)["passes"])
+
+    def test_a_zero_reference_is_undecided(self):
+        from clip_gate import g3_verdict
+
+        self.assertFalse(g3_verdict(0.3, 0.0)["decidable"])

@@ -24,6 +24,9 @@
 # Sage2, on a stream that is worth about 15 s/step. Bytes alone therefore do not
 # make this workload fast; the GEMMs have to get faster too.
 #
+# `--diffusion-quantization-config` parses its argument as JSON, so a bare
+# method name is rejected before the server starts; both arms pass an object.
+#
 #   `int8`  -- vLLM-Omni's own DiffusionInt8Config: per-output-channel weight
 #              scales *and* dynamic per-token activation scales, so the GEMMs run
 #              on INT8 tensor cores. The fast arm, and the one with an activation
@@ -43,7 +46,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${K6_PYTHON:-/data/jooman/k6/venv/bin/python}"
 OUT="${K6_GATE_PRO:-/data/jooman/k6/results/gate-pro}"
-INT8_W8A8='int8'
+INT8_W8A8='{"method": "int8"}'
 INT8_WEIGHT_ONLY='{"method": "int8_per_channel_weight_only", "linear": "int8_per_channel_static"}'
 failures=0
 run() {
@@ -67,10 +70,13 @@ if [ "$failures" -ne 0 ]; then
         --limit 2 --no-warmup --no-locks --out-dir "$OUT/int8-w8a8-mmap-smoke"
 fi
 
-run int8-weight-only-smoke "$PY" "$HERE/gate_pro.py" \
-    --arm shipped --name int8-weight-only-smoke \
-    --quantization "$INT8_WEIGHT_ONLY" --offload layerwise \
-    --limit 2 --no-warmup --no-locks --out-dir "$OUT/int8-weight-only-smoke"
+# The weight-only variant is NOT available: routing INT8 through vLLM's online
+# registry is refused at start-up -- "online quantization for
+# ColumnParallelLinear with weight=QuantKey(i8,scale(f32,static,per_channel))
+# is not supported", the supported keys being FP8 and MX formats only. INT8 on
+# this stack exists solely as vLLM-Omni's DiffusionInt8Config, which is W8A8.
+# So there is no INT8 arm with BF16 activations to fall back to, and the
+# activation half of the approximation is not optional.
 
 echo "=== $(date +%H:%M:%S) session done, $failures failure(s)"
 exit 0
