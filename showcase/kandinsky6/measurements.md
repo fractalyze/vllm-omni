@@ -22,11 +22,13 @@ Three settings, all on the exact BF16 streamed arm with Sage2 on `visual_self`:
 | `sage2-mid` (6:54) | 12 | 179.1 s |
 | platform default everywhere | 60 | 231.8 s |
 
-**Speed is linear in the band at about 1.0 s a request per exact block**, which
-is what the kernel race predicts: 60 blocks x (177.66 - 70.53) ms of attention
-over 10 steps is 64 s across the whole stack, or 1.07 s a block. Nothing
-surprising, and worth stating because it means the band can be chosen to hit a
-latency target rather than searched.
+**Speed is close to linear in the band**, at 0.97 s a request per block over the
+first six and 1.42 s over the next six. The kernel race predicts 1.07 s a block:
+60 blocks x (177.66 - 70.53) ms of attention over 10 steps is 64 s across the
+whole stack. The two intervals bracket that rather than matching it, which is
+what three points measured once each can support -- the useful form of the
+result is that the band is a latency dial of roughly 1 s a block, not that it is
+exactly linear.
 
 Each number above is the **second** request of its run. The first carries
 compilation -- `sage2-wide`'s was 185.9 s against its steady 170.6 s -- so an
