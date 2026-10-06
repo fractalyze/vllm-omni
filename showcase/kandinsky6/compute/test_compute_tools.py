@@ -776,3 +776,35 @@ class ReferenceManifestRoundTripTest(absltest.TestCase):
 
         self.assertEqual(seeds, {"b1-newsreader": 42, "b2-market-haggle": 42})
         self.assertEqual(read_geometry, geometry)
+
+
+class LoadTimeQuantizationFlagTest(absltest.TestCase):
+    """Load-time quantization is a flag on the exact checkpoint, not a new one.
+
+    The offline converter writes per-*tensor* scales because vLLM's serialized
+    fp8 method cannot read per-row ones. vLLM's online methods can, so the
+    better recipe is reachable without a converter at all -- provided the flag
+    is passed and provided it is the only difference from the arm it is
+    compared with.
+    """
+
+    def test_the_method_name_reaches_the_server(self):
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, "fp8_per_channel")
+        self.assertEqual(flags[-2:], ["--diffusion-quantization-config", "fp8_per_channel"])
+
+    def test_vllm_knows_the_method_and_it_is_per_output_row(self):
+        """Guards the name against a vLLM bump, and the recipe against a typo:
+        ``fp8_per_tensor`` is also a valid name and is the thing being replaced."""
+        from vllm.config.quantization import resolve_quantization_config
+
+        args = resolve_quantization_config("fp8_per_channel", None)
+        group_shape = args.linear.weight.scale.group_shape
+        self.assertEqual((group_shape.row, group_shape.col), (-1, 1))
+        self.assertIsNone(args.linear.activation, "weight-only: activations stay BF16")
+
+    def test_no_quantization_leaves_the_flag_list_alone(self):
+        from gate_pro import serve_flags
+
+        self.assertEqual(serve_flags("layerwise", None, None), serve_flags("layerwise", None, None, None))

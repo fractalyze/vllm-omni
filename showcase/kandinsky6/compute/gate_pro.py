@@ -63,12 +63,26 @@ OFFLOAD_FLAGS = {
 }
 
 
-def serve_flags(offload: str, attention_config: str | None, compile_mode: str | None) -> list[str]:
+def serve_flags(
+    offload: str,
+    attention_config: str | None,
+    compile_mode: str | None,
+    quantization: str | None = None,
+) -> list[str]:
     """The ``vllm serve`` flags for one arm, beyond the model.
 
     Separated from :func:`main` because this is the part a reader has to trust:
     two arms are only comparable if the flag list differs in exactly the thing
     under test, and that is checkable here without a GPU.
+
+    ``quantization`` is a *load-time* quantization method name, which is a
+    different thing from serving one of the pre-quantized checkpoints: it takes
+    the exact BF16 checkpoint and quantizes each tensor as it is loaded, so the
+    keep list and the scale granularity are chosen here rather than baked into a
+    file on disk. ``fp8_per_channel`` is the reason the knob exists -- vLLM
+    offers per-output-row FP8 scales online, and the offline converter's own
+    docstring says per-row scales are the better recipe but are not loadable
+    from a natively-serialized FP8 checkpoint.
     """
     if offload not in OFFLOAD_FLAGS:
         raise ValueError(f"unknown offload mode {offload!r}; expected one of {sorted(OFFLOAD_FLAGS)}")
@@ -77,6 +91,8 @@ def serve_flags(offload: str, attention_config: str | None, compile_mode: str | 
         flags += ["--diffusion-attention-config", attention_config]
     if compile_mode:
         flags += ["--diffusion-compile-mode", compile_mode]
+    if quantization:
+        flags += ["--diffusion-quantization-config", quantization]
     return flags
 
 
@@ -129,6 +145,11 @@ def main() -> int:
         "'dlo-mmap' streams the BF16 DiT from NVMe the way the reference server does",
     )
     parser.add_argument("--compile-mode", default=None, help="--diffusion-compile-mode for this arm")
+    parser.add_argument(
+        "--quantization",
+        default=None,
+        help="a load-time quantization method (e.g. fp8_per_channel), or JSON for one with an ignore list",
+    )
     parser.add_argument("--prompts", type=Path, default=BENCH / "prompts" / "setA.json")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=None)
@@ -157,6 +178,7 @@ def main() -> int:
         args.offload,
         None if args.arm == "shipped" else Path(args.arm).read_text(),
         args.compile_mode,
+        args.quantization,
     )
 
     arm = Arm(
@@ -172,13 +194,14 @@ def main() -> int:
             # reason.
             "MALLOC_MMAP_THRESHOLD_": "131072",
         },
-        notes=f"Track C gate generation, arm={args.arm}, offload={args.offload}, compile_mode={args.compile_mode}",
+        notes=f"Track C gate generation, arm={args.arm}, offload={args.offload}, compile_mode={args.compile_mode}, quantization={args.quantization}",
     )
 
     manifest = {
         "arm": args.name,
         "attention_config": args.arm,
         "compile_mode": args.compile_mode,
+        "quantization": args.quantization,
         "checkpoint": checkpoint,
         "offload": args.offload,
         "cli_args": cli_args,
