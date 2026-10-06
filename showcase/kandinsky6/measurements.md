@@ -86,7 +86,7 @@ therefore **0.1819 / 0.5200** for set A and **0.2019 / 0.4345** for set B.
 | **Sage2 blocks 6-53 (12 exact)** | BF16 streamed | **177.7 s** | **0.1543 / 0.4591** | 0.1976 / 0.4989 | eager | fail | A **1.06x pass**, B 1.22x/**1.44x fail** | +0.00% pass |
 | Sage2 blocks 12-47 (24 exact) | BF16 streamed | ~190 s | — | b3 0.3349, b6 0.2767 (screen) | eager | — | — | — |
 | Sage2 "accurate" knobs | BF16 streamed | 192.8 s | a1 0.0563, a2 0.1867 (screen) | — | eager | — | — | — |
-| **blocks 6-53 + exact step 1** | BF16 streamed | **~184 s** | *running* | b3 0.2774, b6 0.2494 (screen) | eager | — | — | — |
+| **blocks 6-53 + exact step 1** | BF16 streamed | **182.6 s** | **0.1296 / 0.3560** | *running* | eager | mean inside, max over | A **0.89x / 0.86x PASS** | **-0.07% pass** |
 | FP8 + Sage2 | FP8-min pinned | ~110 s | 0.2791 / 0.5649 | — | compiled | fail | ~1.9x fail | — |
 | FP8 + platform attention | FP8-min pinned | 173.6 s | 0.262 / 0.551 | — | compiled | fail | ~1.8x fail | — |
 
@@ -94,6 +94,38 @@ Track M's arms on the same gates, for the Pareto frontier rather than for
 attribution: **INT8 storage + Sage2 + exact step 1 at 167.5 s** passes G2 and G3
 on set A (0.1735 / 0.4426 against the eager reference), and an **FFN FP8 band at
 148.9 s** fails G2 on set A (0.218 / 0.461), so that band is out.
+
+### The best arm: one exact sampler step on top of the block schedule
+
+`sage2-mid` plus `VLLM_OMNI_K6_EXACT_ATTN_STEPS=1` -- the 12-block band with the
+**first sampler step exact** -- is the strongest arm either track measured:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| a5-waterfall-drone | motion | 0.0319 | 0.0351 |
+| a1-portrait-speech | face, speech | 0.0345 | 0.0661 |
+| a4-chalkboard | text, face, speech | 0.0997 | 0.1096 |
+| a7-cafe-menu | text, face | 0.1026 | 0.1113 |
+| a9-violinist | face, motion | 0.1207 | 0.1909 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1525 | 0.2471 |
+| a2-neon-signage | text, motion | 0.1670 | 0.1909 |
+| a8-skateboard-crash | motion, sharp-sound | 0.2397 | **0.3120** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2179 | **0.3560** |
+| **set** | | **0.1296** | **0.3560** |
+
+**It sits below the pipeline's own floor on both halves** -- 0.89x the floor's
+mean and 0.86x its max. The difference between this arm and the BF16 reference
+is *smaller than the difference between compiling that reference and running it
+eager*. It is also the first arm here inside G1's **mean** (0.1296 against
+0.15), and ties the reference on prompt agreement (-0.07%).
+
+**One exact sampler step is worth more than twelve exact blocks.** Against the
+same band without it (0.1543 mean, 177.7 s), the step cut the set mean **16% for
+4.9 s a request**; against doubling the band instead (`sage2-narrow`, ~190 s) it
+is both better and 6 s cheaper. That is the vault's Qwen-Image result -- an error
+injected at an early step grows about 20x by the final latent -- reproduced on a
+different model and a different approximation, and it says the trajectory
+position matters more than the stack position for attention error.
 
 ### Reading the frontier
 
