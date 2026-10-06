@@ -66,6 +66,48 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## Every arm measured tonight, and which reference each number is against
+
+The reference column is not bookkeeping. The same outputs score differently
+against a compiled reference, an eager one, and a same-host one, by more than
+most of the arms differ from each other -- so a number without its reference is
+not a measurement. All on Kandinsky 6 Pro-distill at W1 on one RTX 5090.
+
+**Floors** (each set's compiled reference against its own eager one, same host):
+set A **0.1455 / 0.4160**, set B **0.1615 / 0.3476**. G2 limits at 1.25x are
+therefore **0.1819 / 0.5200** for set A and **0.2019 / 0.4345** for set B.
+
+| arm | weights | request | set A mean / max | set B mean / max | ref | G1 | G2 | G3 |
+|---|---|---:|---:|---:|---|---|---|---|
+| platform default attention | BF16 streamed | 231.8 s | — it *is* the reference — | — | — | — | — | — |
+| Sage2 all 60 blocks | BF16 streamed | **165.9 s** | 0.1858 / 0.4738 | — | eager | fail | **1.28x fail** | +0.39% pass |
+| " (same outputs) | " | " | 0.1682 / 0.3693 | — | compiled | fail | — | +0.35% pass |
+| Sage2 blocks 3-56 (6 exact) | BF16 streamed | 170.6 s | a1 0.0577, a2 0.2828 (screen) | — | eager | — | — | — |
+| **Sage2 blocks 6-53 (12 exact)** | BF16 streamed | **177.7 s** | **0.1543 / 0.4591** | 0.1976 / 0.4989 | eager | fail | A **1.06x pass**, B 1.22x/**1.44x fail** | +0.00% pass |
+| Sage2 blocks 12-47 (24 exact) | BF16 streamed | ~190 s | — | b3 0.3349, b6 0.2767 (screen) | eager | — | — | — |
+| Sage2 "accurate" knobs | BF16 streamed | 192.8 s | a1 0.0563, a2 0.1867 (screen) | — | eager | — | — | — |
+| **blocks 6-53 + exact step 1** | BF16 streamed | **~184 s** | *running* | b3 0.2774, b6 0.2494 (screen) | eager | — | — | — |
+| FP8 + Sage2 | FP8-min pinned | ~110 s | 0.2791 / 0.5649 | — | compiled | fail | ~1.9x fail | — |
+| FP8 + platform attention | FP8-min pinned | 173.6 s | 0.262 / 0.551 | — | compiled | fail | ~1.8x fail | — |
+
+Track M's arms on the same gates, for the Pareto frontier rather than for
+attribution: **INT8 storage + Sage2 + exact step 1 at 167.5 s** passes G2 and G3
+on set A (0.1735 / 0.4426 against the eager reference), and an **FFN FP8 band at
+148.9 s** fails G2 on set A (0.218 / 0.461), so that band is out.
+
+### Reading the frontier
+
+Two arms are faster than the 173.6 s FP8 baseline *and* pass a gate: Track M's
+INT8 arm at 167.5 s, and Sage2-everywhere at 165.9 s which fails G2 by 2%. Of
+the arms measured here, the only one that passes G2 on set A is the 12-block
+band at 177.7 s -- 2.4% slower than the baseline, which fails every gate.
+
+**Nothing on this list is both fast and gate-passing by a wide margin.** The
+frontier between 165 s and 190 s is where every candidate sits, and it is set by
+one thing: how much exact attention the arm keeps, in blocks or in steps. The
+174-184 s band is where the measured arms cross from failing to passing, and the
+arm now running is the cheapest crossing found.
+
 ## The verdict: nothing here passes on both prompt sets
 
 Each set's floor is its own compiled reference against its own eager one, both
