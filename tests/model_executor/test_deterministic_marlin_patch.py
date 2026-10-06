@@ -1,114 +1,115 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The VLLM_OMNI_DETERMINISTIC_MARLIN patch: Marlin's MoE alignment comes out
-with each expert's rows in row order, whatever order the atomics left them
-in, and decode-sized alignments are left as they are.
+"""The deterministic Marlin MoE patch: Marlin's MoE alignment runs vLLM PR
+#48032's kernels, which emit each expert's rows in row order on every call,
+and importing vllm_omni installs them without building them.
+
+The alignment cases use the Qwen3-Omni thinker's routing (128 experts, top 8)
+at the block_size_m vLLM 0.30.0's fused_marlin_moe picks for each token count;
+32 tokens (256 routes) take the stable one-block kernel, 64 and 2048 the
+radix path. The kernels are JIT-built, so those cases need a CUDA GPU and the
+CUDA toolkit wheel beside torch.
 """
+
+import subprocess
+import sys
 
 import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.experts import marlin_moe
 
 import vllm_omni.patch as patch_module
+from vllm_omni.model_executor.layers.marlin_moe_align import align
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+NUM_EXPERTS, TOPK = 128, 8
+# (tokens, block_size_m) as fused_marlin_moe chooses them for 128 experts, top 8.
+CASES = [(32, 8), (64, 8), (2048, 64)]
 
-
-def _alignment(topk_ids: torch.Tensor, num_experts: int, block_size: int, generator: torch.Generator):
-    """(sorted_ids, expert_ids, num_tokens_post_padded) as moe_align_block_size
-    lays them out, with each segment's rows in a random order, and the row-
-    ordered sorted_ids the patch must produce. The buffers run one block past
-    the padded total, as vLLM sizes them, with unset expert ids there."""
-    rows = topk_ids.flatten()
-    num_rows = rows.numel()
-    shuffled, ordered, expert_ids = [], [], []
-    for expert in range(num_experts):
-        segment = torch.nonzero(rows == expert).flatten()
-        if segment.numel() == 0:
-            continue
-        padded = -(-segment.numel() // block_size) * block_size
-        padding = [num_rows] * (padded - segment.numel())
-        permuted = segment[torch.randperm(segment.numel(), generator=generator)]
-        shuffled += permuted.tolist() + padding
-        ordered += segment.tolist() + padding
-        expert_ids += [expert] * (padded // block_size)
-    total = len(shuffled)
-    tail = [num_rows] * block_size
-    return (
-        torch.tensor(shuffled + tail, dtype=torch.int32),
-        torch.tensor(expert_ids + [-7], dtype=torch.int32),
-        torch.tensor([total], dtype=torch.int32),
-        torch.tensor(ordered + tail, dtype=torch.int32),
-    )
+requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="the alignment kernels are CUDA kernels")
 
 
-@pytest.mark.parametrize("num_tokens,block_size", [(32, 8), (64, 16), (9, 8)])
-def test_segments_come_out_in_row_order(num_tokens, block_size):
+def _topk_ids(num_tokens: int) -> torch.Tensor:
     generator = torch.Generator().manual_seed(num_tokens)
-    num_experts, topk = 16, 4
-    topk_ids = torch.stack([torch.randperm(num_experts, generator=generator)[:topk] for _ in range(num_tokens)])
-    sorted_ids, expert_ids, post_padded, expected = _alignment(topk_ids, num_experts, block_size, generator)
-    assert not torch.equal(sorted_ids, expected)
-
-    result = patch_module._sorted_within_experts(sorted_ids, expert_ids, post_padded, block_size, topk_ids.numel())
-
-    assert result.dtype == sorted_ids.dtype
-    assert torch.equal(result, expected)
+    scores = torch.rand(num_tokens, NUM_EXPERTS, generator=generator)
+    return scores.topk(TOPK, dim=1).indices.to(torch.int32).cuda()
 
 
-class _ShuffledAlign:
-    """Marlin's moe_align_block_size returning a shuffled alignment; keeps the
-    shuffled and the row-ordered ids of its last call."""
-
-    def __init__(self):
-        self.generator = torch.Generator().manual_seed(0)
-        self.shuffled = self.expected = None
-
-    def __call__(self, topk_ids, block_size, num_experts, *args, **kwargs):
-        sorted_ids, expert_ids, post_padded, self.expected = _alignment(
-            topk_ids, num_experts, block_size, self.generator
-        )
-        self.shuffled = sorted_ids
-        return sorted_ids, expert_ids, post_padded
-
-
-@pytest.fixture
-def fake_align(monkeypatch):
-    align = _ShuffledAlign()
-    monkeypatch.setattr(marlin_moe, "moe_align_block_size", align)
-    return align
+def _row_ordered(topk_ids: torch.Tensor, block_size: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The canonical alignment: experts in order, each expert's rows in row
+    order, padded with the route count to a whole block. Returns the active
+    sorted ids, the active blocks' expert ids, and the padded total."""
+    rows = topk_ids.flatten().cpu()
+    num_rows = rows.numel()
+    sorted_ids, expert_ids = [], []
+    for expert in range(NUM_EXPERTS):
+        segment = torch.nonzero(rows == expert).flatten().tolist()
+        if not segment:
+            continue
+        padded = -(-len(segment) // block_size) * block_size
+        sorted_ids += segment + [num_rows] * (padded - len(segment))
+        expert_ids += [expert] * (padded // block_size)
+    return torch.tensor(sorted_ids, dtype=torch.int32), torch.tensor(expert_ids, dtype=torch.int32), len(sorted_ids)
 
 
-def test_switch_off_leaves_marlin_alone(monkeypatch, fake_align):
-    monkeypatch.delenv("VLLM_OMNI_DETERMINISTIC_MARLIN", raising=False)
-    patch_module._patch_deterministic_marlin_moe()
-    assert marlin_moe.moe_align_block_size is fake_align
+def _active(topk_ids: torch.Tensor, block_size: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+    sorted_ids, expert_ids, post_padded = align.moe_align_block_size(
+        topk_ids, block_size, NUM_EXPERTS, None, ignore_invalid_experts=True
+    )
+    total = int(post_padded.item())
+    return sorted_ids[:total].cpu(), expert_ids[: total // block_size].cpu(), total
 
 
-def test_switch_on_sorts_prefill_alignments(monkeypatch, fake_align):
-    monkeypatch.setenv("VLLM_OMNI_DETERMINISTIC_MARLIN", "1")
-    patch_module._patch_deterministic_marlin_moe()
-    topk_ids = torch.stack([torch.randperm(8)[:2] for _ in range(32)])
+@pytest.mark.local_model
+@pytest.mark.cuda
+@requires_cuda
+@pytest.mark.parametrize("num_tokens,block_size", CASES)
+def test_alignment_is_row_ordered(num_tokens, block_size):
+    topk_ids = _topk_ids(num_tokens)
+    sorted_ids, expert_ids, total = _active(topk_ids, block_size)
+    expected_ids, expected_experts, expected_total = _row_ordered(topk_ids, block_size)
 
-    sorted_ids, _, _ = marlin_moe.moe_align_block_size(topk_ids, 8, 8, None, ignore_invalid_experts=True)
-
-    assert torch.equal(sorted_ids, fake_align.expected)
-
-
-def test_switch_on_skips_decode_sized_alignments(monkeypatch, fake_align):
-    monkeypatch.setenv("VLLM_OMNI_DETERMINISTIC_MARLIN", "1")
-    patch_module._patch_deterministic_marlin_moe()
-    topk_ids = torch.stack([torch.randperm(8)[:2] for _ in range(8)])
-
-    sorted_ids, _, _ = marlin_moe.moe_align_block_size(topk_ids, 8, 8)
-
-    # Eight tokens fit one block per expert: the atomics' order is returned.
-    assert sorted_ids is fake_align.shuffled
+    assert total == expected_total
+    assert torch.equal(sorted_ids, expected_ids)
+    assert torch.equal(expert_ids, expected_experts)
 
 
-def test_patch_installs_once(monkeypatch, fake_align):
-    monkeypatch.setenv("VLLM_OMNI_DETERMINISTIC_MARLIN", "1")
+@pytest.mark.local_model
+@pytest.mark.cuda
+@requires_cuda
+@pytest.mark.parametrize("num_tokens,block_size", CASES)
+def test_repeated_alignments_agree(num_tokens, block_size):
+    topk_ids = _topk_ids(num_tokens)
+    prefixes = {tuple(_active(topk_ids, block_size)[0].tolist()) for _ in range(10)}
+    assert len(prefixes) == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_patch_installs_the_pr_alignment_without_building_it():
+    """Importing vllm_omni points Marlin at the PR's alignment and compiles
+    nothing: a server that never runs Marlin never builds the kernels."""
+    script = """
+from torch.utils import cpp_extension
+
+def refuse(*args, **kwargs):
+    raise AssertionError("the alignment kernels were built at import")
+
+cpp_extension.load = refuse
+import vllm_omni  # noqa: F401
+from vllm.model_executor.layers.fused_moe.experts import marlin_moe
+from vllm_omni.model_executor.layers.marlin_moe_align import _ext, align
+
+assert marlin_moe.moe_align_block_size is align.moe_align_block_size
+assert _ext.load.cache_info().currsize == 0
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_patch_installs_once():
     patch_module._patch_deterministic_marlin_moe()
     installed = marlin_moe.moe_align_block_size
     patch_module._patch_deterministic_marlin_moe()
-    assert marlin_moe.moe_align_block_size is installed
+    assert marlin_moe.moe_align_block_size is installed is align.moe_align_block_size

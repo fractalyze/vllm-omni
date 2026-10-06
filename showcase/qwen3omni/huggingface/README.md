@@ -21,10 +21,10 @@ Qwen3-Omni-30B-A3B (AWQ-4bit) text and speech on a single RTX 5090 with [vLLM-Om
 ## What's inside
 
 - **Megakernels for RTX 5090 (sm_120a):** the thinker's decode steps and short prompt chunks, the talker's decode steps and its code predictor each run on one kernel launch, reading the checkpoint's own weight packing.
-- **Deterministic Marlin MoE:** a patch of vLLM's Marlin MoE so identical requests give the same text.
+- **Deterministic Marlin MoE:** vLLM's Marlin MoE always gives identical requests the same text, through the deterministic alignment kernels of vLLM PR [#48032](https://github.com/vllm-project/vllm/pull/48032).
 - **A shorter path to first audio:** the talker starts at the thinker's first token, ships its first audio frame with its prefill step, and decodes it straight to the API; the three stages share the GPU under CUDA MPS.
 
-Every change is behind a `VLLM_OMNI_*` environment switch, off by default.
+Every other change is behind a `VLLM_OMNI_*` environment switch, off by default.
 
 ## Results
 
@@ -79,7 +79,6 @@ VLLM_OMNI_THINKER_MEGAKERNEL=1 VLLM_OMNI_THINKER_MEGAKERNEL_CTAS=64 \
 VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL=1 VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS=128 \
 VLLM_OMNI_TALKER_MEGAKERNEL=1 \
 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96 \
-VLLM_OMNI_DETERMINISTIC_MARLIN=1 \
 VLLM_OMNI_CODE2WAV_STREAM_GRAPHS=1 VLLM_OMNI_CODE2WAV_COMPILE=1 \
 VLLM_OMNI_FRAME0=1 VLLM_OMNI_EARLY_CHUNK=1 VLLM_OMNI_FRAME0_AUDIO=1 \
 VLLM_OMNI_TALKER_PREP=1 VLLM_OMNI_FAST_POLL=1 \
@@ -89,12 +88,11 @@ vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
     --deploy-config showcase/qwen3omni/kernels.yaml
 ```
 
-**Deterministic Marlin arm.** The thinker on vLLM's Marlin MoE, patched to give the same bits for identical requests:
+**Deterministic Marlin arm.** The thinker on vLLM's Marlin MoE, which gives the same bits for identical requests:
 
 ```bash
 PATH=$PWD/.venv/bin:$PATH \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-VLLM_OMNI_DETERMINISTIC_MARLIN=1 \
 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96 \
 VLLM_OMNI_CODE2WAV_STREAM_GRAPHS=1 VLLM_OMNI_FRAME0=1 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
 vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \

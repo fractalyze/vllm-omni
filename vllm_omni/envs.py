@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     VLLM_OMNI_TALKER_MEGAKERNEL_CTAS: int = 96
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL: bool = False
     VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS: int | None = None
-    VLLM_OMNI_DETERMINISTIC_MARLIN: bool = False
     VLLM_OMNI_CODE2WAV_STREAM_GRAPHS: bool = False
     VLLM_OMNI_CODE2WAV_COMPILE: bool = False
     VLLM_OMNI_FRAME0: bool = False
@@ -66,7 +65,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "1" makes vLLM's Marlin MoE give the same bits across identical
     # requests: each expert's rows are sorted by row before the prefill's
     # grouped GEMM (vllm_omni/patch.py). Read once, when vllm_omni is imported.
-    "VLLM_OMNI_DETERMINISTIC_MARLIN": lambda: os.environ.get("VLLM_OMNI_DETERMINISTIC_MARLIN", "0") == "1",
     # "1" captures Qwen3-Omni code2wav's CUDA graphs only at the frame counts
     # a streaming (async_chunk) decode uses, instead of every size up to a
     # non-streaming decode's. Needs the stage's enforce_eager off.

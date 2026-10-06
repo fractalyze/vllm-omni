@@ -46,6 +46,11 @@ Every arm serves `cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit` (snapshot
   limits it takes to fit 32 GB.
 - The stock arm runs the triton thinker; the Marlin arm runs Marlin; the
   kernel arm runs its own thinker kernels on the checkpoint's packing.
+- `VLLM_OMNI_DETERMINISTIC_MARLIN` has since been removed: Marlin MoE
+  alignment is now always deterministic, through vLLM PR #48032's kernels
+  instead of the sort this table's runs used
+  ([#15](https://github.com/fractalyze/vllm-omni/pull/15)). To serve an arm
+  now, drop that switch.
 
 ## Talker compile artifact
 
