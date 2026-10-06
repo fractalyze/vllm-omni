@@ -44,7 +44,8 @@ W1_LATENT = (1, 16, 31, 60, 108)
 def load_vae(vae_dir: Path, device: torch.device) -> AutoencoderKLHunyuanVideo:
     config = json.loads((vae_dir / "config.json").read_text())
     vae = AutoencoderKLHunyuanVideo.from_config(config)
-    missing, unexpected = vae.load_state_dict(load_file(str(vae_dir / "diffusion_pytorch_model.safetensors")), strict=False)
+    state = load_file(str(vae_dir / "diffusion_pytorch_model.safetensors"))
+    missing, _ = vae.load_state_dict(state, strict=False)
     decoder_missing = [k for k in missing if k.startswith(("decoder.", "post_quant_conv."))]
     if decoder_missing:
         raise RuntimeError(f"decoder weights missing from the checkpoint: {decoder_missing[:5]}")
@@ -77,13 +78,13 @@ def decode(vae: AutoencoderKLHunyuanVideo, z: torch.Tensor) -> torch.Tensor:
 
 def timed(vae: AutoencoderKLHunyuanVideo, z: torch.Tensor, repeats: int) -> tuple[list[float], torch.Tensor]:
     out = decode(vae, z)  # warm-up (and compile)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     walls = []
     for _ in range(repeats):
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         out = decode(vae, z)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         walls.append(time.perf_counter() - start)
     return walls, out
 
@@ -128,12 +129,12 @@ def main() -> None:
             "n": len(walls),
             "shape": list(out.shape),
             **errors(reference, out),
-            "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
+            "peak_mem_gib": torch.accelerator.max_memory_allocated() / 2**30,
         }
         print(variant, json.dumps(results[variant]), flush=True)
         del vae
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.empty_cache()
+        torch.accelerator.reset_peak_memory_stats()
     vae_mod.current_omni_platform.empty_cache = original_empty_cache
     if args.out:
         args.out.write_text(json.dumps({"latent_shape": W1_LATENT, "variants": results}, indent=2))
