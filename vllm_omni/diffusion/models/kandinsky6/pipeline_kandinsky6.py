@@ -50,6 +50,13 @@ from .kandinsky6_transformer import Kandinsky6Transformer3DModel
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
+from .scheduling_kandinsky6_piflow import (
+    DXPolicy,
+    KandinskyPiflowScheduler,
+    policy_rollout_fm,
+    shift_timesteps,
+    split_grid_prediction,
+)
 
 
 class TextEmbeds(TypedDict):
@@ -692,6 +699,150 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
     )
 
 
+def piflow_denoise_loop(  # noqa: PLR0913
+    bundle: LatentBundle,
+    dit: nn.Module,
+    text_embeds: TextEmbeds,
+    visual_rope: Tensor | None,
+    audio_rope: Tensor | None,
+    text_rope: Tensor | list[Tensor],
+    num_steps: int,
+    scheduler: KandinskyPiflowScheduler,
+    guidance_weight: float = 1.0,
+    first_frames: Tensor | None = None,
+    visual_cond_scheme: str = "pretrain",
+    sample_video: bool = True,
+    sample_audio: bool = True,
+    *,
+    attention_mask: Tensor | None = None,
+    visual_token_type_ids: Tensor | None = None,
+    progress_callback=None,
+) -> LatentBundle:
+    """pi-Flow denoising for a distilled K6 checkpoint.
+
+    One DiT call per outer step returns ``scheduler.n_grid`` predictions of
+    ``x_0`` over the segment ahead; :func:`policy_rollout_fm` then integrates
+    that policy across the segment without touching the network. See
+    :mod:`vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow`
+    for the schedule and the policy.
+
+    Distilled K6 is trained at guidance 1.0 and the reference sampler has no CFG
+    branch, so this loop takes none: a caller asking for guidance is asking for a
+    trajectory these weights were not distilled for, and gets an error rather
+    than a quietly different video.
+    """
+    if abs(guidance_weight - 1.0) > 1e-6:
+        raise ValueError(
+            "Kandinsky 6 PiFlow sampling is distilled at guidance 1.0 and has no CFG branch; "
+            f"got guidance_weight={guidance_weight}. Serve the non-distilled checkpoint for CFG."
+        )
+    video, audio = bundle.video, bundle.audio
+    if video is None or audio is None:
+        raise ValueError("Kandinsky 6 PiFlow requires both video and audio latents")
+    if bundle.video_cu_seqlens is None or bundle.audio_cu_seqlens is None:
+        raise ValueError("Kandinsky 6 PiFlow requires video and audio sequence offsets")
+
+    device = video.device
+    video_cu = bundle.video_cu_seqlens.to(device=device)
+    audio_cu = bundle.audio_cu_seqlens.to(device=device)
+    video_lengths = torch.diff(video_cu)
+    audio_lengths = torch.diff(audio_cu)
+    batch_size = video_cu.shape[0] - 1
+
+    n_grid = scheduler.n_grid
+    substeps = scheduler.num_policy_substeps
+    shift = scheduler.shift
+    eps = scheduler.eps
+    scheduler.set_timesteps(num_steps, device=device)
+
+    for segment in scheduler.segments(num_steps):
+        tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
+        tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
+        sigma_src = shift_timesteps(tau_src, shift)
+
+        model_input_v = _build_video_input(
+            video,
+            dit.visual_cond,
+            first_frames,
+            video_cu,
+            visual_cond_scheme,
+        )
+        # Both modalities share the segment's time, as the reference does.
+        model_time = [sigma_src * 1000, sigma_src * 1000]
+        prediction = dit(
+            x_video=model_input_v,
+            x_audio=audio,
+            text_embed=text_embeds["text_embeds"],
+            pooled_text_embed=text_embeds["pooled_embed"],
+            time=model_time,
+            visual_rope=visual_rope,
+            audio_rope=audio_rope,
+            text_rope=text_rope,
+            sparse_params=None,
+            attention_mask=attention_mask,
+            visual_token_type_ids=visual_token_type_ids,
+        )
+        if not isinstance(prediction, tuple):
+            raise RuntimeError("Kandinsky 6 PiFlow requires the fused video/audio DiT forward")
+        pred_video, pred_audio = prediction
+        grid_video = split_grid_prediction(pred_video, n_grid)
+        grid_audio = split_grid_prediction(pred_audio, n_grid)
+
+        # The policy is defined on the latent's own channels; the DiT input may
+        # carry extra conditioning channels that the output head does not.
+        video_dim = grid_video.shape[-1]
+        audio_dim = grid_audio.shape[-1]
+        video_state = video[..., :video_dim]
+        audio_state = audio[..., :audio_dim]
+
+        # Packed layout: one scalar per request becomes one per token.
+        video_sigma = sigma_src.repeat_interleave(video_lengths)
+        audio_sigma = sigma_src.repeat_interleave(audio_lengths)
+        video_segment = torch.full_like(video_sigma, segment.segment_size)
+        audio_segment = torch.full_like(audio_sigma, segment.segment_size)
+
+        policy_video = DXPolicy(grid_video, video_state, video_sigma, video_segment, shift, eps)
+        policy_audio = DXPolicy(grid_audio, audio_state, audio_sigma, audio_segment, shift, eps)
+
+        if sample_video:
+            video = policy_rollout_fm(
+                video_state,
+                video_sigma,
+                tau_src.repeat_interleave(video_lengths),
+                tau_dst.repeat_interleave(video_lengths),
+                substeps,
+                policy_video,
+            )
+            if visual_cond_scheme == "tail_cond_first_frame" and first_frames is not None:
+                video[video_cu[1:] - 1] = first_frames.to(device=device, dtype=video.dtype)
+        if sample_audio:
+            audio = policy_rollout_fm(
+                audio_state,
+                audio_sigma,
+                tau_src.repeat_interleave(audio_lengths),
+                tau_dst.repeat_interleave(audio_lengths),
+                substeps,
+                policy_audio,
+            )
+
+        if progress_callback is not None:
+            progress_callback()
+
+    if first_frames is not None:
+        ff = first_frames.to(device=device, dtype=video.dtype)
+        if visual_cond_scheme == "i2v":
+            video[video_cu[:-1]] = ff
+        elif visual_cond_scheme == "tail_cond_first_frame":
+            video[video_cu[1:] - 1] = ff
+
+    return LatentBundle(
+        video=video,
+        audio=audio,
+        video_cu_seqlens=video_cu,
+        audio_cu_seqlens=audio_cu,
+    )
+
+
 """vLLM-Omni native pipeline for Kandinsky 6 TI2VA.
 
 The port assembler extracts this module's classes/functions into the
@@ -1160,7 +1311,26 @@ class Kandinsky6TI2VAPipeline(
                 _load_json(model_root, "scheduler/scheduler_config.json").get("shift", checkpoint_scheduler_scale)
             )
         scheduler_scale = float(model_config.get("scheduler_scale", checkpoint_scheduler_scale))
-        scheduler = KandinskyFlowMatchScheduler(scheduler_scale=scheduler_scale, device=self.device)
+        # A distilled checkpoint names PiflowScheduler and widens its output head
+        # by n_grid; both must agree, and n_grid is read off the head so they
+        # cannot be configured apart (see KandinskyPiflowScheduler.from_configs).
+        scheduler_json = (
+            _load_json(model_root, "scheduler/scheduler_config.json") if os.path.isfile(scheduler_config_path) else {}
+        )
+        wants_piflow = str(scheduler_json.get("_class_name", "")).lower().startswith("piflow")
+        head_grid_points = KandinskyPiflowScheduler.grid_points_from_config(transformer_config)
+        if wants_piflow != (head_grid_points > 1):
+            raise ValueError(
+                "Kandinsky 6 checkpoint is inconsistent: "
+                f"scheduler is {scheduler_json.get('_class_name')!r} but the DiT head implies "
+                f"n_grid={head_grid_points}. A PiFlow scheduler needs a grid head and vice versa."
+            )
+        if wants_piflow:
+            scheduler = KandinskyPiflowScheduler.from_configs(
+                scheduler_json, transformer_config, device=self.device
+            )
+        else:
+            scheduler = KandinskyFlowMatchScheduler(scheduler_scale=scheduler_scale, device=self.device)
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
 
@@ -1389,6 +1559,25 @@ class Kandinsky6TI2VAPipeline(
             device=device,
         )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            if isinstance(self.scheduler, KandinskyPiflowScheduler):
+                return piflow_denoise_loop(
+                    bundle=bundle,
+                    dit=self.transformer,
+                    text_embeds=positive,
+                    visual_rope=visual_rope,
+                    audio_rope=resolved_audio_rope,
+                    text_rope=text_rope,
+                    num_steps=num_inference_steps,
+                    scheduler=self.scheduler,
+                    guidance_weight=guidance_scale,
+                    first_frames=first_frames,
+                    visual_cond_scheme=visual_cond_scheme,
+                    sample_video=True,
+                    sample_audio=sample_audio,
+                    attention_mask=positive_mask,
+                    visual_token_type_ids=visual_token_type_ids,
+                    progress_callback=progress_bar.update,
+                )
             return denoise_loop(
                 bundle=bundle,
                 dit=self.transformer,
