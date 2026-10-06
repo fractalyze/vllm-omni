@@ -9,6 +9,146 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Making W1's checkpoint serve at all, and what host RAM costs (Track M)
+
+Track M, build-server-2, 2026-10-06 19:00-24:00 KST. `kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers`
+(29B) now loads and serves on one RTX 5090 with an FP8 DiT and pi-Flow sampling.
+**The served output is not yet correct**, so no latency number in this section is
+a headline and none should be quoted as one: the smoke requests return an MP4
+whose video and audio both decode to exactly zero, and the DiT's own output is
+NaN from the first step. The cause is being bisected (below).
+
+### FP8 conversion of the DiT
+
+`tools/quantize_dit_fp8.py` on this host:
+
+| | |
+|---|---:|
+| Input (BF16, 4471 tensors) | 60.3 GB |
+| Output (FP8 E4M3 + per-tensor scales) | 32.3 GB |
+| Compression | 1.87x |
+| Wall time | 75 s, then 63 s |
+| Linear weights quantized / kept BF16 | 1856 / 135 |
+
+Round-trip error, dequantizing sampled weights against the originals: 1.8% to
+3.5% of each tensor's maximum (block 5 `to_query` 3.5%, block 5 FFN `in_layer`
+1.8%, block 30 `visual_modulation` 3.3%). No NaN or Inf in a full sweep of a
+4 GB shard, so the checkpoint itself is sound.
+
+Scales are per **tensor**, not per channel, because vLLM's native `fp8` method
+builds a `PerTensorScaleParameter` and a per-channel scale fails its shape
+assertion on load. `--scale channel` is implemented for a later
+`compressed-tensors` checkpoint and should be the better-quality arm: one scale
+over a 4096x16384 matrix means every row loses range to that matrix's single
+largest weight.
+
+### Host RAM is the binding constraint, not the 32 GB of GPU
+
+| arm | DiT weights | fits 32 GB GPU | fits ~55 GB usable host RAM |
+|---|---:|---|---|
+| BF16 resident | 60.3 GB | no | no |
+| BF16 streamed per block | 60.3 GB | n/a | **no** -- needs NVMe, not host RAM |
+| FP8 streamed from host (this arm) | 32.3 GB | n/a | **marginally** |
+| NVFP4 resident | ~15 GB | plausible, untested | yes |
+
+Measured on the FP8 arm with `--enable-layerwise-offload`:
+
+| | |
+|---|---:|
+| Worker RSS at steady state | 52.4 GB |
+| Worker swapped out | 5.6 GB |
+| Host swap in use | 7 GB of 7 GB |
+| Host memory available | 1-4 GB |
+| GPU in use after load | 18.1 GB |
+| GPU peak during a smoke request | 26.3 GB |
+
+The DiT's 32.3 GB and the Qwen2.5-VL-7B text encoder (~16 GB BF16) are both
+host-resident, with the layerwise backend's flattened copies beside the
+checkpoint's mapped pages. Three consequences, all measured:
+
+- **Load time is bimodal.** About 100 s with the checkpoint warm in the page
+  cache from having just been written; 5-9 minutes cold with swap in use. Cold
+  start is a property of the page cache's state here, not of the checkpoint, and
+  has to be reported with that state named.
+- **The BF16 reference cannot reuse this path.** BF16 does not fit host RAM, so
+  R0 needs block-by-block streaming from NVMe, not the headline arm's offload.
+- **The next precision step should target the text encoder.** Its 16 GB is a
+  bigger prize than the DiT's remaining 2 GB of BF16 weights.
+
+This also made the host unusable for anything else: at 20:05 the box had 3 GB
+available, swap full and a load average of 110 with a build running next to the
+server. One server at a time on a 60 GB host, and nothing heavy beside it.
+
+### Smoke geometry, served (plumbing evidence, not a workload)
+
+512x320, 25 frames, 10 steps, guidance 1.0, seed 42, audio on.
+
+| | |
+|---|---:|
+| Request wall time, first request on a fresh server | 32.6 s |
+| Request wall time, warm | 6.65 / 6.64 / 6.70 s, three separately started servers |
+| Denoise loop | 10/10 steps at 1.86 it/s |
+| GPU peak (allocator) | 26.3 GB |
+
+The smoke geometry has about 4.5k visual tokens against W1's 50k, so it
+exercises the plumbing and not the workload.
+
+### The zero-output bug: what is ruled out, and by what
+
+| hypothesis | tested by | verdict |
+|---|---|---|
+| The FP8 checkpoint is corrupt | dequantized sampled weights; NaN/Inf sweep | ruled out |
+| The pi-Flow math is wrong | 23 unit tests against a naive oracle built from the published recursion | ruled out at the math level |
+| The pi-Flow loop never runs | it logs its sampler; the request logs `sampler=piflow steps=10` with a 10/10 progress bar | ruled out, it runs |
+| The Euler loop runs instead | same log line | ruled out |
+| Latents promoted to FP32 into an FP16 VAE | found, fixed, re-measured | a real bug, fixed, **not** the cause |
+| A dtype or shape fault in the loop | GPU integration test against a small real DiT | ruled out |
+| The VAE or muxer is at fault | Track C's BF16 Lite run produces a correct MP4 on the same code | ruled out |
+
+Traced to its origin: the **DiT forward returns NaN from step 0** (2,867,200 of
+2,867,200 elements), and the VAE then clamps NaN to zero, which is why both
+streams are exactly zero and the file is byte-identical across prompts. So the
+fault is upstream of the sampler, in the FP8 DiT itself or in the wide
+pi-Flow head. The two differ from Track C's working arm in exactly those two
+ways, which is what the next experiment separates: Lite-**distill** is BF16 *and*
+pi-Flow *and* has the same n_grid-10 heads, so a correct video there indicts FP8
+and a NaN there indicts the head handling.
+
+Instrumentation left behind, gated on `VLLM_OMNI_K6_PIFLOW_DEBUG=1`: per-step
+latent and DiT-output statistics inside the pi-Flow loop, plus the final latents,
+the decoded video and the decoded audio. That is what localized this, and it
+separates "degenerate latents" from "a decode that zeroes a good latent" in one
+request.
+
+### What the port could not do before this session
+
+Each was a hard failure, not a slowdown:
+
+1. **No pi-Flow.** `model_index.json` names `PiflowScheduler`; the port had only
+   the shifted-Euler stepper, and `PiflowScheduler` is not in diffusers 0.40.0 --
+   it exists only in Kandinsky's patched fork.
+2. **A 10x wider output head** (`out_visual_dim` 160 for `in_visual_dim` 16).
+   `n_grid` is derived from the head so the two cannot be configured apart.
+3. **`out_audio_dim` was not a DiT parameter.** The audio head was always sized
+   from `in_audio_dim` -- right for plain Pro (40 == 40), wrong for distilled
+   (400 != 40).
+4. **Pre-quantized checkpoints could not load.** `OmniDiffusionConfig`
+   auto-detects a checkpoint's `quantization_config` and resolves it through
+   vLLM-Omni's factory, which maps `fp8` to the *online* `DiffusionFp8Config` --
+   which cannot load the serialized checkpoint it was detected from. Any
+   pre-quantized diffusion checkpoint hits this, not just Kandinsky.
+5. **Weight names.** Covered by Track C's PR #21, which this branch adopts.
+
+### Two process findings, each of which cost measurable time
+
+- **Worker stdout is not forwarded into the server log**, while `logger.*` from
+  the same module is. A missing `print` is therefore not evidence that a code
+  path did not run, and about 40 minutes went into conclusions drawn that way.
+- **Killing `vllm serve` leaves the `DiffusionWorker` alive and serving** on the
+  port. One round of measurements was taken against the previous build before
+  this was noticed; the harness's `serve.py` signals the process group and waits
+  for the GPU to drain for exactly this reason.
+
 ## Where a Pro block's time goes at W1, and what two config values do to it
 
 > Every number in this section was taken after two bugs in the measuring
