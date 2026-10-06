@@ -35,9 +35,7 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
-PROFILER_LINE = re.compile(
-    r"\[DiffusionPipelineProfiler\]\s+(?P<stage>[\w.\[\]]+)\s+took\s+(?P<seconds>[0-9.]+)s"
-)
+PROFILER_LINE = re.compile(r"\[DiffusionPipelineProfiler\]\s+(?P<stage>[\w.\[\]]+)\s+took\s+(?P<seconds>[0-9.]+)s")
 
 # Allocation failures the K6 recipe saw in VAE decode on an 80 GB H100. On 32
 # GB they are the expected first symptom of a decode that no longer fits, and a

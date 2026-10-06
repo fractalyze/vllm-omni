@@ -43,7 +43,7 @@ import json
 import statistics
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -176,9 +176,7 @@ def score_video(
 def _log_mel(wave: np.ndarray, rate: int) -> torch.Tensor:
     import torchaudio
 
-    mel = torchaudio.transforms.MelSpectrogram(
-        sample_rate=rate, n_fft=MEL_FFT, hop_length=MEL_HOP, n_mels=MEL_BINS
-    )
+    mel = torchaudio.transforms.MelSpectrogram(sample_rate=rate, n_fft=MEL_FFT, hop_length=MEL_HOP, n_mels=MEL_BINS)
     return torch.log(mel(torch.from_numpy(wave).float()) + 1e-6)
 
 
@@ -311,8 +309,21 @@ def encode_floor(reference: Path, *, crf: int = 18) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as tmp:
         again = Path(tmp) / "reencoded.mp4"
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(reference), "-c:v", "libx264", "-crf", str(crf),
-             "-c:a", "copy", str(again)],
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(reference),
+                "-c:v",
+                "libx264",
+                "-crf",
+                str(crf),
+                "-c:a",
+                "copy",
+                str(again),
+            ],
             check=True,
         )
         video = score_video(reference, again)

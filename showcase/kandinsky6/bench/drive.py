@@ -40,7 +40,7 @@ POLL_INTERVAL_S = 0.05
 DEFAULT_TIMEOUT_S = 3600.0
 
 
-class RequestFailed(RuntimeError):
+class RequestFailedError(RuntimeError):
     """The server reported a failed generation, or never reached ``completed``."""
 
 
@@ -74,9 +74,7 @@ def _post_multipart(url: str, fields: dict[str, str], timeout: float) -> dict[st
     boundary = f"----k6bench{uuid.uuid4().hex}"
     parts: list[bytes] = []
     for key, value in fields.items():
-        parts.append(
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
-        )
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
     parts.append(f"--{boundary}--\r\n".encode())
     body = b"".join(parts)
     request = urllib.request.Request(
@@ -92,7 +90,7 @@ def _post_multipart(url: str, fields: dict[str, str], timeout: float) -> dict[st
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:  # surface the server's own message
-        raise RequestFailed(f"POST {url} -> {exc.code}: {exc.read().decode()[:2000]}") from exc
+        raise RequestFailedError(f"POST {url} -> {exc.code}: {exc.read().decode()[:2000]}") from exc
 
 
 def _get_json(url: str, timeout: float) -> dict[str, Any]:
@@ -142,7 +140,7 @@ def submit_and_fetch(
 ) -> RequestResult:
     """Run one request end to end and write the MP4 to ``out_path``.
 
-    Raises :class:`RequestFailed` if the server reports ``failed`` or the job
+    Raises :class:`RequestFailedError` if the server reports ``failed`` or the job
     has not completed within ``timeout_s``; a timed-out request is a failed
     measurement, never a slow one to be recorded.
     """
@@ -155,7 +153,7 @@ def submit_and_fetch(
 
     video_id = created.get("id")
     if not video_id:
-        raise RequestFailed(f"POST /v1/videos returned no id: {created!r}")
+        raise RequestFailedError(f"POST /v1/videos returned no id: {created!r}")
 
     deadline = t_start + timeout_s
     n_polls = 0
@@ -163,12 +161,12 @@ def submit_and_fetch(
     # A server that answers the POST with a terminal status needs no polling.
     while payload.get("status") not in {"completed", "failed"}:
         if time.perf_counter() > deadline:
-            raise RequestFailed(f"video {video_id} still {payload.get('status')!r} after {timeout_s}s")
+            raise RequestFailedError(f"video {video_id} still {payload.get('status')!r} after {timeout_s}s")
         time.sleep(poll_interval_s)
         n_polls += 1
         payload = _get_json(f"{base_url}/v1/videos/{video_id}", timeout=60.0)
     if payload.get("status") == "failed":
-        raise RequestFailed(f"video {video_id} failed: {payload.get('error')!r}")
+        raise RequestFailedError(f"video {video_id} failed: {payload.get('error')!r}")
     t_completed = time.perf_counter()
 
     with urllib.request.urlopen(f"{base_url}/v1/videos/{video_id}/content", timeout=timeout_s) as response:
@@ -177,7 +175,7 @@ def submit_and_fetch(
     t_done = time.perf_counter()
 
     if not data:
-        raise RequestFailed(f"video {video_id} returned an empty body")
+        raise RequestFailedError(f"video {video_id} returned an empty body")
 
     return RequestResult(
         request_wall_s=t_done - t_start,

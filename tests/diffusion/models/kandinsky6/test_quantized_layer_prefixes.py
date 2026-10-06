@@ -62,15 +62,21 @@ TINY_CONFIG = {
 }
 
 
-def _init_single_rank() -> None:
+def _init_single_rank(test: absltest.TestCase) -> None:
+    """A one-rank TP group for vLLM's parallel layers, torn down after the test.
+
+    The group is process-global: leaving it up makes the next test module that
+    initializes its own fail with "tensor model parallel group is already
+    initialized", so this mirrors the repo's fixture convention and cleans up.
+    """
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import init_distributed_environment, initialize_model_parallel
-    from vllm.distributed.parallel_state import model_parallel_is_initialized
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory, model_parallel_is_initialized
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", _MASTER_PORT)
     if model_parallel_is_initialized():
         return
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", _MASTER_PORT)
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(
             world_size=1,
@@ -80,6 +86,7 @@ def _init_single_rank() -> None:
             backend="gloo",
         )
         initialize_model_parallel(1, 1)
+    test.addCleanup(cleanup_dist_env_and_memory)
 
 
 class ChildPrefixTest(parameterized.TestCase):
@@ -97,7 +104,7 @@ class LayerPrefixTest(absltest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        _init_single_rank()
+        _init_single_rank(self)
         from diffusers.models.modeling_utils import no_init_weights
 
         from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import (
@@ -164,9 +171,7 @@ class LayerPrefixTest(absltest.TestCase):
         config = VllmConfig()
         config.model_config = SimpleNamespace(dtype=torch.bfloat16, is_moe=False)
         with set_current_vllm_config(config), torch.device("meta"), no_init_weights():
-            dit = Kandinsky6Transformer3DModel.from_diffusers_config(
-                dict(TINY_CONFIG), quant_config=quant_config
-            )
+            dit = Kandinsky6Transformer3DModel.from_diffusers_config(dict(TINY_CONFIG), quant_config=quant_config)
 
         params = {name for name, _ in dit.named_parameters()}
         self.assertIn(f"{kept}.weight", params)

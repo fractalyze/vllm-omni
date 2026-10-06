@@ -169,9 +169,7 @@ class GridHeadTest(absltest.TestCase):
             KandinskyPiflowScheduler.grid_points_from_config(config)
 
     def test_from_configs_reads_the_checkpoint(self) -> None:
-        scheduler = KandinskyPiflowScheduler.from_configs(
-            PRO_DISTILL_SCHEDULER_CONFIG, PRO_DISTILL_TRANSFORMER_CONFIG
-        )
+        scheduler = KandinskyPiflowScheduler.from_configs(PRO_DISTILL_SCHEDULER_CONFIG, PRO_DISTILL_TRANSFORMER_CONFIG)
         self.assertEqual(scheduler.n_grid, 10)
         self.assertEqual(scheduler.shift, 5.0)
         self.assertEqual(scheduler.num_policy_substeps, 128)

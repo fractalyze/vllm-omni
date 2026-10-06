@@ -52,16 +52,12 @@ STUDY = "k6-5090"
 
 
 def _git_commit(repo: Path) -> str | None:
-    out = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
-    )
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
     return out.stdout.strip() or None
 
 
 def _git_dirty(repo: Path) -> bool:
-    out = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, check=False
-    )
+    out = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, check=False)
     return bool(out.stdout.strip())
 
 

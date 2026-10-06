@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from drive import RequestFailed, request_fields, submit_and_fetch  # noqa: E402
+from drive import RequestFailedError, request_fields, submit_and_fetch  # noqa: E402
 from gpu_guard import GpuGuard  # noqa: E402
 from ledger import Ledger, LedgerRow, environment_fingerprint, run_id, spread, validity_from_guard  # noqa: E402
 from stages import summarize  # noqa: E402
@@ -121,7 +121,7 @@ def main() -> None:
                 started = time.time()
                 try:
                     result = submit_and_fetch(args.base_url, fields, out_mp4)
-                except RequestFailed as exc:
+                except RequestFailedError as exc:
                     print(f"{prompt['id']} {label}: FAILED {exc}", file=sys.stderr)
                     records.append({"prompt_id": prompt["id"], "label": label, "failed": str(exc)})
                     continue
