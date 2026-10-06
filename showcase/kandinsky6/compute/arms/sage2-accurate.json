@@ -1,0 +1,20 @@
+{
+  "per_role": {
+    "kandinsky6": {
+      "visual_self": {
+        "backend": "SAGE_ATTN",
+        "quant": {
+          "dtype_qk": "int8",
+          "dtype_vo": "float16",
+          "q_block_size": 1
+        }
+      },
+      "audio_video_cross": {
+        "backend": "TORCH_SDPA"
+      },
+      "audio_self": {
+        "backend": "TORCH_SDPA"
+      }
+    }
+  }
+}

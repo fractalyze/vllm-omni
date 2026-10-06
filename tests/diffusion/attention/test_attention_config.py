@@ -103,7 +103,9 @@ class TestAttentionSpec:
     @pytest.mark.parametrize(
         "spec, match",
         [
-            ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "only supported by the TRTLLM_ATTN"),
+            # The message now lists QUANT_SPEC_BACKENDS, so match on the part
+            # that does not move when a backend joins the set.
+            ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "quant is only supported by the"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int4"}}, "quant.dtype_qk"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8", "k_block_size": 8}}, "quant.k_block_size"),
         ],
@@ -111,6 +113,16 @@ class TestAttentionSpec:
     def test_quant_validation_rejects(self, spec, match):
         with pytest.raises(ValueError, match=match):
             AttentionSpec(**spec)
+
+    def test_quant_accepted_on_sage_attn(self):
+        """SAGE_ATTN reads the quant spec: ``dtype_vo`` chooses between its FP8
+        and FP16-with-FP32-accumulation value paths, and ``q_block_size``
+        chooses per-thread or per-warp INT8 scale granularity. Those are the
+        knobs that trade its accuracy back, and the fast default failed the
+        Kandinsky 6 showcase's quality gate."""
+        spec = AttentionSpec(backend="SAGE_ATTN", quant={"dtype_qk": "int8", "dtype_vo": "float16"})
+        assert spec.quant is not None
+        assert spec.backend_kwargs()["quant"]["dtype_vo"] == "float16"
 
     def test_fastvideo_vsa_topk_serialized(self):
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
@@ -765,6 +777,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             attention_config=None,
             role_category=None,
             allow_trtllm_default=False,
+            layer_index=None,
         ):
             captured["role"] = role
             captured["head_size"] = head_size
@@ -1139,7 +1152,7 @@ class TestDiffusionKvCacheQuantization:
         monkeypatch.setattr(
             layer_mod,
             "get_attn_backend_for_role",
-            lambda role, head_size, attention_config=None, role_category=None, allow_trtllm_default=False: (
+            lambda role, head_size, attention_config=None, role_category=None, allow_trtllm_default=False, layer_index=None: (  # noqa: E501
                 _FakeBackend,
                 None,
             ),
@@ -1227,3 +1240,85 @@ class TestDiffusionKvCacheQuantization:
                     causal=False,
                     softmax_scale=1.0,
                 )
+
+
+class TestLayerScheduledSpecs:
+    """A spec may restrict itself to a range of transformer layers.
+
+    A faster, lower-precision attention backend is not equally safe in every
+    block of a diffusion transformer: a perturbation in an early block has the
+    whole rest of the network to amplify it, and one in the last block lands
+    almost directly in the output. A schedule puts the quick kernel through the
+    middle of the stack and leaves the ends on the platform default, which is a
+    point between "fast and lossy" and "exact and slow" that no per-role setting
+    can express.
+    """
+
+    @staticmethod
+    def _config(layers):
+        from vllm_omni.diffusion.data import AttentionConfig
+
+        return AttentionConfig(per_role={"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN", "layers": layers}}})
+
+    @pytest.mark.parametrize(
+        "layer_index, expected",
+        [(0, None), (5, None), (6, "SAGE_ATTN"), (30, "SAGE_ATTN"), (53, "SAGE_ATTN"), (54, None), (59, None)],
+    )
+    def test_the_range_is_half_open_and_the_ends_fall_through(self, layer_index, expected):
+        spec, _ = self._config("6:54").resolve_with_source(
+            role="kandinsky6.visual_self", layer_index=layer_index
+        )
+        assert (spec.backend if spec is not None else None) == expected
+
+    @pytest.mark.parametrize("layers, inside, outside", [(":8", 7, 8), ("52:", 52, 51)])
+    def test_either_bound_may_be_omitted(self, layers, inside, outside):
+        config = self._config(layers)
+        assert config.resolve_with_source(role="kandinsky6.visual_self", layer_index=inside)[0] is not None
+        assert config.resolve_with_source(role="kandinsky6.visual_self", layer_index=outside)[0] is None
+
+    def test_an_unscheduled_spec_still_applies_everywhere(self):
+        from vllm_omni.diffusion.data import AttentionConfig
+
+        config = AttentionConfig(per_role={"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN"}}})
+        for layer_index in (0, 59, None):
+            spec, _ = config.resolve_with_source(role="kandinsky6.visual_self", layer_index=layer_index)
+            assert spec is not None, "a spec without a range must not become conditional"
+
+    def test_a_scheduled_spec_does_not_apply_to_an_unidentifiable_layer(self):
+        """Otherwise the schedule would depend on whether a module happened to
+        carry a parseable prefix, which is not a property anyone chose."""
+        spec, _ = self._config("6:54").resolve_with_source(role="kandinsky6.visual_self", layer_index=None)
+        assert spec is None
+
+    def test_a_skipped_spec_falls_through_to_the_next_entry(self):
+        """The ends get the *next* match, not nothing: a schedule narrows where a
+        backend applies, it does not disable the lookup."""
+        from vllm_omni.diffusion.data import AttentionConfig
+
+        config = AttentionConfig(
+            default={"backend": "CUDNN_ATTN"},
+            per_role={"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN", "layers": "6:54"}}},
+        )
+        inside, _ = config.resolve_with_source(role="kandinsky6.visual_self", layer_index=30)
+        outside, source = config.resolve_with_source(role="kandinsky6.visual_self", layer_index=0)
+        assert inside.backend == "SAGE_ATTN"
+        assert outside.backend == "CUDNN_ATTN"
+        assert source == "attention_config.default"
+
+    @pytest.mark.parametrize("layers", ["6", "6:54:2", "a:4", "8:8", "9:4", "-1:4"])
+    def test_a_malformed_range_is_refused(self, layers):
+        """Rejected rather than ignored: a schedule that silently became 'every
+        layer' would be measured as a schedule and reported as one while being
+        the plain arm."""
+        with pytest.raises(ValueError):
+            self._config(layers)
+
+    def test_the_index_comes_from_the_layers_own_prefix(self):
+        """So a range is per block stack, not global. A model with two stacks
+        numbers both from zero, and this is the function that decides which
+        number a schedule sees."""
+        from vllm_omni.diffusion.attention.layer import _try_extract_layer_index
+
+        assert _try_extract_layer_index("transformer.visual_transformer_blocks.7.self_attention") == 7
+        assert _try_extract_layer_index("transformer.video_text_transformer_blocks.7.self_attention") == 7
+        assert _try_extract_layer_index("") is None

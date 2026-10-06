@@ -149,6 +149,10 @@ class Attention(nn.Module):
                 attention_config=attention_config,
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
+                # Read from the prefix here rather than from self.layer_idx,
+                # which is assigned further down: a spec may restrict itself to a
+                # range of layers, and the backend is chosen before then.
+                layer_index=_try_extract_layer_index(prefix),
             )
             if (
                 scheduler_paged_kv

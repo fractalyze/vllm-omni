@@ -665,6 +665,50 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         return output
 
 
+def kernel_device() -> torch.device:
+    """Where ``scaled_int8_quant`` can actually run.
+
+    Not ``torch.get_default_device()``: during a layer-wise offloaded load that
+    is host memory, which is exactly the case this exists to handle.
+    """
+    if current_omni_platform.is_cuda() and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if current_omni_platform.is_npu():
+        return torch.device("npu")
+    return torch.device("cpu")
+
+
+def quantize_weight_where_the_kernel_runs(
+    weight: torch.Tensor,
+    compute_device: torch.device,
+    quantize: Callable[..., tuple[torch.Tensor, torch.Tensor, Any]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``weight`` on ``compute_device``, returning results where it lives.
+
+    ``scaled_int8_quant`` is a CUDA/NPU kernel with no CPU implementation, while
+    a weight being quantized at load time is not necessarily on the accelerator:
+    under layer-wise offload the DiT's weights are staged in host memory and only
+    the block being computed is resident. Quantizing in place therefore fails
+    with "Could not run '_C::dynamic_scaled_int8_quant' with arguments from the
+    'CPU' backend" -- at load, before the server ever answers.
+
+    The weight is moved to the device the kernel can run on and the results are
+    moved back to the device the weight came from, so an offloaded layer stays
+    offloaded and a resident one is untouched. The move is one layer's weight at
+    a time, which is the same bound the offload path already works to.
+    """
+    # Resolved here rather than bound as a default argument: a default is
+    # captured at import, which would make `ops.scaled_int8_quant` unpatchable
+    # and silently break every test that asserts this method quantizes.
+    quantize = quantize or ops.scaled_int8_quant
+    staged = weight if weight.device == compute_device else weight.to(compute_device)
+    qweight, weight_scale, _ = quantize(staged, scale=None)
+    if qweight.device != weight.device:
+        qweight = qweight.to(weight.device)
+        weight_scale = weight_scale.to(weight.device)
+    return qweight, weight_scale
+
+
 class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
     """
     Online version of Int8LinearMethod, loads the fp16/bf16 checkpoint
@@ -687,7 +731,7 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
             initialize_single_dummy_weight(layer.weight)
 
         w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.int8_linear.layer_param_names
-        qweight, weight_scale, _ = ops.scaled_int8_quant(layer.weight, scale=None)
+        qweight, weight_scale = quantize_weight_where_the_kernel_runs(layer.weight, kernel_device())
 
         # Update layer with new values.
         replace_parameter(layer, w_q_name, torch.nn.Parameter(qweight.t().data, requires_grad=False))

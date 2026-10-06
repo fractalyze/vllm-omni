@@ -1,0 +1,16 @@
+{
+  "per_role": {
+    "kandinsky6": {
+      "visual_self": {
+        "backend": "SAGE_ATTN",
+        "layers": "12:48"
+      },
+      "audio_video_cross": {
+        "backend": "TORCH_SDPA"
+      },
+      "audio_self": {
+        "backend": "TORCH_SDPA"
+      }
+    }
+  }
+}

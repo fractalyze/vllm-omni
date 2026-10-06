@@ -133,7 +133,15 @@ class Shapes:
 # the race uses so the cross-attention cost is not understated.
 W1 = dict(height=480, width=864, num_frames=121, fps=24.0, text_len=256)
 SMOKE = dict(height=320, width=512, num_frames=25, fps=24.0, text_len=64)
-GEOMETRIES = {"w1": W1, "smoke": SMOKE}
+# The nearest geometry to W1 at which the port's NABLA path runs at all. Its
+# fractal reordering patches the latent grid in 8x8 tiles, so both patched
+# latent dimensions must be multiples of 8 -- which means both pixel
+# dimensions must be multiples of 128, the VAE's 8x and the DiT's 2x together.
+# W1's 864x480 are 6.75 and 3.75 of those and fail the reshape outright, as
+# does the 512x320 smoke. 1024x512 gives 31 x 32 x 64 = 63,488 visual tokens,
+# 26% more than W1's 50,220, which is the closest honest proxy available.
+NABLA_OK = dict(height=512, width=1024, num_frames=121, fps=24.0, text_len=256)
+GEOMETRIES = {"w1": W1, "smoke": SMOKE, "nabla-ok": NABLA_OK}
 
 
 @dataclass
@@ -362,7 +370,43 @@ def maybe_compile(module, mode: str | None):
     return torch.compile(module, mode=mode, fullgraph=False, dynamic=False)
 
 
-def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: torch.dtype) -> dict:
+def sparse_params(cfg, shapes: Shapes, device: torch.device, threshold: float, window: int = 3) -> dict:
+    """The port's NABLA ``sparse_params``, at block granularity.
+
+    ``nabla_block_mask`` ORs its data-dependent mask with a sliding-tile prior
+    whose shape must match the *block* grid, not the token grid: with the
+    fractal reordering's 8x8 patches, one 64-token block is one patch, so the
+    prior is ``fast_sta_nabla(T, H // 8, W // 8)``. Passing the token-grid mask
+    the port's own helper returns by default would be 50,220^2 bools and would
+    not broadcast.
+
+    ``threshold`` is NABLA's ``P``: the mask keeps the key blocks whose
+    cumulative attention mass, counted from the smallest, reaches ``1 - P``.
+    It is a *mass* threshold, so the realized block sparsity is data-dependent
+    and is not the same quantity as a nominal "fraction of blocks dropped".
+    """
+    from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import fast_sta_nabla
+
+    if shapes.latent_h % 8 or shapes.latent_w % 8:
+        raise ValueError(
+            f"NABLA needs both patched latent dims divisible by 8; this geometry is "
+            f"{shapes.latent_frames}x{shapes.latent_h}x{shapes.latent_w}. "
+            "Use --geometry nabla-ok, or a request whose pixel dimensions are multiples of 128."
+        )
+    sta = fast_sta_nabla(
+        shapes.latent_frames, shapes.latent_h // 8, shapes.latent_w // 8, window, window, window, device=device
+    )
+    return {"sta_mask": sta, "P": threshold, "to_fractal": True}
+
+
+def make_inputs(
+    target: str,
+    cfg,
+    shapes: Shapes,
+    device: torch.device,
+    dtype: torch.dtype,
+    nabla: dict | None = None,
+) -> dict:
     """Activations of the right shape for one forward of ``target``.
 
     The visual stream is already flattened and batched to ``(1, N, D)``, as
@@ -397,8 +441,22 @@ def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: t
             torch.arange(shapes.latent_w, device=device),
         ],
     )
-    # `_embed_visual` flattens (T, H, W, ...) to (N, ...) before the blocks.
-    vis_rope = vis_rope_table.flatten(0, 2)
+    # `_embed_visual` flattens (T, H, W, ...) to (N, ...) before the blocks --
+    # and when NABLA is on it flattens through the 8x8 fractal reordering
+    # instead, because the block mask is built in that order. Using the port's
+    # own `fractal_flatten` keeps the two in step.
+    if nabla is not None:
+        from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import fractal_flatten
+
+        placeholder = torch.zeros(
+            shapes.latent_frames, shapes.latent_h, shapes.latent_w, cfg.model_dim, device=device, dtype=dtype
+        )
+        _, vis_rope = fractal_flatten(
+            placeholder, vis_rope_table, (shapes.latent_frames, shapes.latent_h, shapes.latent_w), block_mask=True
+        )
+        del placeholder
+    else:
+        vis_rope = vis_rope_table.flatten(0, 2)
     aud_rope = RoPE1D(head_dim_a, max_pos=max(shapes.audio_len, 1)).to(device)(
         torch.arange(shapes.audio_len, device=device)
     )
@@ -413,7 +471,7 @@ def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: t
             text=randn(shapes.text_len, cfg.model_dim),
             time_embed=time_v,
             rope=vis_rope,
-            sparse_params=None,
+            sparse_params=nabla,
         )
     return dict(
         vis=vis,
@@ -423,7 +481,7 @@ def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: t
         time_embed=(time_v, randn(1, cfg.time_dim)),
         vis_rope=vis_rope,
         aud_rope=aud_rope,
-        sparse_params=None,
+        sparse_params=nabla,
     )
 
 
@@ -661,6 +719,15 @@ def main() -> int:
         "two processes is a ratio across two clock states",
     )
     parser.add_argument(
+        "--sparse",
+        type=float,
+        default=None,
+        metavar="P",
+        help="run the port's NABLA block-sparse attention at threshold P (its usual value is 0.9) "
+        "instead of dense attention. Requires a geometry whose patched latent dims divide by 8; "
+        "--geometry nabla-ok is the nearest one to W1",
+    )
+    parser.add_argument(
         "--check-numerics",
         action="store_true",
         help="with --compare-arm, also compare each arm's output tensors against the control's. "
@@ -726,7 +793,8 @@ def main() -> int:
             build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
             (args.compile_modes or [None])[0],
         )
-        inputs = make_inputs(args.target, cfg, shapes, device, dtype)
+        nabla = sparse_params(cfg, shapes, device, args.sparse) if args.sparse else None
+        inputs = make_inputs(args.target, cfg, shapes, device, dtype, nabla)
         if args.compile_modes and args.warmups < 1:
             parser.error("--compile needs --warmups >= 1, or the first timed forward pays for compilation")
 
@@ -784,6 +852,7 @@ def main() -> int:
             "backend": args.backend or "platform-default",
             "attention_config_file": str(args.attention_config) if args.attention_config else None,
             "compile_modes": args.compile_modes,
+            "nabla_threshold": args.sparse,
             "shapes": asdict(shapes),
             "dtype": str(dtype),
             "torch": torch.__version__,

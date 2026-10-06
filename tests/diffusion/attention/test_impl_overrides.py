@@ -47,7 +47,14 @@ def test_specialization_preserves_selected_backend_and_options(mocker, local_att
     assert attention.attn_spec is spec
     assert isinstance(attention.parallel_strategy, NoParallelAttention)
     select.assert_called_once_with(
-        role="video.self", head_size=8, attention_config=None, role_category="self", allow_trtllm_default=False
+        role="video.self",
+        head_size=8,
+        attention_config=None,
+        role_category="self",
+        allow_trtllm_default=False,
+        # The layer passes its own index so a spec can restrict itself to a
+        # range of layers; this module's layers carry no index in their prefix.
+        layer_index=None,
     )
 
 
