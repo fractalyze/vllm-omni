@@ -78,6 +78,38 @@ Every timed run holds all of the host's GPU lock files and records what
 `nvidia-smi` showed; a run with a foreign compute process on the board is
 marked contaminated rather than reported.
 
+## What this workload turned out to be
+
+Four things decided every arm in [measurements.md](measurements.md), and they
+are worth knowing before reading any number here.
+
+**The DiT does not fit anywhere.** 56.14 GiB in BF16 -- 60 visual blocks of
+0.899 GiB, four text blocks, embeddings and two output heads -- against a 32 GB
+board and 60 GB of host RAM. It runs from the mmapped checkpoint and every one
+of W1's 10 steps re-reads all of it, at a measured 1.67 GB/s off NVMe with a
+page-cache hit rate near 0.6.
+
+**No sub-BF16 weight format on this GPU can pass a tight perceptual gate.** FP8
+E4M3's weight error is 2.6% *at any scale granularity* -- per-tensor 0.02645,
+per-output-row 0.02643 -- because the format carries its own 4-bit exponent, so
+a finer scale slides the matrix along the exponent ladder while the step stays
+at the 3-bit mantissa. INT8 at per-row scales would cost 0.00908, 2.9x less, and
+sm_120 has no INT8 GEMM: CUTLASS's `dispatch_scaled_mm` refuses with "Int8 not
+supported on SM120". So the weights stay BF16 and precision is not the lever.
+
+**Attention is, and it is worth a third of the request.** The platform's cuDNN
+attention runs 21.9 s/step against a stream worth about 15 s; SageAttention2
+takes the arm to 165.9 s from 231.8 s. But Sage2 everywhere costs LPIPS 0.1858
+against the BF16 reference, so the question becomes *which blocks* approximate,
+which is what `AttentionSpec.layers` exists for.
+
+**And the harness moves more than most of the arms do.** Running the same BF16
+checkpoint compiled instead of eager changes LPIPS by 0.1455 on the set mean and
+**0.4160 on the worst frame** -- Inductor picks kernels by measured latency, so
+two compiled processes are not identical while two eager ones are. That is
+larger than the gate those arms were being judged against, and it is why three
+bars are reported instead of one.
+
 ## The quality gate
 
 Three questions, reported side by side, because they disagree and the
