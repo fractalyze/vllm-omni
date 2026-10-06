@@ -42,12 +42,16 @@ ledger alone.
 | `serve/serve_pro_bf16_ref.sh` | BF16, exact | streamed from the mmapped checkpoint | the quality gate's reference; slowest |
 | `serve/serve_pro_fp8.sh` | FP8 E4M3, per-tensor scales | pinned host memory, staged per block | fails the user's quality gate |
 | `serve/serve_pro_int8.sh` | INT8, per-output-row scales | quantized at load from the BF16 checkpoint | **does not run on sm_120** — kept because the format is the right one and the kernel is the only thing missing |
+| `serve/serve_pro_fp8.sh` with `K6_CKPT=<INT8 weight-only checkpoint>` | INT8 storage, BF16 GEMMs | pinned host memory, staged per block | runs on sm_120; passes the working gate on set A only (see Result) |
 
 The INT8 script is in that table as a signpost, not an option: INT8 at per-row
 scales costs 2.9x less weight error than FP8 at the same one byte per weight,
 and consumer Blackwell has no INT8 GEMM to spend it on (CUTLASS's
 `dispatch_scaled_mm`: "Int8 not supported on SM120"). On a datacenter Blackwell
-or an Ada card it is the arm to try first.
+or an Ada card it is the arm to try first. On sm_120, INT8 can still be the
+*storage* format: `tools/quantize_dit_fp8.py --format int8 --keep minimal`
+writes a weight-only checkpoint (30.2 GB). It is dequantized to BF16 on the GPU
+before each GEMM, which is bit-identical to BF16 with fake-quantized weights.
 
 The server is ready when `curl -sf localhost:$PORT/health` succeeds. Add an
 attention arm to any of them:
@@ -115,6 +119,25 @@ a worst frame by 0.416.
 
 Set B's numbers, this arm's cold start, and the per-prompt tables are in
 [measurements.md](measurements.md).
+
+### The same comparison on build-server-2, in one mirrored session
+
+The headline wall comes from one session on build-server-2 (Track M): visits
+A B C C B A, 1 warm-up + 2 timed requests each, every GPU lock held, and no
+foreign GPU process sampled. The BF16 checkpoint streams more slowly here than
+on build-server-3, because its page cache is capped with the server at 40 GB.
+
+| configuration | gates passed | W1 request, median (min-max), n=4 | vs FP8 baseline |
+|---|---|---:|---:|
+| FP8 per-tensor baseline | none | 174.10 s (174.02-174.12) | -- |
+| **BF16 + sage2-mid + exact step 1 (this arm)** | **G2 + G3, sets A and B** | **188.93 s (188.51-189.79)** | **+8.5%** |
+| INT8 weight-only + Sage2 + exact step 1 | G2 + G3, set A only (fails set B on b6, b3) | 168.07 s (167.62-168.91) | -3.5% |
+| BF16 reference (its own gate run, not in the session) | all, by definition | 234.6 s (233.4-243.3), n=9 | +34.7% |
+
+On build-server-2 this arm is 19.5% faster than the reference and 8.5% slower
+than the FP8 baseline that fails every gate. The INT8 arm is the only one
+faster than the baseline that passes a working gate, and it does so on set A
+alone: on b6 its weight rounding changes the scene from the first frame.
 
 ## What this workload turned out to be
 
