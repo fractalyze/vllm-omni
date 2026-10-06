@@ -37,6 +37,47 @@ from quality import score_set  # noqa: E402
 ADOPTION_MEAN_LPIPS = 0.15
 ADOPTION_MAX_LPIPS = 0.25
 
+# G2, the coordinator's working gate (2026-10-07 00:25), pending the user.
+# Rationale, which belongs beside the constant: the literal gate above is
+# absolute, and on this pipeline *rerunning the same configuration in a fresh
+# process* already moves LPIPS, because Inductor picks kernels by timing. A bar
+# an arm can only clear by being bit-exact is not a bar on the arm, it is a bar
+# on the noise. G2 therefore measures an arm against the pipeline's own
+# numerical floor -- BF16 compiled against BF16 eager at the same seed -- and
+# allows a quarter more than that floor.
+G2_FLOOR_SLACK = 1.25
+
+
+def g2_verdict(
+    set_mean: float,
+    set_max: float,
+    floor_mean: float | None,
+    floor_max: float | None,
+    *,
+    slack: float = G2_FLOOR_SLACK,
+) -> dict[str, object]:
+    """The floor-relative verdict, or an explicit refusal to guess one.
+
+    Returns ``decidable: False`` when the floor is unknown rather than assuming
+    a floor of zero, which would silently restate the literal gate under a
+    second name.
+    """
+    if floor_mean is None or floor_max is None:
+        return {"decidable": False, "reason": "no measured floor supplied (--g2-floor-mean/--g2-floor-max)"}
+    limit_mean = slack * floor_mean
+    limit_max = slack * floor_max
+    return {
+        "decidable": True,
+        "floor_mean": floor_mean,
+        "floor_max": floor_max,
+        "slack": slack,
+        "limit_mean": limit_mean,
+        "limit_max": limit_max,
+        "passes": bool(set_mean <= limit_mean and set_max <= limit_max),
+        "mean_over_floor": set_mean / floor_mean if floor_mean > 0 else float("inf"),
+        "max_over_floor": set_max / floor_max if floor_max > 0 else float("inf"),
+    }
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -44,6 +85,18 @@ def main() -> int:
     parser.add_argument("--reference-dir", type=Path, default=Path("/data/jooman/k6/ref/setA"))
     parser.add_argument("--prompts", type=Path, default=BENCH / "prompts" / "setA.json")
     parser.add_argument("--floor-mean", type=float, default=None, help="the encode floor's mean LPIPS, if measured")
+    parser.add_argument(
+        "--g2-floor-mean",
+        type=float,
+        default=None,
+        help="the numerical floor's set mean LPIPS (BF16 compiled vs BF16 eager), for the G2 working gate",
+    )
+    parser.add_argument(
+        "--g2-floor-max",
+        type=float,
+        default=None,
+        help="the numerical floor's set max LPIPS, for the G2 working gate",
+    )
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--no-locks", action="store_true")
     args = parser.parse_args()
@@ -98,6 +151,7 @@ def main() -> int:
         "passes_adoption_gate": bool(passes),
         "prompts_over_adoption_max": over,
         "tier": result.get("tier"),
+        "g2_working_gate": g2_verdict(set_mean, set_max, args.g2_floor_mean, args.g2_floor_max),
         "passes_approx_tier": result.get("gate_pass_approx"),
         "request_seconds_median": _median_seconds(arm_manifest),
     }
@@ -114,9 +168,21 @@ def main() -> int:
     for name, stats in (result.get("by_category") or {}).items():
         print(f"  category {name:<14} mean {stats.get('lpips_mean', float('nan')):.4f} "
               f"max {stats.get('lpips_max', float('nan')):.4f}")
+    g2 = verdict["g2_working_gate"]
+    if g2["decidable"]:
+        print(
+            f"\n  G2 (floor-relative, coordinator-chosen pending the user): floor mean "
+            f"{g2['floor_mean']:.4f} max {g2['floor_max']:.4f}, limits {g2['limit_mean']:.4f}/"
+            f"{g2['limit_max']:.4f} at {g2['slack']}x -> "
+            + ("PASSES" if g2["passes"] else "FAILS")
+            + f" (this arm is {g2['mean_over_floor']:.2f}x the floor's mean, "
+            f"{g2['max_over_floor']:.2f}x its max)"
+        )
+    else:
+        print(f"\n  G2 (floor-relative): not decided -- {g2['reason']}")
     print(
         f"\n  worst prompt {result.get('worst_prompt')} frame {result.get('worst_prompt_frame')}"
-        f"\n  set mean {set_mean:.4f} (limit {ADOPTION_MEAN_LPIPS}), max {set_max:.4f} "
+        f"\n  G1 set mean {set_mean:.4f} (limit {ADOPTION_MEAN_LPIPS}), max {set_max:.4f} "
         f"(limit {ADOPTION_MAX_LPIPS}) -> " + ("PASSES the adoption gate" if passes else "FAILS the adoption gate")
         + f"; tier {verdict['tier']}"
     )

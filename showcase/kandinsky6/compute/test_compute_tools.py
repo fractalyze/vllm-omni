@@ -872,3 +872,43 @@ class OffloadPlacementTest(absltest.TestCase):
 
         flags = serve_flags("dlo-mmap", None, None, None, offload_text_encoder=True)
         self.assertIn("--enable-distributed-layerwise-offload", flags)
+
+
+class WorkingGateTest(parameterized.TestCase):
+    """G2, the floor-relative gate, including its refusal to guess a floor.
+
+    The literal gate is absolute, and on this pipeline a rerun of the same
+    configuration in a fresh process already moves LPIPS because Inductor picks
+    kernels by timing. An absolute bar below that movement is a bar on the noise,
+    not on the arm. These tests pin the arithmetic and, more importantly, that a
+    missing floor is reported as undecided rather than treated as zero -- which
+    would restate the literal gate under a second name and look like a second
+    opinion.
+    """
+
+    def test_an_arm_at_the_floor_passes(self):
+        from gate_pro_score import g2_verdict
+
+        verdict = g2_verdict(0.196, 0.269, 0.196, 0.269)
+        self.assertTrue(verdict["passes"])
+        self.assertAlmostEqual(verdict["mean_over_floor"], 1.0)
+
+    def test_an_arm_inside_the_slack_passes_and_outside_fails(self):
+        from gate_pro_score import g2_verdict
+
+        self.assertTrue(g2_verdict(0.24, 0.33, 0.196, 0.269)["passes"])
+        self.assertFalse(g2_verdict(0.26, 0.33, 0.196, 0.269)["passes"])
+
+    def test_either_half_can_fail_it(self):
+        from gate_pro_score import g2_verdict
+
+        self.assertFalse(g2_verdict(0.20, 0.40, 0.196, 0.269)["passes"], "max over the limit")
+        self.assertFalse(g2_verdict(0.30, 0.28, 0.196, 0.269)["passes"], "mean over the limit")
+
+    @parameterized.parameters((None, 0.269), (0.196, None), (None, None))
+    def test_a_missing_floor_is_undecided_not_a_pass(self, floor_mean, floor_max):
+        from gate_pro_score import g2_verdict
+
+        verdict = g2_verdict(0.01, 0.02, floor_mean, floor_max)
+        self.assertFalse(verdict["decidable"])
+        self.assertNotIn("passes", verdict)
