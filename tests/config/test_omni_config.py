@@ -1446,6 +1446,48 @@ def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
     assert overridden_stage.diffusion_config.diffusion_compile_dynamic is True
 
 
+def test_from_pipeline_config_routes_compile_mode(tmp_path):
+    """``diffusion_compile_mode`` must survive the deploy config and be
+    overridable from the CLI, like the granularity and dynamic flags beside
+    it. Without the routing the flag parses and is silently dropped, which
+    looks exactly like torch.compile ignoring the mode."""
+    deploy_path = tmp_path / "dreamzero_compile_mode.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_compile_mode: reduce-overhead",
+            ]
+        )
+    )
+
+    configured_stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    overridden_stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+        cli_overrides={"diffusion_compile_mode": "max-autotune"},
+    ).stage_by_id(0)
+
+    assert configured_stage.diffusion_config.diffusion_compile_mode == "reduce-overhead"
+    assert overridden_stage.diffusion_config.diffusion_compile_mode == "max-autotune"
+
+
+def test_structured_diffusion_config_compile_mode_defaults_to_none():
+    """Unset must stay unset: the model runner omits ``mode`` from the
+    torch.compile call when it is None, so a default of "default" would change
+    every existing compiled artifact."""
+    stage = _from_pipeline_key("dreamzero").stage_by_id(0)
+    assert stage.diffusion_config.diffusion_compile_mode is None
+
+
+def test_structured_diffusion_config_rejects_unknown_compile_mode():
+    with pytest.raises(ValidationError, match="diffusion_compile_mode"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_mode="turbo")
+
+
 def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
     with pytest.raises(ValidationError, match="diffusion_compile_dynamic"):
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")

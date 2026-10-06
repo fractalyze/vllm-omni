@@ -252,12 +252,19 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
+        # `mode` is omitted rather than passed as None: torch.compile treats an
+        # explicit mode=None as "no mode", which is the same thing, but
+        # omitting it keeps the call identical to what every release before
+        # this flag made, so an unset flag cannot change a compiled artifact.
+        compile_kwargs: dict[str, Any] = {"dynamic": compile_dynamic}
+        if self.od_config.diffusion_compile_mode is not None:
+            compile_kwargs["mode"] = self.od_config.diffusion_compile_mode
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(**compile_kwargs)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, **compile_kwargs)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(

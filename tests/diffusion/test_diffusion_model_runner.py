@@ -307,6 +307,7 @@ def _make_compile_runner(
     *,
     compile_granularity: str = "regional",
     compile_dynamic: bool = True,
+    compile_mode: str | None = None,
     use_hsdp: bool = False,
 ):
     runner = object.__new__(DiffusionModelRunner)
@@ -314,6 +315,7 @@ def _make_compile_runner(
     runner.od_config = SimpleNamespace(
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
+        diffusion_compile_mode=compile_mode,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
@@ -519,6 +521,68 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
             {"dynamic": True},
         )
     ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("mode", ["default", "reduce-overhead", "max-autotune"])
+def test_compile_transformer_forwards_compile_mode(monkeypatch, mode):
+    """``diffusion_compile_mode`` must reach torch.compile.
+
+    Before this flag existed ``regionally_compile`` was called with only
+    ``dynamic``, so there was no way to ask for CUDA graphs or GEMM
+    autotuning. On a Kandinsky 6 Pro block at 50,220 tokens those modes were
+    worth 30% and 39% over the default (showcase/kandinsky6/measurements.md).
+    """
+    runner = _make_compile_runner(compile_mode=mode)
+    regional_calls = []
+
+    def _regionally_compile(target, **kwargs):
+        regional_calls.append((target, kwargs))
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [(runner.pipeline.transformer, {"dynamic": True, "mode": mode})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_omits_mode_when_unset(monkeypatch):
+    """An unset mode must be omitted, not passed as ``mode=None``.
+
+    Both mean "no mode" to torch.compile, but omitting it keeps the call
+    byte-identical to what every release before this flag made, so turning
+    the flag off cannot change a compiled artifact.
+    """
+    runner = _make_compile_runner(compile_mode=None)
+    regional_calls = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "regionally_compile",
+        lambda target, **kwargs: regional_calls.append(kwargs) or target,
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [{"dynamic": True}]
+    assert "mode" not in regional_calls[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_forwards_compile_mode_for_full_granularity(monkeypatch):
+    """The ``full`` path calls ``model.compile`` rather than
+    ``regionally_compile``, and has to forward the mode too."""
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_mode="max-autotune")
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": True, "mode": "max-autotune"})]
 
 
 @pytest.mark.core_model

@@ -38,10 +38,10 @@ Both changes are configuration, not code:
 --diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/tuned.json)"
 ```
 
-and `mode="max-autotune"` where the model runner calls `torch.compile`. That
-second one is **not reachable from a config today**: `regionally_compile`
-forwards only `dynamic`. A `--diffusion-compile-mode` knob is a small local
-change and the obvious next step.
+and `--diffusion-compile-mode max-autotune`, which this branch adds:
+`regionally_compile` forwarded only `dynamic`, so there was previously no way
+to ask for CUDA graphs or GEMM autotuning from a config. Unset leaves torch's
+own default, so the flag changes nothing until it is set.
 
 ### The compiled arms compute the same answer, which is why they are adoptable
 
@@ -205,7 +205,8 @@ call sites. So:
 
 ```bash
 vllm serve kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers --omni \
-    --diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/sage2.json)"
+    --diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/tuned.json)" \
+    --diffusion-compile-mode max-autotune
 ```
 
 Only `kandinsky6.visual_self` is pinned, and that is forced, not tidy:
