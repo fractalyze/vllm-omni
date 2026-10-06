@@ -791,6 +791,9 @@ def _component_sources(model_root: str, *, include_audio_vae: bool) -> list:
 def _adapt_k6_weight_name(name: str) -> str:
     """Map Hub component keys onto this pipeline's module tree.
 
+    ``transformer/`` is the published Diffusers bundle, whose names differ
+    from this port's module tree in four families; see the comments inline.
+
     ``text_encoder/`` is Qwen2.5-VL saved with the language stack at
     ``model.layers`` and the vision tower at ``visual.*``. This transformers
     build nests those under ``model.language_model`` and ``model.visual``.
@@ -799,9 +802,31 @@ def _adapt_k6_weight_name(name: str) -> str:
     ``mel_converter`` lives on ``native``.
     """
     if name.startswith("transformer."):
-        # Released Pro-5s checkpoints use the pre-rename block names.
         rest = name[len("transformer.") :]
+        # Released Pro-5s checkpoints use the pre-rename block names.
         rest = rest.replace(".videoT.", ".video_dec_block.").replace(".audioT.", ".audio_dec_block.")
+        # The published Diffusers bundles name three things differently from
+        # this port's module tree. Without these three rules the loader stops
+        # on the first text block: 184 of Lite's 2,399 transformer tensors and
+        # 344 of Pro-distill's 4,471 have no module to land in.
+        #
+        # 1. A text encoder block's attention is `attn`, not `self_attention`.
+        #    Only the encoder block differs -- the decoder blocks' own
+        #    `self_attention` and `cross_attention` already match.
+        # 2. The feed-forward is Diffusers' `FeedForward`, so its two linears
+        #    are `net.0.proj` and `net.2` rather than `in_layer`/`out_layer`.
+        #    `net.1` is the activation and holds no tensor.
+        # 3. The time embedding's MLP is `timestep_embedder.linear_1`/`_2`.
+        #
+        # With all three, both published bundles map exactly: every tensor
+        # finds a slot, and the only module entries left unfilled are the
+        # eight non-persistent buffers (the RoPE tables and the sinusoidal
+        # `freqs`), which are computed at construction and never loaded.
+        rest = rest.replace(".attn.", ".self_attention.")
+        rest = rest.replace(".feed_forward.net.0.proj.", ".feed_forward.in_layer.")
+        rest = rest.replace(".feed_forward.net.2.", ".feed_forward.out_layer.")
+        rest = rest.replace(".timestep_embedder.linear_1.", ".in_layer.")
+        rest = rest.replace(".timestep_embedder.linear_2.", ".out_layer.")
         return "transformer." + rest
     if name.startswith("text_encoder."):
         rest = name[len("text_encoder.") :]
