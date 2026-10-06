@@ -390,8 +390,8 @@ def main() -> int:
 
         device, dtype = torch.device("cuda"), torch.bfloat16
         stack.enter_context(single_process_parallel())
-        results = [race_role(role, arms, args, device, dtype) for role in roles]
 
+        results: list[dict] = []
         payload = {
             "shapes": {"visual_tokens": shapes.visual_tokens, "audio_len": shapes.audio_len,
                        "text_len": shapes.text_len, "q_tokens_override": args.q_tokens},
@@ -403,8 +403,29 @@ def main() -> int:
             "foreign_gpu_procs": [str(p) for p in foreign],
             "abba_rounds": args.rounds,
             "repeats_per_visit": args.repeats,
+            "roles_requested": [role.name for role in roles],
+            "complete": False,
             "roles": results,
         }
+
+        def save() -> None:
+            if args.json:
+                args.json.parent.mkdir(parents=True, exist_ok=True)
+                args.json.write_text(json.dumps(payload, indent=2) + "\n")
+
+        # Written after every role, not once at the end. This GPU is shared
+        # and the gap between a co-tenant's jobs may be shorter than the
+        # whole race; a run cut off after the first role should still leave
+        # the headline role's numbers on disk, with `complete: false` saying
+        # it was cut off. Roles are in descending cost order, so the first
+        # one done is `visual_self`, which is 98.8% of a block's attention
+        # FLOPs.
+        save()
+        for role in roles:
+            results.append(race_role(role, arms, args, device, dtype))
+            save()
+        payload["complete"] = True
+        save()
 
     for result in results:
         print(f"\n{result['role']}: q={result['q']} kv={result['kv']} "
@@ -424,8 +445,6 @@ def main() -> int:
             print(f"  {arm:<18} unavailable: {message}")
 
     if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"\nwrote {args.json}")
     return 0
 

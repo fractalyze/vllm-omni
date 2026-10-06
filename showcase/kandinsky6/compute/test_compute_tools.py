@@ -219,3 +219,80 @@ class AccuracyTest(absltest.TestCase):
         scored = accuracy(reference * 2.0, reference)
         self.assertAlmostEqual(scored["rel_l2"], 1.0, places=5)
         self.assertAlmostEqual(scored["cosine"], 1.0, places=6)
+
+
+class AttentionArmConfigTest(parameterized.TestCase):
+    """The arm files in `arms/` must be valid `--diffusion-attention-config`
+    values that resolve the role they claim to.
+
+    This is the whole adoption path for a race winner: no code changes, just
+    one of these files. A typo in a role string would silently fall through
+    to the platform default and the "winner" would never run, so the role
+    names are asserted against the ones `kandinsky6_transformer.py` passes.
+    """
+
+    # The five role strings in kandinsky6_transformer.py, with the
+    # role_category each call site passes alongside.
+    K6_ROLES = (
+        ("kandinsky6.visual_self", "self"),
+        ("kandinsky6.text_self", "self"),
+        ("kandinsky6.audio_self", "self"),
+        ("kandinsky6.text_cross", "cross"),
+        ("kandinsky6.video_audio_cross", "cross"),
+        ("kandinsky6.audio_video_cross", "cross"),
+    )
+
+    def _arms_dir(self):
+        return Path(__file__).resolve().parent / "arms"
+
+    def test_the_role_strings_are_the_ones_the_port_passes(self):
+        """Read them out of the model source rather than trusting this list."""
+        import re
+
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py"
+        ).read_text()
+        # Every `kandinsky6.*` string literal, not just the ones directly
+        # after `role=`: one call site picks its role with a conditional
+        # (`role="kandinsky6.visual_self" if ... else "kandinsky6.audio_self"`),
+        # so the second branch has no `role=` in front of it.
+        in_source = set(re.findall(r'"(kandinsky6\.[a-z_]+)"', source))
+        self.assertEqual(in_source, {role for role, _ in self.K6_ROLES})
+
+    @parameterized.named_parameters(
+        ("control", "control.json", None),
+        ("sage2", "sage2.json", "SAGE_ATTN"),
+        ("sage3", "sage3.json", "SAGE_ATTN_3"),
+        ("flash", "flash.json", "FLASH_ATTN"),
+    )
+    def test_arm_resolves_visual_self_and_leaves_the_rest_alone(self, filename, expected):
+        import json
+
+        from vllm_omni.diffusion.data import build_attention_config
+
+        config = build_attention_config(json.loads((self._arms_dir() / filename).read_text()))
+        for role, category in self.K6_ROLES:
+            spec, _ = config.resolve_with_source(role=role, role_category=category)
+            if role == "kandinsky6.visual_self":
+                # `control.json` says "auto", which AttentionConfig
+                # normalizes to None: no override, platform default.
+                self.assertEqual(spec.backend if spec else None, expected, msg=role)
+            else:
+                self.assertIsNone(spec, msg=f"{role} must stay on the platform default")
+
+    @parameterized.named_parameters(
+        ("sage2", "sage2.json"),
+        ("sage3", "sage3.json"),
+        ("flash", "flash.json"),
+    )
+    def test_the_named_backend_exists_in_the_registry(self, filename):
+        """A backend name that is not a registry member would only fail at
+        serve time, after the weights are loaded."""
+        import json
+
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        config = json.loads((self._arms_dir() / filename).read_text())
+        backend = config["per_role"]["kandinsky6"]["visual_self"]["backend"]
+        self.assertIn(backend, DiffusionAttentionBackendEnum.__members__)
