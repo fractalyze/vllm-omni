@@ -187,6 +187,7 @@ def main() -> int:
         "prompt_set": prompt_set.get("set"),
         "prompts_file": str(args.prompts),
         "runs": [],
+        "items": {},
     }
 
     with GpuLocks() if not args.no_locks else contextlib.nullcontext():
@@ -215,6 +216,7 @@ def main() -> int:
             for entry in prompts:
                 fields = request_fields(entry["text"], seed=seeds[entry["id"]], **geometry)
                 destination = args.out_dir / f"{entry['id']}.mp4"
+                started_wall = time.time()
                 started = time.perf_counter()
                 try:
                     result = submit_and_fetch(server.base_url, fields, destination)
@@ -223,16 +225,27 @@ def main() -> int:
                     manifest["runs"].append({"id": entry["id"], "error": str(exc)})
                     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
                     continue
-                manifest["runs"].append(
-                    {
-                        "id": entry["id"],
-                        "seed": seeds[entry["id"]],
-                        "categories": entry.get("categories", []),
-                        "seconds": round(time.perf_counter() - started, 3),
-                        "mp4": destination.name,
-                        "mp4_bytes": result.mp4_bytes,
-                    }
-                )
+                run = {
+                    "id": entry["id"],
+                    "seed": seeds[entry["id"]],
+                    "categories": entry.get("categories", []),
+                    "seconds": round(time.perf_counter() - started, 3),
+                    "mp4": destination.name,
+                    "mp4_bytes": result.mp4_bytes,
+                }
+                manifest["runs"].append(run)
+                # Also in the reference runner's shape, so this directory can
+                # *be* the reference for a later arm: _reference_settings reads
+                # `items[id].seed` and `.geometry` to make the candidate match
+                # the run it is scored against. Set B has no canonical
+                # reference, so a BF16 run of it here has to be usable as one.
+                manifest["items"][entry["id"]] = {
+                    "categories": entry.get("categories", []),
+                    "request_wall_s": run["seconds"],
+                    "started": started_wall,
+                    "seed": seeds[entry["id"]],
+                    "geometry": geometry,
+                }
                 print(f"{entry['id']}: {manifest['runs'][-1]['seconds']:.1f} s -> {destination}", flush=True)
                 (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         finally:

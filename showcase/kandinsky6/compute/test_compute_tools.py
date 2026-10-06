@@ -733,3 +733,46 @@ class ServeFlagsTest(parameterized.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unknown offload mode"):
             serve_flags("resident", None, None)
+
+
+class ReferenceManifestRoundTripTest(absltest.TestCase):
+    """A gate run's own manifest has to be readable as a reference.
+
+    Set B has no canonical BF16 reference, so one has to be generated here and
+    then scored against -- which only works if the directory a gate run writes
+    is the shape ``_reference_settings`` reads. This asserts the round trip
+    rather than trusting that two dict literals in the same file agree.
+    """
+
+    def test_a_gate_manifest_is_a_reference_manifest(self):
+        import json
+        import tempfile
+
+        from gate_pro import _reference_settings
+
+        prompts = [
+            {"id": "b1-newsreader", "categories": ["face", "speech"]},
+            {"id": "b2-market-haggle", "categories": ["speech"]},
+        ]
+        geometry = {"width": 864, "height": 480, "num_frames": 121,
+                    "num_inference_steps": 10, "guidance_scale": 1.0}
+        manifest = {
+            "arm": "bf16-stream-control",
+            "items": {
+                entry["id"]: {
+                    "categories": entry["categories"],
+                    "request_wall_s": 175.0,
+                    "started": 1791300000.0,
+                    "seed": 42,
+                    "geometry": geometry,
+                }
+                for entry in prompts
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(manifest))
+            seeds, read_geometry = _reference_settings(path, prompts)
+
+        self.assertEqual(seeds, {"b1-newsreader": 42, "b2-market-haggle": 42})
+        self.assertEqual(read_geometry, geometry)
