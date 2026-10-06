@@ -37,6 +37,7 @@ from transformers import AutoProcessor as QwenAutoProcessor
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm.logger import init_logger
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -57,6 +58,12 @@ from .scheduling_kandinsky6_piflow import (
     shift_timesteps,
     split_grid_prediction,
 )
+
+logger = init_logger(__name__)
+
+# Per-step latent statistics for the PiFlow loop. Off by default: it is one
+# synchronizing reduction per step per modality.
+_PIFLOW_DEBUG = os.environ.get("VLLM_OMNI_K6_PIFLOW_DEBUG", "0") == "1"
 
 
 class TextEmbeds(TypedDict):
@@ -699,6 +706,42 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
     )
 
 
+def _log_tensor_stats(stage: str, **tensors: Tensor | None) -> None:
+    """Range, mean and non-finite counts of a stage's tensors.
+
+    Gated on ``VLLM_OMNI_K6_PIFLOW_DEBUG`` because each call synchronizes. It
+    exists to tell apart the three ways this pipeline can return a black video
+    while reporting success: zero latents, non-finite latents, and a decode that
+    zeroes a perfectly good latent.
+    """
+    parts = []
+    for name, tensor in tensors.items():
+        if tensor is None:
+            parts.append(f"{name}=None")
+            continue
+        flat = tensor.detach().float()
+        parts.append(
+            f"{name}[{tuple(tensor.shape)} {tensor.dtype}] "
+            f"min={flat.min().item():.4g} max={flat.max().item():.4g} "
+            f"mean={flat.mean().item():.4g} std={flat.std().item():.4g} "
+            f"nan={int(torch.isnan(flat).sum())} inf={int(torch.isinf(flat).sum())}"
+        )
+    logger.warning("K6 stats | %s | %s", stage, " | ".join(parts))
+
+
+def _is_piflow_scheduler(scheduler: object) -> bool:
+    """Whether ``scheduler`` drives pi-Flow sampling.
+
+    Checked by capability, not ``isinstance``. The diffusion registry imports
+    this module dynamically, so the same source can end up as two module objects
+    with two distinct ``KandinskyPiflowScheduler`` classes; an ``isinstance``
+    against the wrong one silently falls through to the Euler loop, which
+    produces a wrong trajectory rather than an error. ``segments`` and ``n_grid``
+    are pi-Flow's own interface and the Euler scheduler has neither.
+    """
+    return hasattr(scheduler, "segments") and hasattr(scheduler, "n_grid")
+
+
 def piflow_denoise_loop(  # noqa: PLR0913
     bundle: LatentBundle,
     dit: nn.Module,
@@ -823,6 +866,21 @@ def piflow_denoise_loop(  # noqa: PLR0913
                 tau_dst.repeat_interleave(audio_lengths),
                 substeps,
                 policy_audio,
+            )
+
+        if _PIFLOW_DEBUG:
+            def _stat(t, name):
+                f = t.float()
+                return (
+                    f"{name}[{tuple(t.shape)} {t.dtype}] min={f.min().item():.4g} "
+                    f"max={f.max().item():.4g} mean={f.mean().item():.4g} "
+                    f"nan={int(torch.isnan(f).sum())} inf={int(torch.isinf(f).sum())}"
+                )
+            logger.warning(
+                "PiFlow step %d tau %.4f->%.4f sigma %.4f | %s | %s | %s | %s",
+                segment.step_index, segment.tau_src, segment.tau_dst, float(sigma_src[0]),
+                _stat(grid_video, "pred_v"), _stat(grid_audio, "pred_a"),
+                _stat(video, "video"), _stat(audio, "audio"),
             )
 
         if progress_callback is not None:
@@ -994,6 +1052,59 @@ def _adapt_k6_weight_name(name: str) -> str:
     if rest.startswith(("vae.", "vocoder.")):
         rest = f"tod.{rest}"
     return f"audio_vae.native.{rest}"
+
+
+def _resolve_quant_config(od_config, transformer_config: dict):
+    """The quantization config to build the DiT with.
+
+    An explicit ``--quantization`` wins. Otherwise the checkpoint's own
+    ``transformer/config.json`` ``quantization_config`` is honoured, which is the
+    convention ``TransformerConfig.from_dict`` already follows for disk-declared
+    quantization elsewhere in the repo.
+
+    A disk-declared method is resolved through **vLLM's** registry rather than
+    vLLM-Omni's ``build_quant_config``. The two disagree on the name ``fp8``:
+    Omni maps it to ``DiffusionFp8Config``, which quantizes BF16 weights
+    *online* and so creates plain BF16 parameters with no ``weight_scale``. A
+    config stored inside a checkpoint describes weights that are already on
+    disk, so it always means a serialized format — online quantization is a
+    runtime choice, never a property of stored weights — and vLLM's
+    ``Fp8Config`` is the one that reads it (its own docstring says so:
+    "Serialized FP8 checkpoints require upstream Fp8Config"). Resolving this the
+    other way loads the checkpoint's FP8 tensors into BF16 parameters and fails
+    naming the first missing scale.
+    """
+    # Only an operator's own --quantization counts as explicit. OmniDiffusionConfig
+    # also *auto-detects* a checkpoint's quantization_config and resolves it
+    # through vLLM-Omni's factory, which maps "fp8" to the online
+    # DiffusionFp8Config -- a config that cannot load the serialized checkpoint it
+    # was detected from. Deferring to that would reintroduce the bug this
+    # function exists to avoid, so an auto-detected config is re-resolved below.
+    explicit = getattr(od_config, "quantization_config", None)
+    auto_detected = bool(getattr(od_config, "quantization_config_is_auto_detected", False))
+    if explicit is not None and not auto_detected:
+        return explicit
+
+    on_disk = transformer_config.get("quantization_config")
+    if not isinstance(on_disk, dict):
+        return None
+    method = str(on_disk.get("quant_method") or on_disk.get("method") or "").lower()
+    if not method:
+        raise ValueError(
+            "transformer/config.json has a quantization_config without a quant_method; "
+            f"got keys {sorted(on_disk)}"
+        )
+
+    from vllm.model_executor.layers.quantization import get_quantization_config
+
+    resolved = get_quantization_config(method).from_config(dict(on_disk))
+    logger.warning(
+        "Kandinsky 6: using the checkpoint's own %s quantization (%s), %d layer(s) left wide",
+        method,
+        type(resolved).__name__,
+        len(getattr(resolved, "ignored_layers", []) or []),
+    )
+    return resolved
 
 
 def _build_audio_vae(audio_vae_dir: str) -> nn.Module:
@@ -1251,10 +1362,18 @@ class Kandinsky6TI2VAPipeline(
         transformer_dir = os.path.join(model_root, "transformer")
         with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
             transformer_config = json.load(handle)
+        # A pre-quantized checkpoint declares its own format, including which
+        # layers were left wide (``ignored_layers``). vLLM 0.31's ``fp8`` method
+        # only supports pre-serialized checkpoints, so for an FP8 K6 checkpoint
+        # this is the sole route: built without it, the linears have no
+        # ``weight_scale`` parameter and the load fails naming the first one.
+        # An explicit CLI ``--quantization`` still wins, so an operator can
+        # override what the checkpoint claims.
+        self._resolved_quant_config = _resolve_quant_config(od_config, transformer_config)
         with torch.device(load_device), no_init_weights():
             transformer = Kandinsky6Transformer3DModel.from_diffusers_config(
                 transformer_config,
-                quant_config=getattr(od_config, "quantization_config", None),
+                quant_config=self._resolved_quant_config,
             )
 
         vae_dir = os.path.join(model_root, "vae")
@@ -1342,7 +1461,9 @@ class Kandinsky6TI2VAPipeline(
         """
         from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 
-        quant_config = getattr(self.od_config, "quantization_config", None)
+        quant_config = getattr(self, "_resolved_quant_config", None) or getattr(
+            self.od_config, "quantization_config", None
+        )
 
         def adapted():
             for name, tensor in weights:
@@ -1350,7 +1471,16 @@ class Kandinsky6TI2VAPipeline(
                     key = name[len("transformer.") :]
                     if is_pp_missing_parameter(key, self.transformer):
                         continue
-                    if quant_config is not None and tensor.is_floating_point() and tensor.dtype != torch.bfloat16:
+                    # Normalize an odd source dtype (e.g. fp32) to BF16 so the
+                    # quantizer sees what it expects. An already-quantized
+                    # tensor is skipped: casting fp8 weights up to BF16 would
+                    # both lose the packing the FP8 linear expects and silently
+                    # undo the quantization the checkpoint ships.
+                    if (
+                        quant_config is not None
+                        and tensor.is_floating_point()
+                        and tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
+                    ):
                         tensor = tensor.to(torch.bfloat16)
                 name = _adapt_k6_weight_name(name)
                 yield name, tensor
@@ -1558,8 +1688,18 @@ class Kandinsky6TI2VAPipeline(
             else None,
             device=device,
         )
+        # Which sampler a request actually took. Worth a line because the two
+        # are not interchangeable -- running the distilled checkpoint through the
+        # Euler loop produces a wrong trajectory, not an error -- and because
+        # worker stdout is not forwarded, so a print here would be invisible.
+        logger.info(
+            "Kandinsky 6 denoise: sampler=%s steps=%d guidance=%.3f",
+            "piflow" if _is_piflow_scheduler(self.scheduler) else "euler",
+            num_inference_steps,
+            guidance_scale,
+        )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            if isinstance(self.scheduler, KandinskyPiflowScheduler):
+            if _is_piflow_scheduler(self.scheduler):
                 return piflow_denoise_loop(
                     bundle=bundle,
                     dit=self.transformer,
@@ -2045,15 +2185,22 @@ class Kandinsky6TI2VAPipeline(
                 audio_cu_seqlens=result.audio_cu_seqlens,
             )
 
+        if _PIFLOW_DEBUG:
+            _log_tensor_stats("final latents", video=result.video, audio=result.audio)
+
         if sampling.output_type == "latent":
             video_out: Tensor | np.ndarray = result.video.unsqueeze(0)
         else:
             decoded = postprocess_video(result, self.vae, bs=1)
+            if _PIFLOW_DEBUG:
+                _log_tensor_stats("vae decoded", video=decoded)
             video_out = decoded.permute(0, 2, 3, 4, 1).cpu().numpy()
 
         audio_out = (
             postprocess_audio(result, self.audio_vae, normalization_mode=audio_normalization) if sample_audio else None
         )
+        if _PIFLOW_DEBUG and audio_out is not None:
+            _log_tensor_stats("audio decoded", audio=torch.as_tensor(audio_out))
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 

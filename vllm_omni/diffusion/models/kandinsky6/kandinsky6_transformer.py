@@ -1234,6 +1234,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
             "visual_cond",
             "is_multimodal",
             "in_audio_dim",
+            "out_audio_dim",
             "model_dim_a",
             "time_dim_a",
             "ff_dim_a",
@@ -1299,6 +1300,12 @@ class Kandinsky6Transformer3DModel(nn.Module):
         is_multimodal: bool = False,
         # Audio (T2VA only)
         in_audio_dim: int = 20,
+        # The audio head's width. It equals in_audio_dim for a plain checkpoint,
+        # but a distilled PiFlow checkpoint predicts n_grid values of x_0 per
+        # channel, so its head is n_grid times wider (400 for in_audio_dim 40) --
+        # exactly as out_visual_dim is already wider than in_visual_dim. None
+        # keeps the old behaviour of sizing the head from the input width.
+        out_audio_dim: int | None = None,
         model_dim_a: int | None = None,
         time_dim_a: int | None = None,
         ff_dim_a: int | None = None,
@@ -1322,6 +1329,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
         self.is_multimodal = is_multimodal
         self.in_visual_dim = in_visual_dim
         self.in_audio_dim = in_audio_dim
+        self.out_audio_dim = int(out_audio_dim) if out_audio_dim else in_audio_dim
         self.text_token_padding = text_token_padding
         self.visual_token_type_num_embeddings = int(visual_token_type_num_embeddings or 0)
         # Time-independent text/pooled projections (cleared each generation).
@@ -1399,7 +1407,11 @@ class Kandinsky6Transformer3DModel(nn.Module):
             )
             self.audio_rope_embeddings = RoPE1D(head_dim_a, freqs_scaling=audio_freqs_scaling)
             self.audio_out_layer = Kandinsky6OutLayerAudio(
-                model_dim_a, time_dim_a, in_audio_dim, quant_config=quant_config, prefix=f"{prefix}.audio_out_layer"
+                model_dim_a,
+                time_dim_a,
+                self.out_audio_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.audio_out_layer",
             )
 
             for mod_prefix, md, td, fd, hd in [

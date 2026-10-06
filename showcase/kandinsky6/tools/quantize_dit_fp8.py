@@ -19,11 +19,12 @@ weights, a ``weight_scale`` beside each, and a ``quantization_config`` in
 (``TransformerConfig.from_dict`` reads that key) instead of BF16 ones it would
 have to convert.
 
-Scales are **per output channel**, not per tensor. A per-tensor scale over a
-4096x16384 matrix is set by its single largest weight, so every other row loses
-range to that one outlier; per-channel costs one FP32 number per row (0.004% of
-the tensor) and keeps each row's own range. The format stores them identically,
-so this is free.
+Scales are **per tensor** by default, because that is what vLLM's native ``fp8``
+method reads (it builds a ``PerTensorScaleParameter``, and a per-channel scale
+fails its shape assertion on load). ``--scale channel`` keeps each output row's
+own range instead of losing it to the matrix's single largest weight, which is
+the better recipe but needs a ``compressed-tensors`` checkpoint; see
+:func:`quantize_weight`.
 
 Sensitive layers stay BF16 (:func:`keeps_bf16`). Which ones is a quality
 question the gate answers, so the list is a flag, not a constant, and the
@@ -124,15 +125,34 @@ def is_quantizable(name: str, tensor_shape: tuple[int, ...], *, protect_sensitiv
     return not (protect_sensitive and keeps_bf16(name))
 
 
-def quantize_per_channel(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(out, in)`` BF16 -> FP8 E4M3 plus an ``(out, 1)`` FP32 scale.
+def quantize_weight(weight: torch.Tensor, *, granularity: str = "tensor") -> tuple[torch.Tensor, torch.Tensor]:
+    """``(out, in)`` BF16 -> FP8 E4M3 plus its scale.
 
-    The scale is ``amax / 448`` per row, computed in FP32 so a BF16 amax cannot
-    round the scale up and clip the row's own maximum. A zero row would divide
-    by zero, so its scale is forced to 1.0 and it quantizes to zeros.
+    ``granularity``:
+
+    ``tensor``
+        One scalar for the whole matrix. This is what vLLM's native ``fp8``
+        quantization method reads: it creates a ``PerTensorScaleParameter``, so a
+        per-channel scale fails the loader's shape assertion. Default for that
+        reason.
+    ``channel``
+        One scale per output row, which keeps each row's own range instead of
+        losing it to the single largest weight in the matrix. Better quality at
+        0.004% more storage, but it needs a ``compressed-tensors`` checkpoint
+        with ``strategy: channel`` rather than the native ``fp8`` method, so it
+        is here for that follow-up and is not yet loadable by this pipeline.
+
+    The scale is ``amax / 448`` computed in FP32, so a BF16 amax cannot round the
+    scale up and clip the true maximum. An all-zero tensor or row would divide by
+    zero, so its scale is forced to 1.0 and it quantizes to zeros.
     """
+    if granularity not in ("tensor", "channel"):
+        raise ValueError(f"unknown scale granularity {granularity!r}")
     as_float = weight.to(torch.float32)
-    amax = as_float.abs().amax(dim=1, keepdim=True)
+    if granularity == "channel":
+        amax = as_float.abs().amax(dim=1, keepdim=True)
+    else:
+        amax = as_float.abs().amax()
     scale = (amax / FP8_E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
     scale = torch.where(amax > 0, scale, torch.ones_like(scale))
     quantized = (as_float / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(FP8_DTYPE)
@@ -152,6 +172,7 @@ def quantize_checkpoint(
     dst: Path,
     *,
     protect_sensitive: bool = True,
+    granularity: str = "tensor",
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, object]:
     """Write an FP8 copy of ``src``'s transformer into ``dst``; link the rest."""
@@ -192,7 +213,7 @@ def quantize_checkpoint(
                 tensor = reader.get_tensor(name)
                 bytes_in += tensor.numel() * tensor.element_size()
                 if is_quantizable(name, tuple(tensor.shape), protect_sensitive=protect_sensitive):
-                    weight, scale = quantize_per_channel(tensor)
+                    weight, scale = quantize_weight(tensor, granularity=granularity)
                     buffer[name] = weight
                     buffer[name.removesuffix("weight") + "weight_scale"] = scale
                     buffer_bytes += weight.numel() + scale.numel() * 4
@@ -241,6 +262,7 @@ def quantize_checkpoint(
         "ignored_layers": ignored_layers,
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
+        "scale_granularity": granularity,
         "compression": bytes_in / bytes_out if bytes_out else None,
         "seconds": time.perf_counter() - started,
     }
@@ -277,6 +299,12 @@ def main() -> None:
         action="store_true",
         help="also quantize the layers keeps_bf16() protects (a quality arm, not a default)",
     )
+    parser.add_argument(
+        "--scale",
+        choices=("tensor", "channel"),
+        default="tensor",
+        help="scale granularity; 'tensor' is what vLLM's native fp8 method loads",
+    )
     parser.add_argument("--shard-gib", type=float, default=4.0)
     args = parser.parse_args()
 
@@ -284,6 +312,7 @@ def main() -> None:
         args.src.resolve(),
         args.dst.resolve(),
         protect_sensitive=not args.quantize_everything,
+        granularity=args.scale,
         shard_bytes=int(args.shard_gib * 1024**3),
     )
     report_path = args.dst / "quantization_report.json"

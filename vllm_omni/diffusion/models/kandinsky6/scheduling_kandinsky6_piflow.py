@@ -142,6 +142,12 @@ def policy_rollout_fm(
     resolution in time. Entries that have finished early are frozen by
     ``active_mask`` rather than skipped, because in the packed layout different
     tokens can belong to requests at different times.
+
+    The result keeps ``x_t_start``'s dtype. The schedule tensors are FP32 (a BF16
+    sigma near the end of the schedule has too few mantissa bits to separate
+    adjacent substeps), and plain promotion would hand the VAE an FP32 latent
+    where the rest of the pipeline -- and the Euler scheduler, which casts its
+    step to ``sample.dtype`` -- keeps BF16.
     """
     ndim = x_t_start.dim()
     shape = (x_t_start.size(0), *((ndim - 1) * [1]))
@@ -161,11 +167,11 @@ def policy_rollout_fm(
         x_t_minus = x_t + velocity * (sigma_t_minus - sigma_t)
 
         active = num_substeps > substep_id
-        x_t = torch.where(active, x_t_minus, x_t)
+        x_t = torch.where(active, x_t_minus.to(x_t.dtype), x_t)
         sigma_t = torch.where(active, sigma_t_minus, sigma_t)
         raw_t = torch.where(active, raw_t_minus, raw_t)
 
-    return x_t
+    return x_t.to(x_t_start.dtype)
 
 
 @dataclass
