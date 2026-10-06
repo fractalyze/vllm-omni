@@ -1,0 +1,8 @@
+{
+  "name": "int8-sage2",
+  "command": ["/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/run_capped.sh",
+              "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/serve_pro_fp8.sh",
+              "--diffusion-attention-config", "@showcase/kandinsky6/compute/arms/tuned.json"],
+  "env": {"K6_CKPT": "/data/jooman/k6/ckpt/pro-distill-int8-min", "K6_MEMMAX": "44G"},
+  "port": 8091
+}

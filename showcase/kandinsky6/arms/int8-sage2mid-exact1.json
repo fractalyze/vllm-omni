@@ -1,0 +1,16 @@
+{
+  "name": "int8-sage2mid-exact1",
+  "command": [
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/run_capped.sh",
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/serve_pro_fp8.sh",
+    "--diffusion-attention-config",
+    "@showcase/kandinsky6/compute/arms/sage2.json"
+  ],
+  "env": {
+    "K6_CKPT": "/data/jooman/k6/ckpt/pro-distill-int8-min",
+    "K6_MEMMAX": "44G",
+    "VLLM_OMNI_K6_EXACT_ATTN_STEPS": "1",
+    "VLLM_OMNI_K6_EXACT_ATTN_BLOCKS": "6"
+  },
+  "port": 8091
+}
