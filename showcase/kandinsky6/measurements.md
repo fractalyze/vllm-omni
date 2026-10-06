@@ -9,6 +9,184 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Headline: the fastest W1 configuration on one RTX 5090 that passes the working gate (Track M)
+
+Track M, build-server-2, 2026-10-07. Kandinsky 6 Pro-distill 5s, W1 (864x480,
+121 frames, 10 pi-Flow steps, guidance 1.0, audio on), one RTX 5090 (32 GB),
+60 GB host.
+
+**Headline: BF16 streamed + Sage2 on blocks 6-53 + exact first sampler step
+("sage2-mid + step 1", Track C's arm) is the one configuration faster than the
+BF16 reference that passes the working gates (G2 and G3) on both prompt sets.**
+It does not pass the user's gate (G1): its worst frame is over 0.25 on both
+sets. It is also not faster than the FP8 baseline, which fails every gate.
+
+One mirrored session on bs2, 2026-10-07 04:16-05:15 KST: visits A B C C B A,
+1 warm-up + 2 timed requests each, prompt a1, seed 42. Every GPU lock was held
+throughout, and the guard sampled no foreign GPU process (`validity: valid`;
+run `ABBA-baselinexbf16-sage2mid-exact1xint8-sage2-exact1-20261006-191327-build-server-2-6d47aa`).
+
+| arm | gates passed | W1 request, median (min-max), n=4 | vs FP8 baseline |
+|---|---|---:|---:|
+| FP8 per-tensor baseline | none | 174.10 s (174.02-174.12) | -- |
+| **BF16 sage2-mid + exact step 1 (headline)** | **G2 + G3 on A and B** | **188.93 s (188.51-189.79)** | **+8.5%** |
+| INT8 weight-only + Sage2 + exact step 1 | G2 + G3 on A only | 168.07 s (167.62-168.91) | -3.5% |
+| BF16 reference (not in the session) | all, by definition | 234.6 s (233.4-243.3), set-B gate run, n=9 | +34.7% |
+
+The control's spread is 0.06%, so both deltas are far outside the noise. The
+headline arm is **19.5% faster than the BF16 reference on bs2** (188.9 vs
+234.6 s; the reference comes from a gate run, not this session), and 8.5%
+slower than the FP8 baseline, which fails every gate.
+
+On bs3 the same arm runs 182.6 s (set A median, n=9), against 231.8 s for the
+BF16 reference there (-21%). On bs2 it is slower, because the BF16 checkpoint is
+streamed from NVMe through a page cache capped with the server at 40 GB.
+
+Nothing faster than the FP8 baseline (174.1 s) passes G2 on both sets. The INT8
+arm (168.1 s) passes set A and fails set B on b6 and b3, and the b6 contact sheet
+shows why: INT8 weight rounding changes that prompt's scene from the first
+frame. The Pareto table below is there so the user can choose.
+
+### Serve commands
+
+From the repo root, with the venv at `/data/jooman/k6/venv` and
+`HF_HOME=/data/jooman/hf`. `run_capped.sh` runs the server in a systemd scope
+with a hard host-memory cap, so a leak takes down the server and not the host.
+
+```bash
+# Headline, passes G2 + G3 on both sets: BF16 streamed + Sage2 on blocks 6-53 + exact step 1.
+VLLM_OMNI_K6_EXACT_ATTN_STEPS=1 VLLM_OMNI_K6_EXACT_ATTN_BLOCKS=6 K6_MEMMAX=40G \
+  showcase/kandinsky6/serve/run_capped.sh showcase/kandinsky6/serve/serve_pro_bf16_ref.sh \
+  --diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/sage2.json)"
+# (Track C states the same block band as `"layers": "6:54"` in compute/arms/sage2-mid.json.)
+
+# The reference configuration (G1's reference; passes everything by definition).
+K6_MEMMAX=40G showcase/kandinsky6/serve/run_capped.sh showcase/kandinsky6/serve/serve_pro_bf16_ref.sh
+
+# Fastest arm passing G2 + G3 on set A (fails set B): INT8 weight-only + Sage2 + exact step 1.
+python showcase/kandinsky6/tools/quantize_dit_fp8.py --src <Pro-distill snapshot> \
+  --dst /data/jooman/k6/ckpt/pro-distill-int8-min --keep minimal --format int8   # once, ~2 min
+VLLM_OMNI_K6_EXACT_ATTN_STEPS=1 K6_MEMMAX=44G K6_CKPT=/data/jooman/k6/ckpt/pro-distill-int8-min \
+  showcase/kandinsky6/serve/run_capped.sh showcase/kandinsky6/serve/serve_pro_fp8.sh \
+  --diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/tuned.json)"
+```
+
+Samples are in `/data/jooman/k6/showcase-samples/` on build-server-2:
+`bf16-compiled/{setA,setB}`, `int8-sage2-exact1/setA`, and
+`int8-sage2-exact1/setB-screen` (b3 and b6, the set-B prompts it fails). The
+comparison sheets are in `sheets/` (a3, b6): one row per arm, the same frames in
+every column.
+
+### Three gates, and which one decides
+
+| gate | definition | chosen by |
+|---|---|---|
+| G1 | per set: LPIPS mean <= 0.15 and worst frame <= 0.25, vs a compiled BF16 reference from the same host with the same pinned Inductor cache | **the user** |
+| G2 | per set: LPIPS mean and worst frame each <= 1.25x the floor, vs the eager BF16 reference; floor = compiled BF16 vs eager BF16 (set A: 0.1455 / 0.416, so <= 0.1819 / 0.5200) | the coordinator, pending the user |
+| G3 | CLIP (ViT-L/14) text-video score within 2% of BF16, plus a contact sheet | the coordinator, pending the user |
+
+**G2 and G3 are working gates the coordinator chose, not the user's.** The
+headline is the fastest arm that passes G2 and G3 on both sets; every arm's G1
+result is reported beside it. No lossy arm passes G1. On this sampler a single changed
+kernel moves the trajectory: the compiled-vs-eager kernel choice alone gives
+a 0.416 worst frame on set A. The user's 0.25 worst-frame limit is below that.
+
+### Pareto table: W1 wall time vs both prompt sets
+
+The three arms marked "session" take their wall from the mirrored session
+above. The others use steady-state walls from their gate runs (one server,
+sequential prompts). "vs eager" is G2's reference and "vs compiled" is G1's
+(bs2, pinned Inductor cache). Each cell is LPIPS set mean / worst frame.
+
+Limits:
+
+| set | G2 floor (compiled vs eager) | G2 limits (1.25x) | G1 limits |
+|---|---|---|---|
+| A (9 prompts) | 0.1455 / 0.416 | 0.1819 / 0.5200 | 0.15 / 0.25 |
+| B (b1-b8) | 0.1538 / 0.3396 | 0.1922 / 0.4245 | 0.15 / 0.25 |
+
+Track C's cross-host set-B floor is 0.1615 / 0.3476. The eager set-B reference
+has b1-b8: b9 was never generated, so set B is scored on 8 prompts.
+
+| arm | W1 wall | A vs eager | A vs compiled | B vs eager | B vs compiled | G1 A/B | G2 A/B | G3 A/B |
+|---|---:|---|---|---|---|---|---|---|
+| FP8 per-tensor, keep=minimal (baseline) | 174.10 s (session) | 0.265 / 0.544 | 0.262 / 0.551 | not run | not run | fail / - | fail / - | pass / - |
+| BF16 streamed + Sage2 (Track C outputs, bs3) | ~166 s (bs3) | 0.186 / 0.474 | 0.168 / 0.369 | Track C | Track C | fail / - | fail / - | pass / - |
+| INT8 weight-only + Sage2 | 161 s | 0.211 / 0.481 | 0.195 / 0.484 | not run | not run | fail / - | fail / - | pass / - |
+| INT8 + Sage2 + FP8 FFN band + exact step 1 | 148.8 s | 0.218 / 0.461 | 0.212 / 0.482 | not run | not run | fail / - | fail / - | pass / - |
+| **INT8 + Sage2 + exact step 1** | **168.07 s** (session) | **0.1735 / 0.4426** | 0.1686 / 0.4627 | screen: b6 0.579 / 0.596, b3 0.387 / 0.436 | not run | fail / fail | **pass** / fail | pass / - |
+| INT8 + sage2-mid (blocks 6-53) + exact step 1 | 180.2 s | not run | not run | screen: b6 - / 0.593, b3 - / 0.363 | not run | - / fail | - / fail | - |
+| BF16 + sage2-mid (blocks 6-53) (Track C, bs3) | 177.7 s (bs3) | 0.1543 / 0.4591 | - | 0.1976 / 0.4989 | - | fail / fail | pass / **fail** (b6) | pass / - |
+| **BF16 + sage2-mid + exact step 1 (Track C's arm, outputs from bs3)** | **188.93 s (session); 182.6 s on bs3** | **0.1296 / 0.3560** | 0.1116 / 0.300 | **0.1561 / 0.3380** | 0.1232 / 0.389 | fail / fail (A: mean inside) | **pass / pass** | pass / pass |
+| BF16 compiled (G1's reference itself) | 234.6 s (set-B gate run) | 0.1455 / 0.416 | 0 | 0.1538 / 0.3396 | 0 | pass / pass | pass / pass | pass / pass |
+
+Contact sheets (`bench/compare_sheet.py`): a3 and b6 across arms, at
+`/data/jooman/k6/showcase-samples/sheets/`.
+
+**What b6 shows.** On b6-train-platform both INT8 arms render a different scene
+from the first frame on: a different camera angle, a different train livery,
+the platform sign moved. The two BF16 references agree with each other. The
+two INT8 arms nearly agree with each other too, though their attention
+schedules differ widely (Sage2 everywhere after step 1, vs exact blocks 0-5 and
+54-59 plus step 1). The composition is set in the earliest steps, and both
+arms keep step 1 exact, so on this prompt the likely cause is INT8 weight
+rounding, not Sage2. A prompt whose layout is decided by a near-tie early in
+sampling is where a small, uniform weight error flips the outcome. On a3, by
+contrast, the INT8 arms keep the BF16 scene and FP8 does not (the runner's
+shorts turn from red to black).
+
+### What each piece is
+
+- **INT8 weight-only** (`DiffusionInt8Config(weight_only=True)`, PR #28). The DiT
+  is stored and streamed as INT8 with one FP32 scale per output row (30.2 GB,
+  `tools/quantize_dit_fp8.py --format int8 --keep minimal`). It is dequantized on
+  the GPU into the BF16 operand of the normal GEMM, because sm_120 has no INT8
+  GEMM. It is bit-identical to a BF16 model with fake-quantized weights
+  (unit-tested). It fits pinned host RAM, so it streams without touching NVMe.
+- **Sage2** (Track C): `compute/arms/tuned.json`, with SageAttention 2++ on
+  visual self-attention and video-to-audio cross-attention.
+- **Exact step 1** (`VLLM_OMNI_K6_EXACT_ATTN_STEPS=1`): the first sampler step
+  uses exact (cuDNN) attention. An error made early grows the most over the
+  trajectory. This step costs +6.5 s/request, and it is what brings the INT8 +
+  Sage2 arm under G2 (mean 0.211 -> 0.1735).
+- **FP8 FFN band** (`VLLM_OMNI_INT8_FP8_BAND`, PR #29). The video FFNs of
+  blocks 6-53 are re-quantized at load to per-tensor FP8 and run
+  `torch._scaled_mm` (cuBLASLt). Step time drops from 14.2 s to 12.3 s, but
+  the band fails G2 on set A (0.218 mean), so no arm here uses it.
+- **sage2-mid** (Track C): Sage2 on blocks 6-53 only, with blocks 0-5 and
+  54-59 exact (`VLLM_OMNI_K6_EXACT_ATTN_BLOCKS=6` here, `"layers": "6:54"` in
+  Track C's config). Combined with exact step 1 on BF16 weights, it is the arm
+  that holds b6's scene.
+
+### Why the FP8 checkpoint is out, and what bounds the step now
+
+FP8 E4M3 weight error is about 2.6% at any scale granularity (Track C:
+per-tensor 0.02645, per-channel 0.02643). FP8 everywhere fails G2 on both mean
+and max. Per-row INT8 carries about a third of that error. Adding INT8 to Sage2
+still costs measurable quality on set A (a2, a9), but exact step 1 recovers it.
+
+With Sage2, the step is compute-bound at about 14 s. INT8 halves the bytes
+streamed per step, yet the step barely moved (BF16 + Sage2 14.5 s/step, INT8 +
+Sage2 14.2), so the stream was not the bound. The remaining lever is the GEMMs
+themselves, which is what the FP8 band spends, at a quality cost the gate
+does not allow.
+
+The non-denoise tail is about 20 s per request (request wall minus the 10
+steps), the same on every INT8 arm. It is not cut here: a cut would need its
+own ABBA. Its stage breakdown was not measured: the profiled run died of CUDA
+OOM at load, because another team's job held the GPU, and the GPU went to the
+headline comparisons after that.
+
+### Reference reproducibility on this host
+
+`ref/setA` (compiled BF16) was regenerated for a5 under the pinned Inductor
+cache. Audio was bit-identical; video was not: LPIPS 0.022 mean / 0.024 worst
+frame, PSNR 37 dB. Audio and video are denoised jointly with cross-attention,
+so identical audio means the DiT trajectory reproduced. The difference comes
+later, in the video path, most likely per-process kernel choice in the VAE
+decode, which the Inductor cache does not pin. Every G1 number above
+carries that ~0.02.
+
 ## End to end: Kandinsky 6 Lite at W1's geometry
 
 The measurements above are one synthetic Pro block. This is a whole request.
