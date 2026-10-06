@@ -79,7 +79,9 @@ def start(arm: dict, log: Path, timeout_s: float = 1800.0) -> tuple[subprocess.P
     env = {**os.environ, **arm["env"]}
     t0 = time.perf_counter()
     with log.open("wb") as handle:
-        proc = subprocess.Popen(arm["command"], stdout=handle, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        proc = subprocess.Popen(
+            arm["command"], stdout=handle, stderr=subprocess.STDOUT, env=env, start_new_session=True
+        )
     while not _healthy(arm["port"]):
         if proc.poll() is not None:
             raise RuntimeError(f"{arm['name']}: server exited ({proc.returncode}); see {log}")
