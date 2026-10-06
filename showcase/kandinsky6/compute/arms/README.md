@@ -17,11 +17,23 @@ vllm serve kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers --omni \
 `kandinsky6.video_audio_cross`, `kandinsky6.audio_video_cross` and
 `kandinsky6.audio_self`, named in `kandinsky6_transformer.py`.
 
-Only `visual_self` is set here. It is 98.8% of a block's attention FLOPs, and
-leaving the four cheap call sites on the platform default keeps each arm a
-one-variable change: a quality regression then has exactly one cause. The
-cheap roles are raced separately by `attn_race.py --all-roles`, which is how a
-second variable would be justified.
+Only `visual_self` is set here, for three reasons that point the same way.
+
+1. It is 98.8% of a block's attention FLOPs (41.3 of 41.8 TFLOP), so it is
+   where a faster kernel pays.
+2. **It is the only mask-free call site, and the FP8/FP4 kernels require
+   that.** `SageAttentionImpl.forward_cuda` raises
+   `"SAGE_ATTN does not support attn_mask"` outright. Both Kandinsky 6
+   bundles set `text_token_padding: true`, and the fused block hands
+   `attn_mask` to `cross_attention` for text and to the audio branch, while
+   visual self-attention is called with only `rotary_emb` and
+   `sparse_params`. So a `default:` arm — one that pointed every role at
+   SAGE_ATTN — would not be slower, it would raise on the first padded
+   prompt. Per-role is not tidiness here; it is the only form that runs.
+3. One variable per arm means a quality regression has exactly one cause.
+
+The cheap roles are raced separately by `attn_race.py --all-roles`, which is
+what would justify a second variable.
 
 | file | `kandinsky6.visual_self` |
 |---|---|
