@@ -114,6 +114,15 @@ def serve_flags(
     offers per-output-row FP8 scales online, and the offline converter's own
     docstring says per-row scales are the better recipe but are not loadable
     from a natively-serialized FP8 checkpoint.
+
+    Known not to work on Kandinsky 6 as of 2026-10-07: ``resident_layers`` with
+    the platform's default compile settings. The server starts and the first
+    request dies in Dynamo with ``call_function linear(..., Parameter(FakeTensor(
+    size=(0,))))`` and ``b must be 2D`` -- a DiT weight the resident path left
+    unmaterialized reaching a traced linear. Recorded here, where someone would
+    next reach for the flag, rather than by removing it: the emitted offload
+    config is validated against vLLM-Omni's own parser in the tests, so the
+    failure is downstream of this file.
     """
     if offload not in OFFLOAD_FLAGS:
         raise ValueError(f"unknown offload mode {offload!r}; expected one of {sorted(OFFLOAD_FLAGS)}")
