@@ -808,3 +808,67 @@ class LoadTimeQuantizationFlagTest(absltest.TestCase):
         from gate_pro import serve_flags
 
         self.assertEqual(serve_flags("layerwise", None, None), serve_flags("layerwise", None, None, None))
+
+
+class OffloadPlacementTest(absltest.TestCase):
+    """Resident blocks and text-encoder offload, validated against vLLM-Omni's own parser.
+
+    This arm is weight-traffic-bound -- 60.3 GB re-read per step -- so where a
+    tensor lives is a performance lever, and neither of these two placements has
+    a CLI flag. The emitted config is checked by the parser that will consume it
+    rather than against a literal, because the schema lives in another repo path
+    and a silently rejected config would serve the default arm under the
+    candidate's name.
+    """
+
+    def _parsed(self, flags):
+        import json
+
+        from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
+
+        self.assertIn("--diffusion-offload-config", flags)
+        payload = flags[flags.index("--diffusion-offload-config") + 1]
+        return parse_diffusion_offload_config(json.loads(payload))
+
+    def test_the_plain_arms_keep_the_legacy_flags(self):
+        """No extras means byte-identical flags to the reference serve script;
+        the public config is only reached when something needs it."""
+        from gate_pro import serve_flags
+
+        for offload in ("layerwise", "dlo-mmap"):
+            flags = serve_flags(offload, None, None)
+            self.assertNotIn("--diffusion-offload-config", flags)
+
+    def test_resident_blocks_resolve_to_the_streaming_backend(self):
+        from vllm_omni.diffusion.offloader.config import DLOTransfer, OffloadStrategy, _public_strategy
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, resident_layers=5)
+        parsed = self._parsed(flags)
+        self.assertEqual(parsed.layer_options["dit"].resident_layers, 5)
+        self.assertEqual(parsed.layer_options["dit"].weight_transfer, DLOTransfer.RANK_LOCAL)
+        self.assertEqual(_public_strategy(parsed), OffloadStrategy.DISTRIBUTED_LAYER_WISE)
+        self.assertIn("--enable-distributed-layerwise-offload", flags)
+
+    def test_the_allgather_flag_is_not_passed_beside_the_config(self):
+        """`_validate_legacy_layer_options` rejects that pair outright, so the
+        server would refuse to start."""
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, resident_layers=5, offload_text_encoder=True)
+        self.assertNotIn("--dlo-no-use-allgather", flags)
+
+    def test_offloading_the_text_encoder_selects_it(self):
+        from gate_pro import serve_flags
+
+        parsed = self._parsed(serve_flags("dlo-mmap", None, None, None, offload_text_encoder=True))
+        self.assertEqual(parsed.components, frozenset({"dit", "text_encoder"}))
+
+    def test_a_streamed_arm_without_resident_blocks_still_streams(self):
+        """Rank-local with no resident block resolves to plain layer-wise, which
+        stages from pinned host memory -- a different arm. The backend flag is
+        what keeps it the streamed one."""
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, None, offload_text_encoder=True)
+        self.assertIn("--enable-distributed-layerwise-offload", flags)

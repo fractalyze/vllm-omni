@@ -63,11 +63,42 @@ OFFLOAD_FLAGS = {
 }
 
 
+def offload_config_json(offload: str, resident_layers: int, offload_text_encoder: bool) -> str:
+    """The ``--diffusion-offload-config`` for a placement the legacy flags cannot express.
+
+    The two legacy switches are shorthands for two points in a larger policy:
+    which components are offloaded, how each one's next block reaches the device,
+    and how many leading DiT blocks are simply left on it. Keeping blocks
+    resident and offloading the text encoder are the two levers this showcase
+    wants and neither has a flag, so those arms are described in the public
+    config instead.
+
+    Note what is *not* here: ``dlo_use_allgather``. The legacy flag and this
+    config are mutually exclusive (``_validate_legacy_layer_options`` rejects
+    the pair), so rank-local transfer is stated inside the config and
+    ``--enable-distributed-layerwise-offload`` only selects the backend. Without
+    that backend flag, a rank-local config with no resident layers resolves to
+    plain layer-wise offload -- which stages from pinned host memory instead of
+    the mmapped checkpoint, quietly serving a different arm than the one asked
+    for.
+    """
+    components = ["dit"] + (["text_encoder"] if offload_text_encoder else [])
+    layer_options: dict[str, dict[str, object]] = {component: {} for component in components}
+    if resident_layers:
+        layer_options["dit"]["resident_layers"] = resident_layers
+    if offload == "dlo-mmap":
+        for options in layer_options.values():
+            options["weight_transfer"] = "rank-local"
+    return json.dumps({"mode": "layer", "components": components, "layer_options": layer_options})
+
+
 def serve_flags(
     offload: str,
     attention_config: str | None,
     compile_mode: str | None,
     quantization: str | None = None,
+    resident_layers: int = 0,
+    offload_text_encoder: bool = False,
 ) -> list[str]:
     """The ``vllm serve`` flags for one arm, beyond the model.
 
@@ -86,7 +117,13 @@ def serve_flags(
     """
     if offload not in OFFLOAD_FLAGS:
         raise ValueError(f"unknown offload mode {offload!r}; expected one of {sorted(OFFLOAD_FLAGS)}")
-    flags = ["--num-gpus", "1", *OFFLOAD_FLAGS[offload], "--disable-multithread-weight-load"]
+    if resident_layers or offload_text_encoder:
+        placement = ["--diffusion-offload-config", offload_config_json(offload, resident_layers, offload_text_encoder)]
+        if offload == "dlo-mmap":
+            placement = ["--enable-distributed-layerwise-offload", *placement]
+    else:
+        placement = list(OFFLOAD_FLAGS[offload])
+    flags = ["--num-gpus", "1", *placement, "--disable-multithread-weight-load"]
     if attention_config is not None:
         flags += ["--diffusion-attention-config", attention_config]
     if compile_mode:
@@ -146,6 +183,17 @@ def main() -> int:
     )
     parser.add_argument("--compile-mode", default=None, help="--diffusion-compile-mode for this arm")
     parser.add_argument(
+        "--resident-layers",
+        type=int,
+        default=0,
+        help="leading DiT blocks kept on the device instead of staged every step (lossless)",
+    )
+    parser.add_argument(
+        "--offload-text-encoder",
+        action="store_true",
+        help="offload the text encoder too, freeing its board memory for resident DiT blocks",
+    )
+    parser.add_argument(
         "--quantization",
         default=None,
         help="a load-time quantization method (e.g. fp8_per_channel), or JSON for one with an ignore list",
@@ -179,6 +227,8 @@ def main() -> int:
         None if args.arm == "shipped" else Path(args.arm).read_text(),
         args.compile_mode,
         args.quantization,
+        args.resident_layers,
+        args.offload_text_encoder,
     )
 
     arm = Arm(
@@ -202,6 +252,8 @@ def main() -> int:
         "attention_config": args.arm,
         "compile_mode": args.compile_mode,
         "quantization": args.quantization,
+        "resident_layers": args.resident_layers,
+        "offload_text_encoder": args.offload_text_encoder,
         "checkpoint": checkpoint,
         "offload": args.offload,
         "cli_args": cli_args,
