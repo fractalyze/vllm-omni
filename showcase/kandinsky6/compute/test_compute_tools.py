@@ -241,6 +241,12 @@ class AttentionArmConfigTest(parameterized.TestCase):
     # role_category each call site passes alongside.
     K6_ROLES = (
         ("kandinsky6.visual_self", "self"),
+        # The exact-attention schedule's fallback role. A visual self-attention
+        # call routed through it resolves to the platform default, because no
+        # arm config names it -- that is how `VLLM_OMNI_K6_EXACT_ATTN_STEPS` and
+        # `_BLOCKS` make individual calls exact without a second backend
+        # setting. It belongs here because the port really does pass it.
+        ("kandinsky6.visual_self_exact", "self"),
         ("kandinsky6.text_self", "self"),
         ("kandinsky6.audio_self", "self"),
         ("kandinsky6.text_cross", "cross"),
