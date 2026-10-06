@@ -260,39 +260,76 @@ class AttentionArmConfigTest(parameterized.TestCase):
         in_source = set(re.findall(r'"(kandinsky6\.[a-z_]+)"', source))
         self.assertEqual(in_source, {role for role, _ in self.K6_ROLES})
 
+    # What each arm file is expected to resolve, role -> backend. A role left
+    # out must resolve to None (platform default). `control.json` says "auto",
+    # which AttentionConfig normalizes to "no override", so it expects nothing.
+    ARMS = {
+        "control.json": {},
+        "sage2.json": {"kandinsky6.visual_self": "SAGE_ATTN"},
+        "sage3.json": {"kandinsky6.visual_self": "SAGE_ATTN_3"},
+        "flash.json": {"kandinsky6.visual_self": "FLASH_ATTN"},
+        "tuned.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.video_audio_cross": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+    }
+
+    # Roles that receive a padding mask, so a mask-rejecting backend must
+    # never be pinned to them. test_role_masks.py establishes the list by
+    # running a forward; this is the consequence for the config files.
+    MASKED_ROLES = frozenset({"kandinsky6.text_self", "kandinsky6.text_cross"})
+    MASK_REJECTING_BACKENDS = frozenset({"SAGE_ATTN", "SAGE_ATTN_3"})
+
     @parameterized.named_parameters(
-        ("control", "control.json", None),
-        ("sage2", "sage2.json", "SAGE_ATTN"),
-        ("sage3", "sage3.json", "SAGE_ATTN_3"),
-        ("flash", "flash.json", "FLASH_ATTN"),
+        ("control", "control.json"),
+        ("sage2", "sage2.json"),
+        ("sage3", "sage3.json"),
+        ("flash", "flash.json"),
+        ("tuned", "tuned.json"),
     )
-    def test_arm_resolves_visual_self_and_leaves_the_rest_alone(self, filename, expected):
+    def test_arm_resolves_exactly_the_roles_it_claims(self, filename):
         import json
 
         from vllm_omni.diffusion.data import build_attention_config
 
+        expected = self.ARMS[filename]
         config = build_attention_config(json.loads((self._arms_dir() / filename).read_text()))
         for role, category in self.K6_ROLES:
             spec, _ = config.resolve_with_source(role=role, role_category=category)
-            if role == "kandinsky6.visual_self":
-                # `control.json` says "auto", which AttentionConfig
-                # normalizes to None: no override, platform default.
-                self.assertEqual(spec.backend if spec else None, expected, msg=role)
-            else:
-                self.assertIsNone(spec, msg=f"{role} must stay on the platform default")
+            resolved = spec.backend if spec else None
+            self.assertEqual(resolved, expected.get(role), msg=role)
+
+    @parameterized.named_parameters(
+        ("control", "control.json"),
+        ("sage2", "sage2.json"),
+        ("sage3", "sage3.json"),
+        ("flash", "flash.json"),
+        ("tuned", "tuned.json"),
+    )
+    def test_no_mask_rejecting_backend_on_a_masked_role(self, filename):
+        """SageAttention raises on attn_mask, and the two text roles get one.
+        Pinning one there would serve fine until the first padded prompt."""
+        for role, backend in self.ARMS[filename].items():
+            if role in self.MASKED_ROLES:
+                self.assertNotIn(backend, self.MASK_REJECTING_BACKENDS, msg=f"{filename}: {role}")
 
     @parameterized.named_parameters(
         ("sage2", "sage2.json"),
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
+        ("tuned", "tuned.json"),
     )
-    def test_the_named_backend_exists_in_the_registry(self, filename):
+    def test_the_named_backends_exist_in_the_registry(self, filename):
         """A backend name that is not a registry member would only fail at
         serve time, after the weights are loaded."""
-        import json
-
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
-        config = json.loads((self._arms_dir() / filename).read_text())
-        backend = config["per_role"]["kandinsky6"]["visual_self"]["backend"]
-        self.assertIn(backend, DiffusionAttentionBackendEnum.__members__)
+        for backend in self.ARMS[filename].values():
+            self.assertIn(backend, DiffusionAttentionBackendEnum.__members__)
+
+    def test_every_arm_file_on_disk_is_covered(self):
+        """A new arm added without a row in ARMS would go untested."""
+        on_disk = {path.name for path in self._arms_dir().glob("*.json")}
+        self.assertEqual(on_disk, set(self.ARMS))
