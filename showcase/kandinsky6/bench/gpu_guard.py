@@ -46,6 +46,9 @@ LOCK_GLOBS = (
     "/data/jooman/*/gpu.lock",
     "/data/jooman/tmp/gpu.lock",
     str(Path.home() / ".cache/*/*/gpu.lock"),
+    # Another team's lease on build-server-2's GPU 0 (owned by its user, mode
+    # 0644). Their jobs hold it for a whole run and launch GPU workers under it.
+    "/var/lock/fractalyze-gpu*.lease",
 )
 
 # This study's own lock, created if absent so the other track and other
@@ -60,6 +63,20 @@ _SMI_QUERY = (
     "utilization.gpu",
     "memory.used",
 )
+
+
+def _open_lock(path: str) -> int:
+    """A descriptor to ``flock`` on, creating our own lock file if needed.
+
+    Another user's lock file may be read-only to us. ``flock`` does not care
+    how the descriptor was opened, so fall back to read-only rather than skip
+    a lock the other job is honouring.
+    """
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o664)
+    except PermissionError:
+        return os.open(path, os.O_RDONLY)
 
 
 def _run(cmd: list[str], timeout: float = 15.0) -> str:
@@ -139,8 +156,7 @@ class GpuGuard:
         """
         deadline = time.monotonic() + timeout_s
         for path in self.lock_paths():
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o664)
+            fd = _open_lock(path)
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
