@@ -71,6 +71,12 @@ class KernelClassesTest(parameterized.TestCase):
         ("sdpa_efficient", "fmha_cutlassF_bf16_aligned_64x128_rf_sm80", "attention"),
         ("flashinfer", "BatchPrefillWithRaggedKVCacheKernel", "attention"),
         ("sage2", "qk_int8_sv_f8_accum_f32_attn_inst_buf", "attention"),
+        # The names the sm_120 path actually emits, from
+        # results/k6c-p01b-block-profile-w1-tuned.json. `qk_int_sv` has no
+        # digit after `int`; missing it put 23.5% of a block in `unclassified`.
+        ("sage2_sm120", "void qk_int_sv_f8_attn_kernel<128u, 64u, 32u, 64u, 128u, (DataType)1>", "attention"),
+        ("sage2_quant_prologue", "void QuantInt8Kernel<128u, 32u, 1u, false, false, __nv_bfloat16>", "attention"),
+        ("sage2_mean_scale", "void MeanScaleKernel<64u, false, __nv_bfloat16>", "attention"),
         ("flex", "triton_tem_fused_flex_attention_0", "attention"),
         ("cublaslt", "nvjet_tst_192x128_64x4_1x2_h_bz_coopA_NTT", "gemm"),
         ("cutlass", "cutlass::device_kernel<cutlass_80_tensorop_bf16_s16816gemm>", "gemm"),

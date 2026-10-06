@@ -1,0 +1,151 @@
+{
+  "config": "pro",
+  "geometry": "w1",
+  "target": "fused",
+  "backend": "platform-default",
+  "attention_config_file": "/data/jooman/k6/vllm-omni/showcase/kandinsky6/compute/arms/tuned.json",
+  "compile_mode": "default",
+  "shapes": {
+    "height": 480,
+    "width": 864,
+    "num_frames": 121,
+    "fps": 24.0,
+    "text_len": 256,
+    "latent_frames": 31,
+    "latent_h": 30,
+    "latent_w": 54,
+    "visual_tokens": 50220,
+    "audio_len": 218
+  },
+  "dtype": "torch.bfloat16",
+  "torch": "2.13.0+cu132",
+  "device": "NVIDIA GeForce RTX 5090",
+  "locks_held": "run_when_free.py pid 1238487: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "foreign_gpu_procs": [],
+  "peak_allocated_gib": 5.201,
+  "timing": {
+    "median_ms": 203.015,
+    "min_ms": 202.6,
+    "max_ms": 203.214,
+    "spread_pct": 0.3,
+    "repeats": 5,
+    "all_ms": [
+      202.758,
+      202.6,
+      203.015,
+      203.017,
+      203.214
+    ]
+  },
+  "compare_compile": null,
+  "profile": {
+    "iters": 3,
+    "device_ms_per_forward": 202.774,
+    "wall_ms_per_forward": 209.012,
+    "launch_gap_ms_per_forward": 6.238,
+    "categories_ms_per_forward": {
+      "attention": 63.714,
+      "gemm": 129.996,
+      "elementwise": 3.383,
+      "norm": 5.014,
+      "copy": 0.652,
+      "unclassified": 0.014
+    },
+    "categories_share_pct": {
+      "attention": 31.42,
+      "gemm": 64.11,
+      "elementwise": 1.67,
+      "norm": 2.47,
+      "copy": 0.32,
+      "unclassified": 0.01
+    },
+    "top_kernels": [
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
+        "ms_per_forward": 73.082
+      },
+      {
+        "name": "void qk_int_sv_f8_attn_kernel<128u, 64u, 32u, 64u, 128u, (DataType)1, (QuantGranularity)2, (QuantGranularity)2, float, true, __nv_bfloat16, (ComputeUnit)1, (MaskMode)0, false, true, false, true>(signed char*, signed char*, signed char*, __nv_bfloat16*, float*, float*, float*, float*, float*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float)",
+        "ms_per_forward": 59.336
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8::Params)",
+        "ms_per_forward": 28.395
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_tn_align8::Params)",
+        "ms_per_forward": 28.088
+      },
+      {
+        "name": "triton_poi_fused__unsafe_view_gelu_6",
+        "ms_per_forward": 2.121
+      },
+      {
+        "name": "triton_red_fused__fused_rms_norm__to_copy_mul_sum_view_0",
+        "ms_per_forward": 1.64
+      },
+      {
+        "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_split_with_sizes_view_10",
+        "ms_per_forward": 1.312
+      },
+      {
+        "name": "cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0",
+        "ms_per_forward": 1.12
+      },
+      {
+        "name": "triton_poi_fused__to_copy__unsafe_view_add_mul_split_7",
+        "ms_per_forward": 0.997
+      },
+      {
+        "name": "void QuantInt8Kernel<128u, 32u, 1u, false, false, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, signed char*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
+        "ms_per_forward": 0.81
+      },
+      {
+        "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_0",
+        "ms_per_forward": 0.77
+      },
+      {
+        "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_5",
+        "ms_per_forward": 0.754
+      },
+      {
+        "name": "void TransposePadPermuteKernel<128u, 64u, true, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
+        "ms_per_forward": 0.652
+      },
+      {
+        "name": "void MeanScaleKernel<64u, false, __nv_bfloat16>(__nv_bfloat16*, signed char*, float*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
+        "ms_per_forward": 0.631
+      },
+      {
+        "name": "void pytorch_flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, cutlass::bfloat16_t> >, false, false, false, false, true, false, true, false>(pytorch_flash::Flash_fwd_params)",
+        "ms_per_forward": 0.575
+      },
+      {
+        "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_1",
+        "ms_per_forward": 0.521
+      },
+      {
+        "name": "triton_per_fused__fused_rms_norm__scaled_dot_product_cudnn_attention_permute_unsqueeze_view_1",
+        "ms_per_forward": 0.517
+      },
+      {
+        "name": "void QuantInt8Kernel<128u, 64u, 1u, false, true, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, signed char*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
+        "ms_per_forward": 0.419
+      },
+      {
+        "name": "triton_red_fused__fused_rms_norm__scaled_dot_product_flash_attention__to_copy_mul_permute_sum_view_1",
+        "ms_per_forward": 0.287
+      },
+      {
+        "name": "triton_red_fused_mean_0",
+        "ms_per_forward": 0.254
+      }
+    ],
+    "unclassified_kernels": [
+      {
+        "name": "Memset (Device)",
+        "ms_per_forward": 0.014
+      }
+    ]
+  }
+}
