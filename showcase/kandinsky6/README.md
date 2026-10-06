@@ -96,17 +96,22 @@ serve/serve_pro_bf16_ref.sh \
     --diffusion-attention-config "$(cat compute/arms/sage2-mid.json)"
 ```
 
-| | W1 request | set A mean / max | vs the floor |
-|---|---:|---:|---:|
-| platform default attention (the reference) | 231.8 s | — | — |
-| **this arm** | **182.6 s** | **0.1296 / 0.3560** | **0.89x / 0.86x** |
-| FP8 baseline (fails every gate) | 173.6 s | 0.262 / 0.551 | ~1.8x |
+| | W1 request | set A mean / max | set B mean / max | vs each set's floor |
+|---|---:|---:|---:|---:|
+| platform default attention (the reference) | 231.8 s | — | — | — |
+| **this arm** | **182.6 s** | **0.1296 / 0.3560** | **0.1561 / 0.3380** | **0.89x / 0.86x** and **0.97x / 0.97x** |
+| FP8 baseline (fails every gate) | 173.6 s | 0.262 / 0.551 | — | ~1.8x |
 
 **-21% against the only other configuration that passes**, and the arm differs
 from the BF16 reference by *less than that reference differs from itself*
-compiled against eager. It passes the floor-relative gate and the distributional
-gate on set A, and clears the user's absolute gate on the mean (0.1296 against
-0.15) while exceeding it on the worst frame.
+compiled against eager — on **both** prompt sets and on both the mean and the
+worst frame, all four ratios under 1.0.
+
+It passes the floor-relative gate on both sets and the distributional gate on
+set A (-0.07%). It does not pass the user's absolute gate: set A's mean is inside
+(0.1296 against 0.15), set B's is just over, and both sets' worst frames exceed
+0.25 — which nothing here can clear, since recompiling the reference alone moves
+a worst frame by 0.416.
 
 Set B's numbers, this arm's cold start, and the per-prompt tables are in
 [measurements.md](measurements.md).

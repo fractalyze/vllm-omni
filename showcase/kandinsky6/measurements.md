@@ -86,7 +86,7 @@ therefore **0.1819 / 0.5200** for set A and **0.2019 / 0.4345** for set B.
 | **Sage2 blocks 6-53 (12 exact)** | BF16 streamed | **177.7 s** | **0.1543 / 0.4591** | 0.1976 / 0.4989 | eager | fail | A **1.06x pass**, B 1.22x/**1.44x fail** | +0.00% pass |
 | Sage2 blocks 12-47 (24 exact) | BF16 streamed | ~190 s | — | b3 0.3349, b6 0.2767 (screen) | eager | — | — | — |
 | Sage2 "accurate" knobs | BF16 streamed | 192.8 s | a1 0.0563, a2 0.1867 (screen) | — | eager | — | — | — |
-| **blocks 6-53 + exact step 1** | BF16 streamed | **182.6 s** | **0.1296 / 0.3560** | *running* | eager | mean inside, max over | A **0.89x / 0.86x PASS** | **-0.07% pass** |
+| **blocks 6-53 + exact step 1** | BF16 streamed | **182.6 s** | **0.1296 / 0.3560** | **0.1561 / 0.3380** | eager | A mean inside, maxes over | **A 0.89x/0.86x, B 0.97x/0.97x — BOTH PASS** | **-0.07% pass** |
 | FP8 + Sage2 | FP8-min pinned | ~110 s | 0.2791 / 0.5649 | — | compiled | fail | ~1.9x fail | — |
 | FP8 + platform attention | FP8-min pinned | 173.6 s | 0.262 / 0.551 | — | compiled | fail | ~1.8x fail | — |
 
