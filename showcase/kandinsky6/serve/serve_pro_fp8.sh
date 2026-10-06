@@ -1,5 +1,6 @@
 #!/bin/bash
-# W1 arm: FP8 DiT (32.3 GB, host-resident) streamed per block to the 5090.
+# W1 arm: a pre-quantized Pro DiT (FP8, or INT8 weight-only; ~30 GB, pinned in
+# host RAM) streamed per block to the 5090. K6_CKPT names the model root.
 set -uo pipefail
 export HF_HOME=/data/jooman/hf
 export PATH=/data/jooman/k6/venv/bin:$PATH
