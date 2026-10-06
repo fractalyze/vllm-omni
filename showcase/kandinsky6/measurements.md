@@ -66,6 +66,42 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## Set B is 28% harder than set A, which is why there are two sets
+
+The same arm, the same eight-of-nine prompts it could be scored on (Track M's
+eager set B reference is missing `b9-piano-tuner`), median 178.3 s a request:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| b8-surf-barrel | motion | 0.0536 | 0.0671 |
+| b5-glassblower | motion, face | 0.0682 | 0.0714 |
+| b1-newsreader | face, text, speech | 0.0972 | 0.1377 |
+| b2-market-haggle | face, speech, motion | 0.1410 | 0.1597 |
+| b7-child-birthday | face, sharp-sound | 0.1996 | **0.2699** |
+| b4-tennis-serve | motion, sharp-sound, face | 0.2517 | **0.2736** |
+| b3-storefront-sign | text, motion | 0.3307 | **0.3646** |
+| b6-train-platform | text, motion, sharp-sound | **0.4387** | **0.4989** |
+| **8-prompt set** | | **0.1976** | **0.4989** |
+
+Set A was 0.1543 for the same arm. The reason the sets disagree is in the
+categories: **B has two text-plus-motion prompts and they are its two worst**,
+where A has one. PLAN.md requires two disjoint sets on exactly this evidence --
+the vault's `c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09`, where an
+FP8 recipe passed one 8-prompt set at LPIPS 0.034 and failed another at 0.162 --
+and this is that case reproduced on a different model and a different
+approximation.
+
+**Set B has no floor-relative verdict here.** A floor is the compiled reference
+against the eager one *for that set*, and set B's compiled reference is still
+generating. Substituting set A's floor would be the easy wrong thing: set B's
+prompts are not set A's, and the difficulty ordering above is exactly what a
+floor would also pick up. The scorer reports G2 as **undecided** when no floor
+is supplied rather than falling back, and that is what it reports for set B.
+
+`b9-piano-tuner` is generated here but unscored, and named rather than dropped:
+a set mean over eight of nine prompts is a different gate, and this study has
+already had a partial set read the opposite of its full one.
+
 ## The arm: SageAttention2 through blocks 6-53 of the stack
 
 Exact BF16 weights streamed from the mmapped checkpoint, SageAttention2 on
