@@ -18,7 +18,7 @@ From a clone of this branch:
 ```bash
 uv venv --python 3.12 /data/jooman/k6/venv
 VIRTUAL_ENV=/data/jooman/k6/venv uv pip install setuptools_scm
-VIRTUAL_ENV=/data/jooman/k6/venv uv pip install vllm==0.30.0 --torch-backend=auto
+VIRTUAL_ENV=/data/jooman/k6/venv uv pip install vllm==0.31.0 --torch-backend=auto
 VIRTUAL_ENV=/data/jooman/k6/venv uv pip install -e .
 ```
 
@@ -103,7 +103,8 @@ serve/serve_pro_bf16_ref.sh \
 | | W1 request | set A mean / max | set B mean / max | vs each set's floor |
 |---|---:|---:|---:|---:|
 | platform default attention (the reference) | 231.8 s | — | — | — |
-| **this arm** | **182.6 s** | **0.1296 / 0.3560** | **0.1561 / 0.3380** | **0.89x / 0.86x** and **0.97x / 0.97x** |
+| **this arm**, vs the eager reference (cross-host) | **182.6 s** | **0.1296 / 0.3560** | **0.1561 / 0.3380** | **0.89x / 0.86x** and **0.97x / 0.97x** |
+| **this arm**, primary verdict: vs the compiled reference, same host, same Inductor cache | 182.6 s | **0.1117 / 0.3446** (G1 mean inside; 8 of 9 prompts under the 0.25 max, a3 over) | — | — |
 | FP8 baseline (fails every gate) | 173.6 s | 0.262 / 0.551 | — | ~1.8x |
 
 **-21% against the only other configuration that passes**, and the arm differs
