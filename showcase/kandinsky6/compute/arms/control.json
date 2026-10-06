@@ -1,0 +1,9 @@
+{
+  "per_role": {
+    "kandinsky6": {
+      "visual_self": {
+        "backend": "auto"
+      }
+    }
+  }
+}

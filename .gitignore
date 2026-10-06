@@ -248,6 +248,9 @@ datasets/
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 # Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
 !tests/e2e/accuracy/omni_duplex_eval/*.json
+# Kandinsky 6 showcase: the attention arms are configs, not data -- each is a
+# value for --diffusion-attention-config and the compute tests load them.
+!showcase/kandinsky6/compute/arms/*.json
 *.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
 !tests/assets/hunyuan_image3/it2i.jsonl
@@ -258,6 +261,11 @@ datasets/
 outputs/
 !vllm_omni/outputs/
 results/
+# Kandinsky 6 showcase: the checked-in race and profile records a published
+# table is audited from. The directory itself has to be un-ignored first, or
+# git never descends into it to see the negation below.
+!showcase/kandinsky6/compute/results/
+!showcase/kandinsky6/compute/results/*.json
 generated/
 output_*/
 /tests/e2e/accuracy/artifacts/
