@@ -1,0 +1,16 @@
+{
+  "name": "int8-sage2-exact1-fp8band",
+  "command": [
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/run_capped.sh",
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/serve_pro_fp8.sh",
+    "--diffusion-attention-config",
+    "@showcase/kandinsky6/compute/arms/tuned.json"
+  ],
+  "env": {
+    "K6_CKPT": "/data/jooman/k6/ckpt/pro-distill-int8-min",
+    "K6_MEMMAX": "44G",
+    "VLLM_OMNI_K6_EXACT_ATTN_STEPS": "1",
+    "VLLM_OMNI_INT8_FP8_BAND": "^visual_transformer_blocks\\.([6-9]|[1-4][0-9]|5[0-3])\\.video_dec_block\\.feed_forward\\."
+  },
+  "port": 8091
+}
