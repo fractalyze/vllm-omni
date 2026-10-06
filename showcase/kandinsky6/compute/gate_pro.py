@@ -40,9 +40,49 @@ from drive import RequestFailedError, request_fields, submit_and_fetch  # noqa: 
 from gpulock import GpuLocks, foreign_gpu_procs  # noqa: E402
 from serve import Arm, start_server, stop_server  # noqa: E402
 
-# W1, as PLAN.md fixes it.
-W1 = dict(width=864, height=480, num_frames=121, num_inference_steps=10)
+# W1, as PLAN.md fixes it and as Track M's BF16 references were generated:
+# their ref/setA/manifest.json records this geometry and seed 42 for every
+# prompt. Both have to match or the comparison is not same-seed and the LPIPS
+# is measuring a different sample, not a different kernel.
+W1 = dict(width=864, height=480, num_frames=121, num_inference_steps=10, guidance_scale=1.0)
+REFERENCE_SEED = 42
 DEFAULT_CKPT = "/data/jooman/k6/ckpt/pro-distill-fp8-min"
+
+
+def _reference_settings(manifest_path: Path, prompts: list[dict]) -> tuple[dict[str, int], dict]:
+    """Per-prompt seeds and the geometry, taken from the reference's manifest.
+
+    Read rather than assumed. The gate compares a candidate with a reference
+    *on the same sample*: a different seed or a different frame count makes
+    LPIPS measure a different video, not a different kernel, and the number
+    would look like a quality result. If the manifest is missing, this falls
+    back to the declared defaults and says so, because a silent fallback is
+    the same trap.
+    """
+    ids = [entry["id"] for entry in prompts]
+    if not manifest_path.is_file():
+        print(f"warning: no reference manifest at {manifest_path}; using W1 defaults and seed "
+              f"{REFERENCE_SEED} for every prompt", file=sys.stderr)
+        return dict.fromkeys(ids, REFERENCE_SEED), dict(W1)
+
+    manifest = json.loads(manifest_path.read_text())
+    items = manifest.get("items", {})
+    missing = [i for i in ids if i not in items]
+    if missing:
+        raise SystemExit(f"{manifest_path} has no entry for {missing}; the reference set and the prompt set disagree")
+
+    seeds = {i: int(items[i]["seed"]) for i in ids}
+    geometries = {json.dumps(items[i]["geometry"], sort_keys=True) for i in ids}
+    if len(geometries) != 1:
+        raise SystemExit(f"{manifest_path} mixes geometries across prompts: {sorted(geometries)}")
+    geometry = json.loads(next(iter(geometries)))
+    # request_fields takes exactly these; anything else in the manifest's
+    # geometry is informational and must not be forwarded blindly.
+    allowed = {"width", "height", "num_frames", "num_inference_steps", "guidance_scale"}
+    unexpected = set(geometry) - allowed
+    if unexpected:
+        raise SystemExit(f"{manifest_path} geometry has keys this driver does not know: {sorted(unexpected)}")
+    return seeds, geometry
 
 
 def main() -> int:
@@ -56,11 +96,19 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--warmup", action="store_true", default=True, help="one discarded request first")
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
+    parser.add_argument(
+        "--reference-manifest",
+        type=Path,
+        default=Path("/data/jooman/k6/ref/setA/manifest.json"),
+        help="the reference run's manifest, read for its per-prompt seed and geometry so this run "
+        "matches it. Pass a missing path to fall back to the defaults",
+    )
     parser.add_argument("--no-locks", action="store_true", help="accepted so run_when_free.py can pass it")
     args = parser.parse_args()
 
     prompt_set = json.loads(args.prompts.read_text())
     prompts = prompt_set["prompts"][: args.limit]
+    seeds, geometry = _reference_settings(args.reference_manifest, prompts)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # The same flags Track M's serve_pro_fp8.sh passes, so an arm measured
@@ -93,7 +141,8 @@ def main() -> int:
         "attention_config": args.arm,
         "compile_mode": args.compile_mode,
         "checkpoint": args.ckpt,
-        "geometry": W1,
+        "geometry": geometry,
+        "seeds": seeds,
         "prompt_set": prompt_set.get("set"),
         "prompts_file": str(args.prompts),
         "runs": [],
@@ -117,12 +166,13 @@ def main() -> int:
                 # The first request on a fresh server pays one-off costs no
                 # later request pays. Discarded, but it must succeed: a
                 # warm-up that fails means the arm is broken, not warm.
-                fields = request_fields(prompts[0]["prompt"], seed=prompts[0]["seed"], **W1)
+                first = prompts[0]
+                fields = request_fields(first["text"], seed=seeds[first["id"]], **geometry)
                 submit_and_fetch(server.base_url, fields, args.out_dir / "warmup.mp4")
                 print(f"{args.name}: warm-up ok", flush=True)
 
             for entry in prompts:
-                fields = request_fields(entry["prompt"], seed=entry["seed"], **W1)
+                fields = request_fields(entry["text"], seed=seeds[entry["id"]], **geometry)
                 destination = args.out_dir / f"{entry['id']}.mp4"
                 started = time.perf_counter()
                 try:
@@ -135,7 +185,7 @@ def main() -> int:
                 manifest["runs"].append(
                     {
                         "id": entry["id"],
-                        "seed": entry["seed"],
+                        "seed": seeds[entry["id"]],
                         "categories": entry.get("categories", []),
                         "seconds": round(time.perf_counter() - started, 3),
                         "mp4": destination.name,
