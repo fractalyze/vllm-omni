@@ -1,0 +1,77 @@
+{
+  "config": "pro",
+  "geometry": "w1",
+  "target": "fused",
+  "backend": "platform-default",
+  "attention_config_file": null,
+  "compile_modes": null,
+  "shapes": {
+    "height": 480,
+    "width": 864,
+    "num_frames": 121,
+    "fps": 24.0,
+    "text_len": 256,
+    "latent_frames": 31,
+    "latent_h": 30,
+    "latent_w": 54,
+    "visual_tokens": 50220,
+    "audio_len": 218
+  },
+  "dtype": "torch.bfloat16",
+  "torch": "2.13.0+cu132",
+  "device": "NVIDIA GeForce RTX 5090",
+  "locks_held": "run_when_free.py pid 1269420: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "foreign_gpu_procs": [],
+  "peak_allocated_gib": 7.634,
+  "timing": {
+    "median_ms": 392.97,
+    "min_ms": 392.802,
+    "max_ms": 393.348,
+    "spread_pct": 0.14,
+    "repeats": 3,
+    "all_ms": [
+      393.348,
+      392.802,
+      392.97
+    ]
+  },
+  "compare_compile": {
+    "shipped-eager": {
+      "median_ms": 392.51,
+      "min_ms": 390.529,
+      "max_ms": 393.653,
+      "spread_pct": 0.8,
+      "samples": 12
+    },
+    "shipped": {
+      "median_ms": 340.827,
+      "min_ms": 340.392,
+      "max_ms": 341.695,
+      "spread_pct": 0.38,
+      "samples": 12,
+      "delta_pct_vs_shipped-eager": -13.17,
+      "inside_control_spread": false
+    }
+  },
+  "output_deltas": {
+    "control_is_finite": true,
+    "shipped": {
+      "comparable": true,
+      "outputs": [
+        {
+          "output": 0,
+          "rel_l2": 0.00459014,
+          "max_abs": 0.0625,
+          "control_rms": 1.280632
+        },
+        {
+          "output": 1,
+          "rel_l2": 0.00437498,
+          "max_abs": 0.0625,
+          "control_rms": 1.279087
+        }
+      ]
+    }
+  },
+  "profile": null
+}

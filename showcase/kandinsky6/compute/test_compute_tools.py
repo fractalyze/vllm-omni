@@ -339,3 +339,180 @@ class AttentionArmConfigTest(parameterized.TestCase):
         """A new arm added without a row in ARMS would go untested."""
         on_disk = {path.name for path in self._arms_dir().glob("*.json")}
         self.assertEqual(on_disk, set(self.ARMS))
+
+
+class ArmSpecTest(parameterized.TestCase):
+    """`--compare-arm LABEL=ATTENTION@MODE`. A spec that parses wrongly would
+    silently measure a different arm than the label claims, which is worse
+    than an error."""
+
+    @parameterized.named_parameters(
+        ("platform_eager", "shipped-eager=default@eager", "shipped-eager", None, "eager"),
+        ("platform_compiled", "shipped=default@default", "shipped", None, "default"),
+        ("file_compiled", "tuned=arms/tuned.json@max-autotune", "tuned", "arms/tuned.json", "max-autotune"),
+        # A path with a drive-style colon and slashes must survive, which is
+        # why the separator is `@` rather than `:` or `/`.
+        ("absolute_path", "t=/a/b/c.json@default", "t", "/a/b/c.json", "default"),
+    )
+    def test_valid_specs(self, spec, label, attention, mode):
+        from block_profile import parse_arm_spec
+
+        got_label, got_attention, got_mode = parse_arm_spec(spec)
+        self.assertEqual(got_label, label)
+        self.assertEqual(None if got_attention is None else str(got_attention), attention)
+        self.assertEqual(got_mode, mode)
+
+    @parameterized.named_parameters(
+        ("no_label", "default@eager"),
+        ("no_mode", "x=default"),
+        ("empty_label", "=default@eager"),
+        ("empty_mode", "x=default@"),
+        ("empty_attention", "x=@eager"),
+    )
+    def test_invalid_specs_raise(self, spec):
+        from block_profile import parse_arm_spec
+
+        with self.assertRaises(ValueError):
+            parse_arm_spec(spec)
+
+
+class FlattenOutputsTest(absltest.TestCase):
+    def test_a_single_tensor_and_a_tuple_both_flatten(self):
+        import torch
+        from block_profile import _flatten_outputs
+
+        one = torch.zeros(2)
+        self.assertEqual(len(_flatten_outputs(one)), 1)
+        self.assertEqual(len(_flatten_outputs((one, one.clone()))), 2)
+
+    def test_a_none_in_the_tuple_is_dropped(self):
+        """The fused block returns (vis, aud) and aud is None for T2V."""
+        import torch
+        from block_profile import _flatten_outputs
+
+        self.assertEqual(len(_flatten_outputs((torch.zeros(2), None))), 1)
+
+
+class ParameterStorageTest(absltest.TestCase):
+    """`output_deltas` only reports a number when two arms share weights, and
+    it must recognize a compiled module as sharing them. torch.compile returns
+    an OptimizedModule whose parameter *names* are all prefixed `_orig_mod.`,
+    so a name-based comparison silently answers "not comparable" for every
+    compiled arm -- which it did, and which made the check useless exactly
+    where it was needed."""
+
+    def test_a_compiled_module_shares_its_own_storages(self):
+        import torch
+        from block_profile import _parameter_storages
+
+        module = torch.nn.Linear(4, 4)
+        compiled = torch.compile(module)
+        self.assertEqual(_parameter_storages(compiled), _parameter_storages(module))
+
+    def test_two_separate_modules_do_not(self):
+        import torch
+        from block_profile import _parameter_storages
+
+        self.assertNotEqual(
+            _parameter_storages(torch.nn.Linear(4, 4)),
+            _parameter_storages(torch.nn.Linear(4, 4)),
+        )
+
+
+class RopeTableTest(absltest.TestCase):
+    """`make_inputs` must build RoPE tables with the port's own modules.
+
+    A RoPE table's 2x2 blocks are [[cos, -sin], [sin, cos]], so `apply_rotary`
+    is a rotation and preserves the per-head norm that query_norm/key_norm
+    just set. An earlier version drew the table from `randn`, which makes it
+    an arbitrary linear map: the dense bf16 backends stayed finite, so it
+    looked harmless, but SageAttention's per-block INT8 scale is set by the
+    largest entry in a block and the visual self-attention returned NaN at W1.
+    """
+
+    def _tables(self, cfg_name="pro"):
+        import torch
+        from block_profile import CONFIGS, W1, Shapes, make_inputs
+
+        inputs = make_inputs("fused", CONFIGS[cfg_name], Shapes(**W1), torch.device("cpu"), torch.bfloat16)
+        return inputs["vis_rope"], inputs["aud_rope"]
+
+    def test_every_block_is_a_rotation(self):
+        import torch
+
+        for name, table in zip(("vis_rope", "aud_rope"), self._tables()):
+            blocks = table.reshape(-1, 2, 2)
+            dets = blocks[:, 0, 0] * blocks[:, 1, 1] - blocks[:, 0, 1] * blocks[:, 1, 0]
+            torch.testing.assert_close(dets, torch.ones_like(dets), rtol=0, atol=1e-5, msg=f"{name}: det != 1")
+            norms = blocks[:, 0, :].norm(dim=-1)
+            torch.testing.assert_close(norms, torch.ones_like(norms), rtol=0, atol=1e-5, msg=f"{name}: row norm")
+
+    def test_the_tables_have_the_shape_apply_rotary_broadcasts_against(self):
+        from block_profile import PRO, W1, Shapes
+
+        shapes = Shapes(**W1)
+        vis_rope, aud_rope = self._tables()
+        self.assertEqual(tuple(vis_rope.shape), (shapes.visual_tokens, 1, sum(PRO.axes_dims) // 2, 2, 2))
+        self.assertEqual(tuple(aud_rope.shape), (shapes.audio_len, 1, sum(PRO.axes_dims_a) // 2, 2, 2))
+
+    def test_the_tables_are_fp32(self):
+        """The port's apply_rotary upcasts to fp32; a bf16 table would quantize
+        the angles before the rotation."""
+        import torch
+
+        for table in self._tables():
+            self.assertEqual(table.dtype, torch.float32)
+
+    def test_lite_shapes_work_too(self):
+        """Lite's head_dim is 64, not 128, so the table halves with it."""
+        import torch
+        from block_profile import LITE, W1, Shapes, make_inputs
+
+        inputs = make_inputs("fused", LITE, Shapes(**W1), torch.device("cpu"), torch.bfloat16)
+        self.assertEqual(inputs["vis_rope"].shape[-3], sum(LITE.axes_dims) // 2)
+        self.assertTrue(torch.isfinite(inputs["vis_rope"]).all())
+
+
+class OutputDeltaControlTest(absltest.TestCase):
+    """A non-finite control must be named as such, not reported as NaN deltas.
+
+    This is the lesson of the RoPE bug: the check did run, and it did return
+    NaN for every arm, and a NaN rel_l2 reads as "could not tell" when it
+    should read as "the baseline is broken".
+    """
+
+    def test_a_nan_control_is_reported_as_a_broken_control(self):
+        import torch
+        from block_profile import output_deltas
+
+        class Nan(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, x):
+                return x * float("nan")
+
+        control = Nan()
+        result = output_deltas({"control": control, "other": control}, {"x": torch.ones(4)})
+        self.assertFalse(result["control_is_finite"])
+        self.assertIn("not finite", result["why"])
+
+    def test_a_finite_control_reports_per_arm_rows(self):
+        import torch
+        from block_profile import output_deltas
+
+        class Scale(torch.nn.Module):
+            def __init__(self, factor):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.factor = factor
+
+            def forward(self, x):
+                return x * self.factor
+
+        control = Scale(1.0)
+        result = output_deltas({"control": control, "same": control}, {"x": torch.ones(4)})
+        self.assertTrue(result["control_is_finite"])
+        self.assertTrue(result["same"]["comparable"])
+        self.assertEqual(result["same"]["outputs"][0]["rel_l2"], 0.0)

@@ -1,0 +1,129 @@
+{
+  "config": "pro",
+  "geometry": "w1",
+  "target": "fused",
+  "backend": "platform-default",
+  "attention_config_file": null,
+  "compile_modes": null,
+  "shapes": {
+    "height": 480,
+    "width": 864,
+    "num_frames": 121,
+    "fps": 24.0,
+    "text_len": 256,
+    "latent_frames": 31,
+    "latent_h": 30,
+    "latent_w": 54,
+    "visual_tokens": 50220,
+    "audio_len": 218
+  },
+  "dtype": "torch.bfloat16",
+  "torch": "2.13.0+cu132",
+  "device": "NVIDIA GeForce RTX 5090",
+  "locks_held": "run_when_free.py pid 1269420: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "foreign_gpu_procs": [],
+  "peak_allocated_gib": 7.634,
+  "timing": {
+    "median_ms": 391.855,
+    "min_ms": 391.706,
+    "max_ms": 391.992,
+    "spread_pct": 0.07,
+    "repeats": 3,
+    "all_ms": [
+      391.855,
+      391.992,
+      391.706
+    ]
+  },
+  "compare_compile": {
+    "tuned-eager": {
+      "median_ms": 279.91,
+      "min_ms": 278.611,
+      "max_ms": 281.036,
+      "spread_pct": 0.87,
+      "samples": 12
+    },
+    "tuned-default": {
+      "median_ms": 229.264,
+      "min_ms": 228.234,
+      "max_ms": 230.284,
+      "spread_pct": 0.89,
+      "samples": 12,
+      "delta_pct_vs_tuned-eager": -18.09,
+      "inside_control_spread": false
+    },
+    "tuned-reduce-overhead": {
+      "median_ms": 161.487,
+      "min_ms": 160.66,
+      "max_ms": 162.253,
+      "spread_pct": 0.99,
+      "samples": 12,
+      "delta_pct_vs_tuned-eager": -42.31,
+      "inside_control_spread": false
+    },
+    "tuned-max-autotune": {
+      "median_ms": 140.925,
+      "min_ms": 140.373,
+      "max_ms": 141.732,
+      "spread_pct": 0.96,
+      "samples": 12,
+      "delta_pct_vs_tuned-eager": -49.65,
+      "inside_control_spread": false
+    }
+  },
+  "output_deltas": {
+    "control_is_finite": true,
+    "tuned-default": {
+      "comparable": true,
+      "outputs": [
+        {
+          "output": 0,
+          "rel_l2": 0.0051998,
+          "max_abs": 0.09375,
+          "control_rms": 1.261274
+        },
+        {
+          "output": 1,
+          "rel_l2": 0.00443594,
+          "max_abs": 0.0625,
+          "control_rms": 1.257972
+        }
+      ]
+    },
+    "tuned-reduce-overhead": {
+      "comparable": true,
+      "outputs": [
+        {
+          "output": 0,
+          "rel_l2": 0.00519989,
+          "max_abs": 0.09375,
+          "control_rms": 1.261274
+        },
+        {
+          "output": 1,
+          "rel_l2": 0.00443815,
+          "max_abs": 0.0625,
+          "control_rms": 1.257972
+        }
+      ]
+    },
+    "tuned-max-autotune": {
+      "comparable": true,
+      "outputs": [
+        {
+          "output": 0,
+          "rel_l2": 0.00516134,
+          "max_abs": 0.09375,
+          "control_rms": 1.261274
+        },
+        {
+          "output": 1,
+          "rel_l2": 0.00444401,
+          "max_abs": 0.0625,
+          "control_rms": 1.257972
+        }
+      ]
+    }
+  },
+  "profile": null
+}
