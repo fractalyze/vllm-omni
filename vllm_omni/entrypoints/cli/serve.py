@@ -25,6 +25,7 @@ from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import DIFFUSION_COMPILE_MODES
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
@@ -603,6 +604,17 @@ class OmniServeCommand(CLISubcommand):
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
                 "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-mode",
+            choices=sorted(DIFFUSION_COMPILE_MODES),
+            default=None,
+            help=(
+                "torch.compile 'mode' for the generic diffusion compile scope. Unset leaves torch's own "
+                "default, which is what earlier releases used. 'reduce-overhead' and 'max-autotune' also "
+                "capture CUDA graphs and cost compile time; on a Kandinsky 6 Pro block at 50,220 tokens "
+                "they were worth 30% and 39% over the default mode."
             ),
         )
         omni_config_group.add_argument(

@@ -47,6 +47,10 @@ logger = init_logger(__name__)
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
+# ``mode`` values accepted by torch.compile. Kept as a module constant so the
+# config, the CLI and the tests cannot drift apart.
+DIFFUSION_COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"})
+
 
 def _move_diffusion_alias(
     normalized: dict[str, Any],
@@ -985,6 +989,14 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # ``mode`` forwarded to torch.compile. None leaves torch's own default,
+    # which is what every release before this flag used, so an unset value
+    # changes nothing. The non-default modes trade compile time, and
+    # "reduce-overhead" and "max-autotune" additionally capture CUDA graphs,
+    # for throughput: on a Kandinsky 6 Pro block at 50,220 tokens they were
+    # worth 30% and 39% over the default mode
+    # (showcase/kandinsky6/measurements.md).
+    diffusion_compile_mode: str | None = None
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1230,6 +1242,11 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if self.diffusion_compile_mode is not None and self.diffusion_compile_mode not in DIFFUSION_COMPILE_MODES:
+            raise ValueError(
+                f"diffusion_compile_mode must be None or one of {sorted(DIFFUSION_COMPILE_MODES)}, "
+                f"got {self.diffusion_compile_mode!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")

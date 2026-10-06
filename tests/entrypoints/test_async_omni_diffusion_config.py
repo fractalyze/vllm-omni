@@ -643,6 +643,47 @@ def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     assert engine_args["dlo_host_registration_limit_gib"] == 80
 
 
+def test_serve_cli_accepts_diffusion_compile_mode():
+    """``--diffusion-compile-mode`` must reach the diffusion stage's engine
+    args, not just parse. On a Kandinsky 6 Pro block at 50,220 tokens
+    "reduce-overhead" and "max-autotune" were worth 30% and 39% over the
+    default mode, and before this flag there was no way to ask for either."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Lightricks/LTX-Video-0.9.8-13B-distilled",
+            "--omni",
+            "--diffusion-compile-mode",
+            "max-autotune",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+
+    assert args.diffusion_compile_mode == "max-autotune"
+    assert stage_cfg["engine_args"]["diffusion_compile_mode"] == "max-autotune"
+
+
+def test_serve_cli_leaves_diffusion_compile_mode_unset_by_default():
+    """Unset must not appear in the engine args at all: the model runner omits
+    ``mode`` from the torch.compile call when it is None, and an explicit
+    default here would change every existing compiled artifact."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "Lightricks/LTX-Video-0.9.8-13B-distilled", "--omni"])
+
+    assert args.diffusion_compile_mode is None
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    assert "diffusion_compile_mode" not in stage_cfg["engine_args"]
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
