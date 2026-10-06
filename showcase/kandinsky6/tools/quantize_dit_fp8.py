@@ -213,12 +213,65 @@ def find_dit_weights(src_transformer: Path) -> list[Path]:
     return shards
 
 
+FORMATS = ("fp8", "compressed-tensors")
+
+
+def quantization_config(fmt: str, ignored_layers: list[str]) -> dict:
+    """The ``quantization_config`` the checkpoint declares for its weights.
+
+    ``fp8``: vLLM's native serialized FP8 -- per-tensor weight scales and one
+    dynamic scale per *activation tensor*. Cheap, and at W1 too coarse: with
+    50k tokens a single activation scale is set by the largest outlier token,
+    and the Pro FP8 arm failed the user's gate on set A (LPIPS mean 0.262,
+    worst frame 0.551).
+
+    ``compressed-tensors``: the FP8_DYNAMIC scheme -- one scale per output
+    channel of each weight and one dynamic scale per *token* of each activation.
+    Same storage and the same FP8 GEMM, far finer scales on both operands.
+    """
+    if fmt == "fp8":
+        return {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": None,
+            "ignored_layers": ignored_layers,
+        }
+    if fmt == "compressed-tensors":
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "quantization_status": "compressed",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "channel",
+                        "dynamic": False,
+                        "symmetric": True,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "token",
+                        "dynamic": True,
+                        "symmetric": True,
+                    },
+                }
+            },
+            "ignore": ignored_layers,
+        }
+    raise ValueError(f"unknown format {fmt!r}; expected one of {FORMATS}")
+
+
 def quantize_checkpoint(
     src: Path,
     dst: Path,
     *,
     keep: str = "sensitive",
     granularity: str = "tensor",
+    fmt: str = "fp8",
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, object]:
     """Write an FP8 copy of ``src``'s transformer into ``dst``; link the rest."""
@@ -287,12 +340,7 @@ def quantize_checkpoint(
     # this checkpoint does not carry -- which reads back as whatever was in its
     # uninitialized allocation, and the first forward returns NaN.
     ignored_layers = sorted({module_path(name).removesuffix(".weight") for name in kept_names})
-    config["quantization_config"] = {
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "weight_block_size": None,
-        "ignored_layers": ignored_layers,
-    }
+    config["quantization_config"] = quantization_config(fmt, ignored_layers)
     with (dst_transformer / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
@@ -315,6 +363,7 @@ def quantize_checkpoint(
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
         "scale_granularity": granularity,
+        "format": fmt,
         "keep_profile": keep,
         "compression": bytes_in / bytes_out if bytes_out else None,
         "seconds": time.perf_counter() - started,
@@ -359,6 +408,12 @@ def main() -> None:
         default="tensor",
         help="scale granularity; 'tensor' is what vLLM's native fp8 method loads",
     )
+    parser.add_argument(
+        "--format",
+        choices=FORMATS,
+        default="fp8",
+        help="checkpoint format; compressed-tensors implies per-channel weight scales and per-token activations",
+    )
     parser.add_argument("--shard-gib", type=float, default=4.0)
     args = parser.parse_args()
 
@@ -366,7 +421,8 @@ def main() -> None:
         args.src.resolve(),
         args.dst.resolve(),
         keep=args.keep,
-        granularity=args.scale,
+        granularity="channel" if args.format == "compressed-tensors" else args.scale,
+        fmt=args.format,
         shard_bytes=int(args.shard_gib * 1024**3),
     )
     report_path = args.dst / "quantization_report.json"
