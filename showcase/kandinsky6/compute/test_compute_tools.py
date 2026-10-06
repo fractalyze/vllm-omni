@@ -296,6 +296,26 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # The band dial: the same Sage2 kernel on the same roles, restricted to a
+        # range of visual blocks so the ends of the stack keep exact attention.
+        # Only the range differs between the three, which is the point -- the
+        # band is the free parameter once the weights are BF16 and the kernel is
+        # chosen.
+        "sage2-wide.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        "sage2-mid.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        "sage2-narrow.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
         # The same roles, with Sage's accuracy knobs on: FP16 PV with FP32
         # accumulation and per-thread INT8 granularity.
         "sage2-accurate.json": {
@@ -939,3 +959,39 @@ class DistributionalGateTest(absltest.TestCase):
         from clip_gate import g3_verdict
 
         self.assertFalse(g3_verdict(0.3, 0.0)["decidable"])
+
+
+class BandedArmTest(parameterized.TestCase):
+    """The three banded arms differ only in their layer range.
+
+    They exist to measure one dial, so anything else differing between them
+    would make the curve measure two things at once.
+    """
+
+    BANDS = {"sage2-wide.json": "3:57", "sage2-mid.json": "6:54", "sage2-narrow.json": "12:48"}
+
+    def _arm(self, filename):
+        import json
+
+        return json.loads((Path(__file__).resolve().parent / "arms" / filename).read_text())
+
+    @parameterized.parameters(*sorted(BANDS))
+    def test_the_range_is_the_only_difference_from_the_others(self, filename):
+        import copy
+
+        reference = copy.deepcopy(self._arm("sage2-mid.json"))
+        candidate = copy.deepcopy(self._arm(filename))
+        for arm in (reference, candidate):
+            arm["per_role"]["kandinsky6"]["visual_self"].pop("layers")
+        self.assertEqual(candidate, reference)
+
+    @parameterized.parameters(*sorted(BANDS.items()))
+    def test_each_band_is_the_range_it_is_named_for(self, filename, layers):
+        self.assertEqual(self._arm(filename)["per_role"]["kandinsky6"]["visual_self"]["layers"], layers)
+
+    @parameterized.parameters(*sorted(BANDS.items()))
+    def test_the_range_is_symmetric_about_a_sixty_block_stack(self, filename, layers):
+        """Kandinsky 6 Pro has 60 visual blocks and the schedule protects both
+        ends, so an asymmetric band would be measuring two changes."""
+        start, stop = (int(part) for part in layers.split(":"))
+        self.assertEqual(start, 60 - stop, f"{filename}: {start} exact at the front, {60 - stop} at the back")
