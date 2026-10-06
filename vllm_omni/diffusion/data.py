@@ -2117,6 +2117,55 @@ class BlockSparseSpec:
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
+def _parse_layer_range(layers: str | None) -> tuple[int | None, int | None] | None:
+    """``"start:stop"`` -> bounds, with either side optional.
+
+    Rejected rather than ignored when malformed: a schedule that silently
+    becomes "every layer" would be measured as a schedule and reported as one
+    while being the plain arm.
+    """
+    if layers is None:
+        return None
+    if not isinstance(layers, str) or layers.count(":") != 1:
+        raise ValueError(f"AttentionSpec.layers must look like 'start:stop', got {layers!r}")
+    bounds: list[int | None] = []
+    for part in layers.split(":"):
+        part = part.strip()
+        if not part:
+            bounds.append(None)
+            continue
+        try:
+            bounds.append(int(part))
+        except ValueError as exc:
+            raise ValueError(f"AttentionSpec.layers bound {part!r} is not an integer") from exc
+    start, stop = bounds
+    if start is not None and start < 0:
+        raise ValueError(f"AttentionSpec.layers start must not be negative, got {start}")
+    if start is not None and stop is not None and stop <= start:
+        raise ValueError(f"AttentionSpec.layers range {layers!r} is empty")
+    return start, stop
+
+
+def layer_range_contains(bounds: tuple[int | None, int | None] | None, layer_index: int | None) -> bool:
+    """Whether a spec restricted to ``bounds`` applies to ``layer_index``.
+
+    An unrestricted spec applies everywhere. A restricted spec does **not**
+    apply to a layer whose index could not be determined, because applying it
+    there would make the schedule depend on whether a module happened to carry a
+    parseable prefix.
+    """
+    if bounds is None:
+        return True
+    if layer_index is None:
+        return False
+    start, stop = bounds
+    if start is not None and layer_index < start:
+        return False
+    if stop is not None and layer_index >= stop:
+        return False
+    return True
+
+
 @dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
@@ -2127,10 +2176,22 @@ class AttentionSpec:
     fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    layers: str | None = None
+    """Half-open range of transformer layer indices this spec applies to, ``"start:stop"``.
+
+    A faster, lower-precision attention backend is not equally safe in every
+    block of a diffusion transformer, so this allows a *schedule*: the quick
+    kernel through the middle of the stack and the platform default at the ends,
+    where a perturbation has the most of the network left to amplify it. Either
+    bound may be omitted (``":8"``, ``"52:"``). A layer outside the range falls
+    through to the next entry in the lookup, exactly as if this spec were absent
+    -- so a schedule narrows where a backend applies and never widens it.
+    """
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        self.layer_range = _parse_layer_range(self.layers)
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
@@ -2271,7 +2332,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse", "layers"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
@@ -2292,16 +2353,27 @@ class AttentionConfig:
         self,
         role: str = "self",
         role_category: str | None = None,
+        layer_index: int | None = None,
     ) -> tuple[AttentionSpec | None, str | None]:
-        """Resolve the AttentionSpec and report which config entry matched."""
+        """Resolve the AttentionSpec and report which config entry matched.
+
+        A spec carrying a ``layers`` range is skipped for layers outside it, so
+        the lookup continues to the category fallback, then the default, then
+        the platform default -- which is how a schedule puts the quick kernel in
+        the middle of the stack and leaves the ends alone.
+        """
+
+        def applies(spec: "AttentionSpec | None") -> bool:
+            return spec is not None and layer_range_contains(getattr(spec, "layer_range", None), layer_index)
+
         spec = self.per_role.get(role)
-        if spec is not None:
+        if applies(spec):
             return spec, f"attention_config.per_role[{role!r}]"
         if role_category is not None:
             spec = self.per_role.get(role_category)
-            if spec is not None:
+            if applies(spec):
                 return spec, f"attention_config.per_role[{role_category!r}] (role_category fallback)"
-        if self.default is not None:
+        if applies(self.default):
             return self.default, "attention_config.default"
         return None, None
 
