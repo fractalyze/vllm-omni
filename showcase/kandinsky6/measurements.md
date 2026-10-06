@@ -888,3 +888,32 @@ and a session script spends the window.
 `attn_race.py --arms` takes the arm list; dropping `FLASHINFER_ATTN` on sm_120
 saves about 90 s a role. `python block_profile.py --list-shapes` prints the
 derived token counts the table's shapes come from.
+
+The served arms and their gate numbers:
+
+```bash
+cd showcase/kandinsky6/compute
+# One arm's W1 outputs for a prompt set, from real served requests.
+#   --offload dlo-mmap    exact BF16 weights, the reference's own weight path
+#   --offload layerwise   a pre-quantized checkpoint staged from pinned host RAM
+#   --quantization '{"method": "..."}'   quantize at load from the exact checkpoint
+#   --resident-layers N   keep N leading DiT blocks on the device (lossless)
+python run_when_free.py --need-free-gib 30 -- python gate_pro.py     --arm arms/sage2-mid.json --name sage2-mid --offload dlo-mmap     --out-dir /data/jooman/k6/results/gate-pro/sage2-mid
+
+# G1 and G2. The floor comes from the reference measured against itself,
+# compiled against eager; without it G2 reports "undecided" rather than a pass.
+python gate_pro_score.py --arm-dir /data/jooman/k6/results/gate-pro/sage2-mid     --reference-dir /data/jooman/k6/ref-eager/setA     --g2-floor-mean 0.1455 --g2-floor-max 0.4160
+
+# G3 and the contact sheet. CPU by default: the GPU belongs to whatever is timed.
+CUDA_VISIBLE_DEVICES= python clip_gate.py     --arm-dir /data/jooman/k6/results/gate-pro/sage2-mid     --reference-dir /data/jooman/k6/ref-eager/setA --contact-sheet sheet.jpg
+```
+
+Scoring runs on the GPU unless `CUDA_VISIBLE_DEVICES=` is set, and it takes the
+host locks for that reason: a scorer that ignores them steals memory from a
+timed run, which happened once here and cost a measurement.
+
+What a one-byte weight costs, without a GPU at all:
+
+```bash
+python showcase/kandinsky6/tools/weight_quant_error.py --limit 24
+```
