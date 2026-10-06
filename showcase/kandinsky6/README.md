@@ -134,6 +134,10 @@ on build-server-3, because its page cache is capped with the server at 40 GB.
 | INT8 weight-only + Sage2 + exact step 1 | G2 + G3, set A only (fails set B on b6, b3) | 168.07 s (167.62-168.91) | -3.5% |
 | BF16 reference (its own gate run, not in the session) | all, by definition | 234.6 s (233.4-243.3), n=9 | +34.7% |
 
+Scored on all nine set-B prompts, after b9's eager reference was generated,
+this arm is at 0.1502 / 0.3380 against the bs2 set-B floor of 0.1447 / 0.3396
+(limits 0.1809 / 0.4245): it still passes.
+
 On build-server-2 this arm is 19.5% faster than the reference and 8.5% slower
 than the FP8 baseline that fails every gate. The INT8 arm is the only one
 faster than the baseline that passes a working gate, and it does so on set A
