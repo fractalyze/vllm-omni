@@ -9,6 +9,106 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## What actually limits W1 on one 5090, and what a one-byte weight costs
+
+Three measurements that together pick the arms worth running. All on
+Kandinsky 6 **Pro-distill** at W1 (864x480, 121 frames, 10 PiFlow steps,
+guidance 1.0, audio on; 50,220 visual tokens through 60 blocks), scored against
+Track M's canonical BF16 reference for prompt set A.
+
+### The streamed BF16 arm is compute-bound with the platform's attention
+
+The Pro DiT is **56.14 GiB** in BF16 -- 60 visual blocks of 0.899 GiB, four text
+blocks totalling 2.13 GiB, 0.09 GiB of embeddings and heads -- which fits
+neither the 32 GB board nor the 60 GB host. It runs from the mmapped checkpoint
+(`--enable-distributed-layerwise-offload --dlo-no-use-allgather`), so every one
+of the 10 steps re-reads all of it.
+
+| streamed BF16 arm | s/step | request (median) |
+|---|---:|---:|
+| platform default attention (cuDNN), = the reference's configuration | 21.9 | ~240 s |
+| `arms/tuned.json` (Sage2 on `visual_self` and `video_audio_cross`) | 14.3-14.6 | **165.9 s** |
+
+During the run `iostat` showed **1.67 GB/s** from `nvme0n1` with `Cached:
+59.4 GB` and `Mapped: 57.0 GB`: about 24 GB of each step's 60.3 GB comes from
+the device and 36 GB from the page cache, a hit rate near 0.6 -- which is what
+LRU gives for a sequential rescan of a working set 1.06x the cache.
+
+So the stream is worth about 15 s/step, cuDNN's compute about 22 s, and Sage2
+takes the arm down **to the stream's floor and no further**. Two things follow.
+A faster attention kernel is worth a third of this arm's wall time, not the
+-37.4% it was worth on the pinned FP8 arm. And 14.5 s/step is the floor for BF16
+weights however fast attention gets, so an arm that wants to be fast has to cut
+bytes *and* keep the GEMMs fast.
+
+### SageAttention2 fails the user's gate on exact weights
+
+The same arm's quality, so the only difference from the reference is the
+attention kernel:
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| G1 limits | | 0.15 | 0.25 |
+| a5-waterfall-drone | motion | 0.0451 | 0.0478 |
+| a1-portrait-speech | face, speech | 0.0495 | 0.0865 |
+| a4-chalkboard | text, face, speech | 0.1391 | 0.1756 |
+| a2-neon-signage | text, motion | 0.1551 | 0.1780 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1570 | 0.2128 |
+| a9-violinist | face, motion | 0.1806 | **0.2822** |
+| a3-sprint-start | motion, face, sharp-sound | 0.2435 | **0.3277** |
+| a7-cafe-menu | text, face | 0.2634 | **0.2908** |
+| a8-skateboard-crash | motion, sharp-sound | 0.2805 | **0.3693** |
+| **set** | | **0.1682** | **0.3693** |
+
+Four of nine prompts over the max. This is the Lite screen's failure (mean
+0.118, max 0.375) reproduced on Pro against a real reference, and it refutes an
+inference worth recording because it was wrong in an instructive way: the FP8
+stack with Sage2 scored 0.2791 and FP8 alone 0.262, from which we had reasoned
+that attention was worth about 0.017. It is worth 0.168. Perceptual errors of
+this kind do not add -- the larger one hides the smaller -- so a stacked
+measurement attributes nothing to its smaller component.
+
+### FP8's weight error ignores scale granularity; INT8's does not
+
+`tools/weight_quant_error.py` quantizes the checkpoint's own tensors and reports
+the relative error of one quantize/dequantize round trip,
+`||W - dequant(quant(W))||_F / ||W||_F`. It needs no GPU, no server and no video,
+because it asks only about the weights. Median over 14 sampled 2-D weights
+spread across the stack:
+
+| format | per-tensor scale | per-output-row scale |
+|---|---:|---:|
+| FP8 E4M3 | 0.02645 | 0.02643 |
+| INT8 | 0.02057 | **0.00908** |
+
+**FP8's error does not care about the scale.** E4M3 carries its own 4-bit
+exponent, so a finer scale only slides the matrix along the exponent ladder
+while the quantization step stays at the 3-bit mantissa. It holds even for the
+sampled tensor whose amax is 76x its median row's
+(`va_modulation.out_layer`, where per-row INT8 is 2.5x better and per-row FP8 is
+1.01x better).
+
+That retires three hypotheses at once, before any of them cost a GPU hour: a
+per-row FP8 checkpoint, a wider FP8 keep profile, and FP8 scale tuning in
+general. It also explains the two things the gate numbers had made puzzling --
+why the measured 0.262 did not move between the `minimal` (15 tensors kept in
+BF16) and `sensitive` (367) keep profiles, since the error is per-weight and
+uniform rather than concentrated; and why a per-row-weight plus
+per-token-activation FP8 recipe scored *worse* at 0.338-0.364, since the weight
+half bought nothing and the activation half added a second error.
+
+INT8 is fixed point, so there the scale **is** the step, and a per-row scale buys
+real precision: 2.9x less error than FP8 for the same one byte per weight. The
+recipe DB's MiniMax-H3 entry, the nearest joint video+audio analogue, used INT8
+linears for the same reason (inherited evidence,
+`/data/jooman/k6/db/EVIDENCE.md`).
+
+vLLM-Omni serves it from the exact published checkpoint with no conversion step:
+`--diffusion-quantization-config int8` is `DiffusionInt8Config`, which quantizes
+each tensor as the checkpoint streams -- per-output-channel weight scales with
+dynamic per-token activation scales, so the GEMMs run on INT8 tensor cores, and
+`ignored_layers` can hold named layers in BF16 without rebuilding anything.
+
 ## The quality gate: SageAttention on Kandinsky 6 is lossy, not approx
 
 This is the section that decides whether the speed numbers below are
