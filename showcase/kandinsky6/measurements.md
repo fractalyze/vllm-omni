@@ -66,6 +66,56 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## Where the reference was generated matters as much as how
+
+Two of this host's server processes, started 40 minutes apart with compile on
+and no determinism flags, produced **byte-identical MP4s** on the same prompts
+and seeds. Compiled execution is therefore not run-to-run random. Inductor
+benchmarks candidate kernels, picks by measured latency, and **caches the choice
+on disk** (`/tmp/torchinductor_$USER`, 1.2 GB here); once that cache is warm the
+choice is fixed and so is the output.
+
+So this pipeline has three different floors, with three different causes:
+
+| pairing | LPIPS mean / max | cause |
+|---|---:|---|
+| same host, warm cache, two processes | **0.0000 / 0.0000** | none; bit-identical |
+| different hosts, both compiled | 0.0272 / 0.0636 (a1) | each host's autotune choices |
+| same host, compiled vs eager | 0.1455 / 0.4160 | two fixed, different kernel sets |
+
+### What that does to every number above
+
+An arm scored against a reference from another machine is charged for that
+machine's autotune choices as well as for its own approximation. Scoring four
+arms against a reference generated **here**, on a1 and a2, the two prompts for
+which both sides exist locally:
+
+| arm | a1 mean / max | a2 mean / max | 2-prompt mean |
+|---|---:|---:|---:|
+| Sage2 everywhere | 0.0422 / 0.0486 | 0.1999 / 0.2134 | 0.1210 |
+| **`sage2-mid`** (blocks 6-53) | **0.0194 / 0.0369** | **0.1657 / 0.1827** | **0.0925** |
+| `sage2-wide` (blocks 3-56) | 0.0271 / 0.0354 | 0.2157 / 0.2283 | 0.1214 |
+| `sage2-accurate` | 0.0582 / 0.1090 | 0.2099 / 0.2356 | 0.1340 |
+
+The same Sage2 arm's a1 reads **0.0676** against the remote eager reference,
+**0.0422** against the remote compiled one, and the scheduled arm reads
+**0.0194** against a local control. The arm did not change; the reference did.
+
+And the band ordering, which [the band section](#the-block-schedule-speed-is-linear-in-the-band-quality-is-not-resolvable-by-a-screen)
+reports as unresolvable, resolves cleanly once the cross-host term is gone:
+twelve exact blocks are worth 24% of the error, six are worth nothing, and the
+accuracy knobs are the worst of the four. **That earlier conclusion was about
+the measurement, not about the arms**, and it is left in place above rather than
+rewritten, because the sequence is the point: a difference that sits under the
+noise of one comparison can be plain in a better-conditioned one.
+
+### What to do instead
+
+Pin `TORCHINDUCTOR_CACHE_DIR` to a shared path and prime it once, for the
+reference and every arm. It costs nothing, keeps compiled speed, and removes a
+term that was larger than the effects being measured -- without
+`TORCHINDUCTOR_DETERMINISTIC` and without falling back to eager.
+
 ## The pipeline's own numerical floor is larger than the gate
 
 Track M measured it on set A: the same BF16 checkpoint through the same weight
