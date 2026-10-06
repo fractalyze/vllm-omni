@@ -9,6 +9,61 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## The block schedule: speed is linear in the band, quality is not resolvable by a screen
+
+`AttentionSpec.layers` turns "which attention kernel" into "which blocks get the
+fast kernel", so the band of exact blocks at the two ends of the stack is a dial.
+Three settings, all on the exact BF16 streamed arm with Sage2 on `visual_self`:
+
+| arm | exact blocks | request (steady) |
+|---|---:|---:|
+| Sage2 everywhere (`tuned.json`) | 0 | 164.8 s |
+| `sage2-wide` (3:57) | 6 | 170.6 s |
+| `sage2-mid` (6:54) | 12 | 179.1 s |
+| platform default everywhere | 60 | 231.8 s |
+
+**Speed is linear in the band at about 1.0 s a request per exact block**, which
+is what the kernel race predicts: 60 blocks x (177.66 - 70.53) ms of attention
+over 10 steps is 64 s across the whole stack, or 1.07 s a block. Nothing
+surprising, and worth stating because it means the band can be chosen to hit a
+latency target rather than searched.
+
+Each number above is the **second** request of its run. The first carries
+compilation -- `sage2-wide`'s was 185.9 s against its steady 170.6 s -- so an
+arm screened without a warm-up and compared against one screened with a warm-up
+reads 15 s slower than it is.
+
+### Quality, and why these screens cannot order the bands
+
+Two-prompt screens against the eager reference, with the full set for the one
+arm that has one:
+
+| arm | a1 | a2 | screen mean | full set A |
+|---|---:|---:|---:|---:|
+| Sage2 everywhere | 0.0676 | 0.2462 | 0.1569 (1.08x floor) | **0.1858 (1.28x)** |
+| `sage2-wide` | 0.0577 | **0.2828** | 0.1703 (1.17x) | — |
+| `sage2-mid` | 0.0579 | 0.2291 | 0.1435 (0.99x) | — |
+
+Two things are wrong with reading a gate off that table, and both are worth
+keeping.
+
+**The screen underestimates the set.** For the one arm where both numbers exist,
+two prompts gave 0.1569 and the nine-prompt set gave 0.1858 -- 18% higher, and
+across the bar. a1 is the easiest prompt for every arm measured here and a2 the
+one that separates them, which makes them a good pair for *choosing what to run*
+and a bad pair for deciding anything.
+
+**And the ordering inverts.** `sage2-wide` approximates six blocks fewer than
+Sage2-everywhere and scored *worse* on a2, 0.2828 against 0.2462. That cannot be
+a property of the band. It is what a difference of 0.02-0.05 looks like when the
+pipeline's own compile floor has a set mean of 0.1455: the bands are separated
+by less than the noise they are measured through, so a single sample per prompt
+cannot order them.
+
+So the band was chosen on the only signal that survives -- `sage2-mid` is the
+one band better than Sage2-everywhere on *both* screened prompts -- and the
+decision is made on its full nine-prompt set, not on the screen.
+
 ## The pipeline's own numerical floor is larger than the gate
 
 Track M measured it on set A: the same BF16 checkpoint through the same weight
