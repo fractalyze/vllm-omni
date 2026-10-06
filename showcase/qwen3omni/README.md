@@ -124,13 +124,10 @@ vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
 vLLM's Marlin MoE always gives the same bits across identical requests on
 this branch, so `control_marlin.yaml`'s thinker repeats its text. Upstream,
 `moe_align_block_size` orders each expert's rows with atomics, and Marlin's
-split-K sums follow that order
-([vllm-project/vllm#52525](https://github.com/vllm-project/vllm/issues/52525)).
-The branch carries vLLM PR
-[#48032](https://github.com/vllm-project/vllm/pull/48032)'s deterministic
-alignment kernels (`vllm_omni/model_executor/layers/marlin_moe_align/`) as a
-patch of `marlin_moe.moe_align_block_size`, since it pins upstream
-`vllm==0.30.0`.
+split-K sums follow that order (vLLM issue 52525). The branch carries vLLM
+PR 48032's deterministic alignment kernels
+(`vllm_omni/model_executor/layers/marlin_moe_align/`) as a patch of
+`marlin_moe.moe_align_block_size`, since it pins upstream `vllm==0.30.0`.
 
 - The kernels replace vLLM's alignment rather than adding to it: in one
   session, the Marlin deploy's TTFT (16 ms) and TTFA (39 ms) medians were

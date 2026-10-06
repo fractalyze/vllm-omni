@@ -1,7 +1,58 @@
 # Qwen3-Omni speech measurements
 
 Stock vLLM-Omni, the deterministic Marlin arm and the kernel arm, served one
-after another in one session on one RTX 5090 on 2026-10-02, from one venv.
+after another in one session on one RTX 5090, from one venv. The latest
+session is first; earlier sessions are kept below as history.
+
+## 2026-10-06
+
+This branch at `1f2cae18`
+([#15](https://github.com/fractalyze/vllm-omni/pull/15)): Marlin MoE always
+aligns routes with vLLM PR 48032's kernels, and `VLLM_OMNI_DETERMINISTIC_MARLIN`
+no longer exists.
+
+Every column but WER is median (min–max).
+
+| Arm | TTFT | TTFA | TTFA, probes | Text, tok/s | RTF | Distinct texts per prompt | WER |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stock | 56 ms (49–60) | 214 ms (206–226) | 213 ms (206–215) | 64.1 (64.1–64.9) | 0.111 (0.104–0.114) | 1, 1, 1 | 1.59% |
+| deterministic Marlin | 16 ms (14–16) | 39 ms (37–41) | 38 ms (37–43) | 188.7 (188.7–188.7) | 0.059 (0.057–0.061) | 1, 1, 1 | 2.64% |
+| kernels | 16 ms (15–21) | **23 ms** (21–25) | **23 ms** (22–25) | **238.1** (238.1–238.1) | **0.052** (0.051–0.053) | 1, 1, 1 | 1.01% |
+
+- The protocol is the 2026-10-02 session's (below): three prompts five times
+  each after one warm-up request, then 15 probe requests on the same server;
+  WER with Qwen3-ASR-1.7B over the 15 timed replies.
+- Every arm's 15 timed texts and audio files are byte-identical to the
+  2026-10-02 session's, so WER and its split by prompt are unchanged
+  (stock 4.4%, 0.0%, 0.3%; Marlin 6.3%, 0.0%, 0.2%; kernels 2.2%, 0.0%,
+  0.6%).
+- The Marlin arm's TTFT and TTFA are 2–3 ms lower than in 2026-10-02, when a
+  sort after vLLM's alignment made it deterministic.
+- Text speed is the inverse of the server's pace between streamed text
+  deltas: 15.6, 5.3 and 4.2 ms a token at the medians.
+
+| Arm | vLLM-Omni commit | Deploy config | CUDA MPS | Switches |
+|---|---|---|---|---|
+| stock | `69de153f` | decode-mk's `control/qwen3omni/production.yaml` | no | none |
+| deterministic Marlin | `1f2cae18` | `showcase/qwen3omni/control_marlin.yaml` | yes | `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1` `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96` `VLLM_OMNI_CODE2WAV_STREAM_GRAPHS=1` `VLLM_OMNI_FRAME0=1` `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` |
+| kernels | `1f2cae18` | `showcase/qwen3omni/kernels.yaml` | yes | `VLLM_OMNI_THINKER_MEGAKERNEL=1` `VLLM_OMNI_THINKER_MEGAKERNEL_CTAS=64` `VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL=1` `VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS=128` `VLLM_OMNI_TALKER_MEGAKERNEL=1` `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1` `VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96` `VLLM_OMNI_CODE2WAV_STREAM_GRAPHS=1` `VLLM_OMNI_CODE2WAV_COMPILE=1` `VLLM_OMNI_FRAME0=1` `VLLM_OMNI_EARLY_CHUNK=1` `VLLM_OMNI_FRAME0_AUDIO=1` `VLLM_OMNI_TALKER_PREP=1` `VLLM_OMNI_FAST_POLL=1` `VLLM_OMNI_THINKER_YIELD=1` `VLLM_OMNI_TALKER_PREPREFILL=1` `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` |
+
+Each arm's stage 1 loaded the same talker compile artifact as in 2026-10-02:
+
+| Arm | Artifact | Files | sha256 of its files |
+|---|---|---:|---|
+| stock | `2ba9d68299c4757b…` | 45 | `daf25361c036de0c…` |
+| deterministic Marlin | `8b3fbc760decae24…` | 1505 | `f1a3b750695e5131…` |
+| kernels | `8b3fbc760decae24…` | 1505 | `f1a3b750695e5131…` |
+
+Loading `8b3fbc76…` again logs the four `Cubin file saved by TritonBundler
+not found` warnings in both arms.
+
+## 2026-10-02
+
+The first session, at `379804a6`, before the deterministic Marlin MoE fix
+moved into vLLM PR 48032's alignment kernels. Its texts and audio are
+byte-identical to the 2026-10-06 session's.
 
 Every column but WER is median (min–max).
 
@@ -29,7 +80,7 @@ Every column but WER is median (min–max).
 | deterministic Marlin | 6.3% | 0.0% | 0.2% |
 | kernels | 2.2% | 0.0% | 0.6% |
 
-## Arms
+### Arms
 
 Every arm serves `cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit` (snapshot
 `d6e1eff8`) with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
@@ -52,7 +103,7 @@ Every arm serves `cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit` (snapshot
   ([#15](https://github.com/fractalyze/vllm-omni/pull/15)). To serve an arm
   now, drop that switch.
 
-## Talker compile artifact
+### Talker compile artifact
 
 The talker's prompt runs on vLLM's compiled forward, and two compile
 artifacts can round differently (see the README's talker notes). Each arm's
@@ -107,8 +158,9 @@ $DMK/control/qwen3omni/serve.sh stop
   print(f"probe ttfa: {statistics.median(ttfa):.0f} ms ({min(ttfa):.0f}-{max(ttfa):.0f})")'
   ```
 
-- The two `379804a6` arms set their switches in the environment of
-  `serve.sh start` and pass it `--mps`.
+- The deterministic Marlin and kernel arms set their switches (the latest
+  session's table) in the environment of `serve.sh start` and pass it
+  `--mps`.
 - Keep `S2MK_RUN_DIR` short: `serve.sh` puts the MPS control socket under it,
   and a Unix socket path over 108 bytes stops the daemon.
 - `bench.py wer --out <arm> --asr-url http://127.0.0.1:8000` scores an arm
