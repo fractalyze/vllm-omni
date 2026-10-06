@@ -154,7 +154,7 @@ in measurements.md, "Where the headline arm's time goes"):
 | BF16 GEMMs | 94 s (54% of denoise) | a narrower one-byte band; every wider format tried fails the gate |
 | exact cuDNN attention (step 1 + 12 edge blocks) | 30.4 s | a faster **exact** kernel, which cannot fail the gate; 2x would save ~15 s |
 | Sage2 attention (blocks 6-53) | 30.6 s | already the fast kernel |
-| video VAE decode (spatially untiled already; 16-frame chunks every 12) | 18.9 s | temporal-chunk overlap (~1/4) or the decoder's kernels; unscreened |
+| video VAE decode (tiling planned per call from free GPU memory; 16-frame chunks every 8) | 18.9 s | a deterministic plan (14.8 s when it gets full-frame tiles) and less temporal overlap |
 | other kernels (norms, RoPE, elementwise) | 5.5 s | -- |
 | GPU idle while weights stream from NVMe | 8.6 s | already overlapped |
 | text encoders, audio decode, mux | < 1 s | none |
