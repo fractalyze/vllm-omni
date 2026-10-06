@@ -103,7 +103,9 @@ class TestAttentionSpec:
     @pytest.mark.parametrize(
         "spec, match",
         [
-            ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "only supported by the TRTLLM_ATTN"),
+            # The message now lists QUANT_SPEC_BACKENDS, so match on the part
+            # that does not move when a backend joins the set.
+            ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "quant is only supported by the"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int4"}}, "quant.dtype_qk"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8", "k_block_size": 8}}, "quant.k_block_size"),
         ],
@@ -111,6 +113,16 @@ class TestAttentionSpec:
     def test_quant_validation_rejects(self, spec, match):
         with pytest.raises(ValueError, match=match):
             AttentionSpec(**spec)
+
+    def test_quant_accepted_on_sage_attn(self):
+        """SAGE_ATTN reads the quant spec: ``dtype_vo`` chooses between its FP8
+        and FP16-with-FP32-accumulation value paths, and ``q_block_size``
+        chooses per-thread or per-warp INT8 scale granularity. Those are the
+        knobs that trade its accuracy back, and the fast default failed the
+        Kandinsky 6 showcase's quality gate."""
+        spec = AttentionSpec(backend="SAGE_ATTN", quant={"dtype_qk": "int8", "dtype_vo": "float16"})
+        assert spec.quant is not None
+        assert spec.backend_kwargs()["quant"]["dtype_vo"] == "float16"
 
     def test_fastvideo_vsa_topk_serialized(self):
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)

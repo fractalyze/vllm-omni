@@ -2059,6 +2059,17 @@ class AttnQuantSpec:
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
 
+# Backends that read ``AttentionSpec.quant``. Named as a set, like
+# BLOCK_SPARSE_BACKENDS above, so adding one is a single edit rather than a
+# tuple buried in a validation branch.
+#
+# SAGE_ATTN reads ``dtype_vo`` to choose between its FP8 and FP16-with-FP32-
+# accumulation value paths and ``q_block_size`` to choose per-thread or
+# per-warp INT8 scale granularity. Those are the knobs that trade its accuracy
+# back, and on Kandinsky 6 the fast default failed the showcase's quality gate
+# (showcase/kandinsky6/measurements.md).
+QUANT_SPEC_BACKENDS = frozenset({"TRTLLM_ATTN", "FLASHINFER_ATTN", "SAGE_ATTN"})
+
 
 class RainFusionPrecision(str, Enum):
     """Execution precision for block-sparse RainFusion (rf_v3) attention.
@@ -2128,9 +2139,9 @@ class AttentionSpec:
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
                 "Remove skip_softmax or set backend to TRTLLM_ATTN."
             )
-        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+        if self.quant is not None and self.backend.upper() not in QUANT_SPEC_BACKENDS:
             raise ValueError(
-                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                f"quant is only supported by the {sorted(QUANT_SPEC_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
         if self.fastvideo_vsa_topk is not None:

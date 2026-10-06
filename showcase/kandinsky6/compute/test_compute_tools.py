@@ -287,6 +287,22 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # `tuned.json` without Sage on video_audio_cross. That call is 0.19 ms
+        # a block, so dropping it costs almost no speed and removes one of the
+        # two quantized paths -- the cheapest thing to try against the gate's
+        # max limit.
+        "sage2-visual-only.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
+        # The same roles, with Sage's accuracy knobs on: FP16 PV with FP32
+        # accumulation and per-thread INT8 granularity.
+        "sage2-accurate.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
     }
 
     # Roles that receive a padding mask, so a mask-rejecting backend must
@@ -302,6 +318,8 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
         ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
     )
     def test_arm_resolves_exactly_the_roles_it_claims(self, filename):
         import json
@@ -322,6 +340,8 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
         ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
     )
     def test_no_mask_rejecting_backend_on_a_masked_role(self, filename):
         """SageAttention raises on attn_mask, and the two text roles get one.
@@ -336,6 +356,8 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
         ("lossless", "lossless.json"),
+        ("sage2_visual_only", "sage2-visual-only.json"),
+        ("sage2_accurate", "sage2-accurate.json"),
     )
     def test_the_named_backends_exist_in_the_registry(self, filename):
         """A backend name that is not a registry member would only fail at
@@ -617,3 +639,38 @@ class GateTierTest(parameterized.TestCase):
 
         self.assertGreater(ADOPTION_MEAN_LPIPS, APPROX_MEAN_LPIPS)
         self.assertGreater(ADOPTION_MAX_LPIPS, APPROX_MAX_LPIPS)
+
+
+class SageAccuracySpecTest(absltest.TestCase):
+    """`arms/sage2-accurate.json` must actually select the accurate variant.
+
+    The arm differs from `sage2-visual-only.json` only in a `quant` block, so
+    a resolver that silently ignored it would leave two files that look
+    different and behave identically -- and the gate numbers would be
+    attributed to a knob that never took effect.
+    """
+
+    def _quant_of(self, filename, role="kandinsky6.visual_self"):
+        import json
+
+        from vllm_omni.diffusion.data import build_attention_config
+
+        path = Path(__file__).resolve().parent / "arms" / filename
+        config = build_attention_config(json.loads(path.read_text()))
+        spec, _ = config.resolve_with_source(role=role, role_category="self")
+        return spec.backend_kwargs()
+
+    def test_the_accurate_arm_selects_the_fp16_fp32accum_per_thread_variant(self):
+        from vllm_omni.diffusion.attention.backends.sage_attn import _resolve_variant
+
+        variant = _resolve_variant(self._quant_of("sage2-accurate.json"))
+        self.assertIsNotNone(variant)
+        self.assertEqual(variant["name"], "qk_int8_pv_fp16_fp32accum_per_thread")
+
+    def test_the_plain_arm_keeps_the_dispatcher(self):
+        """No quant spec means the top-level dispatcher, which is what every
+        release before this knob used."""
+        from vllm_omni.diffusion.attention.backends.sage_attn import _resolve_variant
+
+        self.assertIsNone(_resolve_variant(self._quant_of("sage2-visual-only.json")))
+        self.assertIsNone(_resolve_variant(self._quant_of("tuned.json")))
