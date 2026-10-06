@@ -1312,3 +1312,13 @@ class TestLayerScheduledSpecs:
         the plain arm."""
         with pytest.raises(ValueError):
             self._config(layers)
+
+    def test_the_index_comes_from_the_layers_own_prefix(self):
+        """So a range is per block stack, not global. A model with two stacks
+        numbers both from zero, and this is the function that decides which
+        number a schedule sees."""
+        from vllm_omni.diffusion.attention.layer import _try_extract_layer_index
+
+        assert _try_extract_layer_index("transformer.visual_transformer_blocks.7.self_attention") == 7
+        assert _try_extract_layer_index("transformer.video_text_transformer_blocks.7.self_attention") == 7
+        assert _try_extract_layer_index("") is None

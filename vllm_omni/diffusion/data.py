@@ -2186,6 +2186,14 @@ class AttentionSpec:
     bound may be omitted (``":8"``, ``"52:"``). A layer outside the range falls
     through to the next entry in the lookup, exactly as if this spec were absent
     -- so a schedule narrows where a backend applies and never widens it.
+
+    The index is the one in the layer's own prefix, so it is **per block stack,
+    not global**: a model with two stacks numbers both from zero, and a range on
+    a role that appears in both applies to the same indices in each. Scope the
+    range with a role that belongs to one stack (on Kandinsky 6,
+    ``kandinsky6.visual_self`` is only in the 60 visual blocks, while
+    ``kandinsky6.text_self`` is only in the four text blocks) rather than
+    assuming the numbering is continuous across them.
     """
 
     def __post_init__(self) -> None:
