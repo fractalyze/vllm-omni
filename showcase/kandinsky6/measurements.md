@@ -103,10 +103,12 @@ Limits:
 | set | G2 floor (compiled vs eager) | G2 limits (1.25x) | G1 limits |
 |---|---|---|---|
 | A (9 prompts) | 0.1455 / 0.416 | 0.1819 / 0.5200 | 0.15 / 0.25 |
-| B (b1-b8) | 0.1538 / 0.3396 | 0.1922 / 0.4245 | 0.15 / 0.25 |
+| B (9 prompts) | 0.1447 / 0.3396 | 0.1809 / 0.4245 | 0.15 / 0.25 |
+| B (b1-b8, before b9's eager reference existed) | 0.1538 / 0.3396 | 0.1922 / 0.4245 | 0.15 / 0.25 |
 
-Track C's cross-host set-B floor is 0.1615 / 0.3476. The eager set-B reference
-has b1-b8: b9 was never generated, so set B is scored on 8 prompts.
+Track C's cross-host set-B floor is 0.1615 / 0.3476. The eager b9 reference was
+generated last (05:21), so only the headline arm is scored on all 9 set-B
+prompts. Every other set-B number is on b1-b8 or a b3/b6 screen.
 
 | arm | W1 wall | A vs eager | A vs compiled | B vs eager | B vs compiled | G1 A/B | G2 A/B | G3 A/B |
 |---|---:|---|---|---|---|---|---|---|
@@ -117,7 +119,7 @@ has b1-b8: b9 was never generated, so set B is scored on 8 prompts.
 | **INT8 + Sage2 + exact step 1** | **168.07 s** (session) | **0.1735 / 0.4426** | 0.1686 / 0.4627 | screen: b6 0.579 / 0.596, b3 0.387 / 0.436 | not run | fail / fail | **pass** / fail | pass / - |
 | INT8 + sage2-mid (blocks 6-53) + exact step 1 | 180.2 s | not run | not run | screen: b6 - / 0.593, b3 - / 0.363 | not run | - / fail | - / fail | - |
 | BF16 + sage2-mid (blocks 6-53) (Track C, bs3) | 177.7 s (bs3) | 0.1543 / 0.4591 | - | 0.1976 / 0.4989 | - | fail / fail | pass / **fail** (b6) | pass / - |
-| **BF16 + sage2-mid + exact step 1 (Track C's arm, outputs from bs3)** | **188.93 s (session); 182.6 s on bs3** | **0.1296 / 0.3560** | 0.1116 / 0.300 | **0.1561 / 0.3380** | 0.1232 / 0.389 | fail / fail (A: mean inside) | **pass / pass** | pass / pass |
+| **BF16 + sage2-mid + exact step 1 (Track C's arm, outputs from bs3)** | **188.93 s (session); 182.6 s on bs3** | **0.1296 / 0.3560** | 0.1116 / 0.300 | **0.1502 / 0.3380** (9 prompts; b1-b8 0.1561) | 0.1219 / 0.389 | fail / fail (A: mean inside) | **pass / pass** | pass / pass |
 | BF16 compiled (G1's reference itself) | 234.6 s (set-B gate run) | 0.1455 / 0.416 | 0 | 0.1538 / 0.3396 | 0 | pass / pass | pass / pass | pass / pass |
 
 Contact sheets (`bench/compare_sheet.py`): a3 and b6 across arms, at
