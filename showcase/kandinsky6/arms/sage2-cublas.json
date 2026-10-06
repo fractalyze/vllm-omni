@@ -1,0 +1,8 @@
+{
+  "name": "sage2-cublas",
+  "command": ["/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/run_capped.sh", "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/serve_pro_fp8.sh",
+              "--diffusion-attention-config", "@showcase/kandinsky6/compute/arms/sage2.json"],
+  "env": {"K6_CKPT": "/data/jooman/k6/ckpt/pro-distill-fp8-min", "K6_MEMMAX": "44G",
+          "VLLM_DISABLED_KERNELS": "CutlassFP8ScaledMMLinearKernel"},
+  "port": 8091
+}
