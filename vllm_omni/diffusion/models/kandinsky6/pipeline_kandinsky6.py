@@ -706,6 +706,45 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
     )
 
 
+class _NonFiniteLocator:
+    """Names the first module in a DiT whose output stops being finite.
+
+    A NaN anywhere in the DiT reaches the VAE, which clamps it to zero, so the
+    served MP4 is black and the API reports success -- the failure carries no
+    address. This records the first offending module per request, in execution
+    order, which turns "the output is NaN" into "this layer is where it starts".
+
+    Only installed when ``VLLM_OMNI_K6_PIFLOW_DEBUG=1``: it adds a reduction per
+    module per forward.
+    """
+
+    def __init__(self, root: nn.Module, limit: int = 6) -> None:
+        self.limit = limit
+        self.hits: list[str] = []
+        for name, module in root.named_modules():
+            if name:
+                module.register_forward_hook(self._hook(name))
+
+    def _hook(self, name: str):
+        def record(module: nn.Module, _inputs: object, output: object) -> None:
+            if len(self.hits) >= self.limit:
+                return
+            tensors = output if isinstance(output, (tuple, list)) else (output,)
+            for tensor in tensors:
+                if torch.is_tensor(tensor) and tensor.is_floating_point() and not torch.isfinite(tensor).all():
+                    self.hits.append(f"{name} [{type(module).__name__} {tuple(tensor.shape)}]")
+                    return
+
+        return record
+
+    def report(self) -> None:
+        if self.hits:
+            logger.warning("K6 first non-finite modules: %s", " -> ".join(self.hits))
+        else:
+            logger.warning("K6 non-finite locator: every module output stayed finite")
+        self.hits.clear()
+
+
 def _log_tensor_stats(stage: str, **tensors: Tensor | None) -> None:
     """Range, mean and non-finite counts of a stage's tensors.
 
@@ -1330,6 +1369,10 @@ class Kandinsky6TI2VAPipeline(
                 resident_dit_paths=frozenset({"transformer"}),
             )
 
+        self._nonfinite_locator = (
+            _NonFiniteLocator(_raw_dit(self.transformer)) if _PIFLOW_DEBUG else None
+        )
+
         if od_config is not None:
             self.setup_diffusion_pipeline_profiler(
                 enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
@@ -1692,6 +1735,14 @@ class Kandinsky6TI2VAPipeline(
         # are not interchangeable -- running the distilled checkpoint through the
         # Euler loop produces a wrong trajectory, not an error -- and because
         # worker stdout is not forwarded, so a print here would be invisible.
+        if _PIFLOW_DEBUG:
+            _log_tensor_stats(
+                "conditioning",
+                text=positive["text_embeds"],
+                pooled=positive["pooled_embed"],
+                video_latent=bundle.video,
+                audio_latent=bundle.audio,
+            )
         logger.info(
             "Kandinsky 6 denoise: sampler=%s steps=%d guidance=%.3f",
             "piflow" if _is_piflow_scheduler(self.scheduler) else "euler",
@@ -2187,6 +2238,8 @@ class Kandinsky6TI2VAPipeline(
 
         if _PIFLOW_DEBUG:
             _log_tensor_stats("final latents", video=result.video, audio=result.audio)
+            if self._nonfinite_locator is not None:
+                self._nonfinite_locator.report()
 
         if sampling.output_type == "latent":
             video_out: Tensor | np.ndarray = result.video.unsqueeze(0)

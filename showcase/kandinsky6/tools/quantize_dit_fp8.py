@@ -30,6 +30,10 @@ Sensitive layers stay BF16 (:func:`keeps_bf16`). Which ones is a quality
 question the gate answers, so the list is a flag, not a constant, and the
 checkpoint records what was kept in its ``quantization_config.ignored_layers``.
 
+Run it with the vLLM-Omni venv: the ignored-layer list is written in module-path
+form via the pipeline's own name mapping, so the tool imports it rather than
+keeping a second copy that could drift.
+
 Usage::
 
     python quantize_dit_fp8.py \
@@ -94,7 +98,11 @@ KEEP_BF16_ROOT_PREFIXES = (
     "video_text_transformer_blocks.",
     "audio_text_transformer_blocks.",
 )
-KEEP_BF16_SUBSTRINGS = (".modulation.",)
+# Any module whose name ends in "modulation": the blocks call theirs
+# `visual_modulation`, `av_modulation`, `va_modulation` and `text_modulation`, so
+# a ".modulation." substring rule silently protected only the two top-level
+# output heads and quantized all 60 blocks' modulation after all.
+KEEP_BF16_NAME_SUFFIXES = ("modulation",)
 KEEP_BF16_BLOCK_PREFIXES = (
     "visual_transformer_blocks.0.",
     "visual_transformer_blocks.59.",
@@ -103,10 +111,11 @@ KEEP_BF16_BLOCK_PREFIXES = (
 
 def keeps_bf16(name: str) -> bool:
     """True when ``name`` is on the sensitive list and must stay BF16."""
+    components = name.split(".")
     return (
         name.startswith(KEEP_BF16_ROOT_PREFIXES)
         or name.startswith(KEEP_BF16_BLOCK_PREFIXES)
-        or any(marker in name for marker in KEEP_BF16_SUBSTRINGS)
+        or any(c.endswith(KEEP_BF16_NAME_SUFFIXES) for c in components)
     )
 
 
@@ -156,7 +165,23 @@ def quantize_weight(weight: torch.Tensor, *, granularity: str = "tensor") -> tup
     scale = (amax / FP8_E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
     scale = torch.where(amax > 0, scale, torch.ones_like(scale))
     quantized = (as_float / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(FP8_DTYPE)
-    return quantized, scale.to(torch.float32)
+    scale = scale.to(torch.float32)
+    # A per-tensor scale is written with shape (1,), not as a 0-dim scalar.
+    # vLLM's PerTensorScaleParameter is 1-D of size 1; a 0-dim tensor still
+    # loads (the loader accepts "1-D param, scalar value") but is not what
+    # process_weights_after_loading then reduces over.
+    return quantized, scale.reshape(1) if granularity == "tensor" else scale
+
+
+def module_path(checkpoint_key: str) -> str:
+    """A transformer checkpoint key -> the path of the module it loads into.
+
+    Uses the pipeline's own ``_adapt_k6_weight_name``, so the two can never drift:
+    whatever the loader renames, this renames identically.
+    """
+    from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import _adapt_k6_weight_name
+
+    return _adapt_k6_weight_name(f"transformer.{checkpoint_key}")[len("transformer.") :]
 
 
 def find_dit_weights(src_transformer: Path) -> list[Path]:
@@ -231,10 +256,16 @@ def quantize_checkpoint(
                     flush()
     flush()
 
-    # The ignored list is what the loader must *not* build as FP8. vLLM matches
-    # these against layer prefixes, so the module path without ".weight" is the
-    # right granularity.
-    ignored_layers = sorted({name.removesuffix(".weight") for name in kept_names})
+    # The ignored list is what the loader must *not* build as FP8, and vLLM
+    # matches it against each layer's **prefix** -- its path in the module tree.
+    # Checkpoint key names are not that path: the published bundles name the FFN
+    # `feed_forward.net.0.proj`, the text towers' attention `attn` and the time
+    # embedding `timestep_embedder.linear_1`, all of which the loader remaps.
+    # Writing the raw key names here produced entries that matched nothing, so
+    # every layer meant to stay BF16 was built as an FP8 layer whose weight_scale
+    # this checkpoint does not carry -- which reads back as whatever was in its
+    # uninitialized allocation, and the first forward returns NaN.
+    ignored_layers = sorted({module_path(name).removesuffix(".weight") for name in kept_names})
     config["quantization_config"] = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
