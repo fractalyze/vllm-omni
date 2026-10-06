@@ -183,6 +183,21 @@ besides (0.2774 against 0.3349).
 | blocks 12-47 (24 exact) | 0.3349 / 0.3681 | 0.2767 / 0.3326 | ~190 s |
 | **blocks 6-53 + exact step 1** | **0.2774 / 0.3084** | 0.2494 / **0.3380** | **~184 s** |
 
+The frames say why, more clearly than the numbers do.
+`showcase-samples/compare-b6-the-prompt-that-decided-it.jpg` puts eight frames of
+b6 across the reference, the band alone, and the band with an exact first step.
+The band-alone row is **framed differently** -- a wider, lower camera, different
+platform geometry, the station sign reduced to a shorter word -- while the
+exact-step row sits back on the reference's framing with its signage detail
+restored.
+
+So an error in the first sampler step changes **which sample the trajectory lands
+on**, and an error later only perturbs detail within the sample already chosen.
+That is a different kind of failure from the one a block-level approximation
+causes, and it is why a single exact step buys more than twelve exact blocks:
+the block schedule was reducing the size of a perturbation that had already sent
+the trajectory somewhere else.
+
 **Trajectory position beats stack position.** An exact first step is worth more
 than twelve more exact blocks and costs less than half as much, which is the
 vault's Qwen-Image finding -- an error injected at an early step grows about 20x
