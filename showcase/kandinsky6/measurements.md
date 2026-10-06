@@ -9,76 +9,126 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
-## Where a Pro block's time goes at W1, and what two switches do to it
+## Where a Pro block's time goes at W1, and what two config values do to it
 
-One `Kandinsky6FusedTransformerDecoderBlock` at W1's token counts, median of
-5 timed forwards. Spreads are 0.13–0.30%, so every delta below is two orders
-of magnitude outside the noise.
+> Every number in this section was taken after two bugs in the measuring
+> harness were found and fixed (see "Two bugs in the harness" below). Earlier
+> revisions of this file carried pre-fix numbers; those are superseded.
 
-| stack | block | x60 blocks | vs shipped | peak allocated |
+One `Kandinsky6FusedTransformerDecoderBlock` at W1's token counts, and x60 for
+the 60 visual blocks of one forward. All four arms timed in ABBA order in
+**one process**, n=12 each, so every ratio is same-session.
+
+| arm | block | x60 blocks | vs shipped | spread |
 |---|---:|---:|---:|---:|
-| as shipped (platform default, eager) | 375.67 ms | 22.54 s | — | 6.74 GiB |
-| `arms/tuned.json`, eager | 259.69 ms | 15.58 s | **−30.9%** | 6.74 GiB |
-| `arms/tuned.json` + `torch.compile` | 203.01 ms | 12.18 s | **−45.9%** | **5.20 GiB** |
+| `shipped` — platform attention, compiled | 340.86 ms | 20.45 s | — | 0.95% |
+| `shipped-eager` — `--enforce-eager` | 393.08 ms | 23.58 s | +15.32% | 0.57% |
+| `tuned` — `arms/tuned.json`, compiled | 230.74 ms | 13.84 s | **−32.31%** | 0.73% |
+| `tuned` + `mode="max-autotune"` | 141.61 ms | 8.50 s | **−58.45%** | 0.59% |
 
-The split, by kernel name, with the launch gap measured as wall minus device:
+`shipped` is the right baseline: vLLM-Omni compiles the DiT's repeated blocks
+by default — `enforce_eager=False`,
+`diffusion_compile_granularity="regional"`, and
+`Kandinsky6FusedTransformerDecoderBlock` is in the model's
+`_repeated_blocks` — so an eager measurement describes nothing anyone serves.
 
-| category | shipped | tuned | tuned + compile |
+Both changes are configuration, not code:
+
+```bash
+--diffusion-attention-config "$(cat showcase/kandinsky6/compute/arms/tuned.json)"
+```
+
+and `mode="max-autotune"` where the model runner calls `torch.compile`. That
+second one is **not reachable from a config today**: `regionally_compile`
+forwards only `dynamic`. A `--diffusion-compile-mode` knob is a small local
+change and the obvious next step.
+
+### The compiled arms compute the same answer, which is why they are adoptable
+
+Each compiled arm against the **same module** run eager, on the same inputs:
+
+| arm | vs eager | rel L2 (video) | rel L2 (audio) |
 |---|---:|---:|---:|
-| attention | 178.53 ms (47.5%) | 62.92 ms (24.2%) | 63.71 ms (31.4%) |
-| GEMM | 130.45 ms (34.7%) | 129.82 ms (49.8%) | 130.00 ms (64.1%) |
-| elementwise | 44.35 ms (11.8%) | 44.63 ms (17.1%) | 3.38 ms (1.7%) |
-| copy | 13.14 ms (3.5%) | 13.82 ms (5.3%) | 0.65 ms (0.3%) |
-| norm | 9.31 ms (2.5%) | 9.29 ms (3.6%) | 5.01 ms (2.5%) |
-| unclassified | 0.01 ms | 0.01 ms | 0.01 ms |
-| launch gap | 10.83 ms | 8.18 ms | 6.24 ms |
+| `tuned`, `mode="default"` | −18.09% | 5.200e-03 | 4.436e-03 |
+| `tuned`, `mode="reduce-overhead"` | −42.31% | 5.200e-03 | 4.438e-03 |
+| `tuned`, `mode="max-autotune"` | −49.65% | 5.161e-03 | 4.444e-03 |
+| `shipped`, `mode="default"` | −13.17% | 4.590e-03 | 4.375e-03 |
 
-### PLAN.md's "attention is about two thirds of the DiT's work" does not hold
+All three tuned arms land at the same error, so `max-autotune`'s Triton GEMM
+templates add nothing beyond the reordering `mode="default"` already does.
+5.2e-03 against a control of RMS 1.26 is bf16 reduction reordering.
 
-It is 47.5% of the shipped block, not ~65%. The bound is not wrong about
-attention *versus GEMM* — measured, attention is 178.53 / (178.53 + 130.45) =
-57.8% of the attention-plus-GEMM time, close to the 64% the FLOP counts give.
-It is wrong about attention versus the **step**, because it priced no
-elementwise, norm, copy or launch time at all, and those are 17.8% of the
-device time plus a 2.9% gap. A plan that budgets attention and GEMM is
-budgeting 82% of the block.
+**This check is the only reason the CUDA-graph arms are reportable at all.**
+Their profiles put attention at 3.1% of the block, which cannot be true —
+41.32 TFLOP does not run in 4.4 ms at any rate this GPU has. The profiler
+mis-attributes work captured inside a CUDA graph, so the *category split* of a
+graph-captured arm must not be quoted. Its wall time and its output are both
+sound.
 
-### `torch.compile` is worth 21.8%, and the categories say why
+### The split, and where the next lever is
 
-Same block, same inputs, same attention arm, eager and compiled timed in ABBA
-order **in one process** (2 rounds x 2 visits x 3 repeats, n=12 each): eager
-263.79 ms (spread 0.51%), compiled 209.04 ms (spread 0.77%), **−20.75%** — a
-delta 40x the control's spread. Profiled separately, the mechanism is not
-inferred but visible: elementwise −92%, copy −95%, norm −46%, while **attention
-and GEMM do not move** (+1.3% and +0.1%).
+Profiled separately (the profiler changes the timing, so a profiled run is not
+a wall), both at `mode="default"`:
 
-That is exactly the chain the port upcasts to fp32. `apply_scale_shift_norm`
-runs three times a block, `apply_rotary` twice and `apply_gate_sum` three
-times, each on the whole residual stream: at 50,220 x 4096 one upcast is a
-823 MB fp32 tensor, and `apply_rotary`'s broadcast intermediate — `(N, H, D/2,
-2, 2)` before its `sum(-1)` — is 1.65 GB. Eager mode fuses none of them, so
-each was a full HBM round trip. Inductor graph-breaks at every attention call
-(the backends enter extensions Dynamo cannot trace) and leaves the GEMMs to
-cuBLAS, which is why those two categories are untouched.
+| category | shipped | tuned |
+|---|---:|---:|
+| block | 339.35 ms | 228.76 ms |
+| attention | 185.89 ms (55.0%) | 71.97 ms (31.6%) |
+| GEMM | 145.55 ms (43.1%) | 146.61 ms (64.4%) |
+| elementwise | 3.12 ms (0.9%) | 3.39 ms (1.5%) |
+| norm | 3.41 ms (1.0%) | 5.08 ms (2.2%) |
+| copy | ~0 | 0.67 ms (0.3%) |
+| unclassified | 0.01 ms | 0.01 ms |
+| launch gap | 6.05 ms | 6.34 ms |
 
-`fullgraph=False` is required rather than convenient: a full graph either
-fails at the attention extension or silently falls back to a traceable,
-slower attention path and then measures the wrong thing.
+**PLAN.md's "attention is about two thirds of the DiT's work" is a modest
+overstatement, not a refutation.** It is 55.0% of the shipped block. An
+earlier revision of this file reported 47.5% and called the bound refuted;
+that came from an *eager* profile, where the unfused fp32 AdaLN/RoPE/gate
+chain contributed 17.8% and inflated the denominator. Compiled — which is what
+runs — that chain is 1.9%. The lesson is not about the bound: it is that a
+profile taken in a mode the system does not run in attributes time to the
+wrong place, by enough to change which lever you pick next.
 
-**Peak allocation falls 1.54 GiB**, from 6.74 to 5.20. This study exists
-because the model does not fit, so that is worth naming: the fp32
-intermediates are transient, so it is per-block headroom rather than resident
-capacity, but it is 1.54 GiB a residency or streaming plan no longer has to
-leave free.
-
-### What is left
-
-After both switches the block is 64.1% GEMM. The GEMMs run on
+After the tuned arm the block is **64.4% GEMM**, on
 `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_*` kernels — the Ampere
-`s16816` HMMA generation — with the largest at a `64x64_32x6` tile taking
-73.2 ms of the 130. The next compute lever is therefore the GEMM: whatever
-format Track M picks, and possibly the tile selection. Attention is down to
-31.4% and the elementwise chain to 4.5%.
+`s16816` HMMA generation. `max-autotune` takes that 145.55 ms to 125.15
+(−14%) with Triton templates, which is most of its win. Whether a block-scaled
+FP8 or NVFP4 route beats bf16 here needs Track M's format.
+
+### Two bugs in the harness
+
+Both were in `block_profile.py`'s synthetic block, both invalidated earlier
+block numbers, and **neither touched the attention race** — `attn_race.py`
+always built its activations with the port's own RoPE module and normalized
+q/k itself.
+
+1. **The RoPE table was drawn from `randn`.** A RoPE table's 2x2 blocks are
+   `[[cos, −sin], [sin, cos]]`, so `apply_rotary` is a rotation and preserves
+   the per-head norm `query_norm`/`key_norm` just set. Random entries make it
+   an arbitrary linear map that stretches some rows far more than others.
+2. **The weights were never random.** vLLM's `ColumnParallelLinear` and
+   `RowParallelLinear` allocate with `torch.empty` and expect a checkpoint
+   loader; unlike `torch.nn.Linear` they run no initializer, and the
+   allocation read back as **zeros**. Every projection in the block returned
+   zero.
+
+Dense GEMM and attention kernels take the same time on zeros, which is why
+both bugs were invisible in the timings. They are not invisible to a
+quantizing kernel: SageAttention's per-block scale is the block's maximum
+absolute value, so a zero query gives a zero scale and the kernel returns NaN.
+
+They surfaced because `--check-numerics` was added before trusting a 49%
+speedup, and **the control's own output came back NaN**. The first version of
+that check was itself wrong: it compared parameter *names* to decide whether
+two arms share weights, and `torch.compile` returns an `OptimizedModule` whose
+names are all prefixed `_orig_mod.`, so it answered "not comparable" for
+exactly the arms it existed to check.
+
+Each fix carries a test: every RoPE 2x2 block has determinant 1 and unit rows;
+the initializer returns how many parameters it filled, so a layer-type change
+cannot make it silently stop applying; a non-finite control is reported as a
+broken control rather than as NaN deltas.
 
 ## Attention backend on sm_120, at W1's visual self-attention
 
@@ -224,8 +274,8 @@ and remains the candidate for the sparse-attention line of the plan.
 | | `flashinfer==0.7.0.post1` (from vLLM), `flash-attn-4==4.0.0b18` |
 | Checkpoint config | `kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers`, snapshot `7a1a4033` |
 | Harness | `showcase/kandinsky6/compute/attn_race.py`, run under `run_when_free.py` |
-| Raw records | `compute/results/*.json`; vault root `k6c-bs3`, snapshot `20261006-1940` |
-| Vault trials | `k6c-a01` (attention backend, `outcome_vs_vault: vault-right`), `k6c-f01` (`torch.compile`, predicted -8%, measured -20.75%). Both predictions frozen before their runs. |
+| Raw records | `compute/results/*.json` (`k6c-b04`, `k6c-g02`, `k6c-b03`, `k6c-p05-*` are the post-fix runs); vault root `k6c-bs3` |
+| Vault trials | `k6c-a01` (attention backend), `k6c-f01` (`torch.compile`), `k6c-g01` (compile modes). Every prediction frozen before its run. |
 
 ## Reproduce
 

@@ -471,3 +471,48 @@ class RopeTableTest(absltest.TestCase):
         inputs = make_inputs("fused", LITE, Shapes(**W1), torch.device("cpu"), torch.bfloat16)
         self.assertEqual(inputs["vis_rope"].shape[-3], sum(LITE.axes_dims) // 2)
         self.assertTrue(torch.isfinite(inputs["vis_rope"]).all())
+
+
+class OutputDeltaControlTest(absltest.TestCase):
+    """A non-finite control must be named as such, not reported as NaN deltas.
+
+    This is the lesson of the RoPE bug: the check did run, and it did return
+    NaN for every arm, and a NaN rel_l2 reads as "could not tell" when it
+    should read as "the baseline is broken".
+    """
+
+    def test_a_nan_control_is_reported_as_a_broken_control(self):
+        import torch
+        from block_profile import output_deltas
+
+        class Nan(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, x):
+                return x * float("nan")
+
+        control = Nan()
+        result = output_deltas({"control": control, "other": control}, {"x": torch.ones(4)})
+        self.assertFalse(result["control_is_finite"])
+        self.assertIn("not finite", result["why"])
+
+    def test_a_finite_control_reports_per_arm_rows(self):
+        import torch
+        from block_profile import output_deltas
+
+        class Scale(torch.nn.Module):
+            def __init__(self, factor):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.factor = factor
+
+            def forward(self, x):
+                return x * self.factor
+
+        control = Scale(1.0)
+        result = output_deltas({"control": control, "same": control}, {"x": torch.ones(4)})
+        self.assertTrue(result["control_is_finite"])
+        self.assertTrue(result["same"]["comparable"])
+        self.assertEqual(result["same"]["outputs"][0]["rel_l2"], 0.0)

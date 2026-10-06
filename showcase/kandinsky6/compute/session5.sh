@@ -22,14 +22,14 @@ run() {
     else echo "=== $(date +%H:%M:%S) $name FAILED (exit $?)"; failures=$((failures + 1)); fi
 }
 
-run k6c-g01d-numerics "$PY" "$HERE/block_profile.py" \
+run k6c-g01e-numerics "$PY" "$HERE/block_profile.py" \
     --config pro --geometry w1 --target fused \
     --compare-arm "tuned-eager=$HERE/arms/tuned.json@eager" \
     --compare-arm "tuned-default=$HERE/arms/tuned.json@default" \
     --compare-arm "tuned-reduce-overhead=$HERE/arms/tuned.json@reduce-overhead" \
     --compare-arm "tuned-max-autotune=$HERE/arms/tuned.json@max-autotune" \
     --check-numerics --repeats 3 --rounds 2 --warmups 3 --profile-iters 0 \
-    --json "$OUT/k6c-g01d-numerics-w1.json"
+    --json "$OUT/k6c-g01e-numerics-w1.json"
 
 echo "=== $(date +%H:%M:%S) session done, $failures failure(s)"
 exit "$failures"

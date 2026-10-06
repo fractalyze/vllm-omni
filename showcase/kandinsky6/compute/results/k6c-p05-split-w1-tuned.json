@@ -4,7 +4,9 @@
   "target": "fused",
   "backend": "platform-default",
   "attention_config_file": "/data/jooman/k6/vllm-omni/showcase/kandinsky6/compute/arms/tuned.json",
-  "compile_mode": "default",
+  "compile_modes": [
+    "default"
+  ],
   "shapes": {
     "height": 480,
     "width": 864,
@@ -20,109 +22,110 @@
   "dtype": "torch.bfloat16",
   "torch": "2.13.0+cu132",
   "device": "NVIDIA GeForce RTX 5090",
-  "locks_held": "run_when_free.py pid 1238487: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "locks_held": "run_when_free.py pid 1269420: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
   "foreign_gpu_procs": [],
   "peak_allocated_gib": 5.201,
   "timing": {
-    "median_ms": 203.015,
-    "min_ms": 202.6,
-    "max_ms": 203.214,
-    "spread_pct": 0.3,
+    "median_ms": 228.763,
+    "min_ms": 228.593,
+    "max_ms": 228.938,
+    "spread_pct": 0.15,
     "repeats": 5,
     "all_ms": [
-      202.758,
-      202.6,
-      203.015,
-      203.017,
-      203.214
+      228.839,
+      228.593,
+      228.763,
+      228.938,
+      228.643
     ]
   },
   "compare_compile": null,
+  "output_deltas": null,
   "profile": {
     "iters": 3,
-    "device_ms_per_forward": 202.774,
-    "wall_ms_per_forward": 209.012,
-    "launch_gap_ms_per_forward": 6.238,
+    "device_ms_per_forward": 227.741,
+    "wall_ms_per_forward": 234.083,
+    "launch_gap_ms_per_forward": 6.342,
     "categories_ms_per_forward": {
-      "attention": 63.714,
-      "gemm": 129.996,
-      "elementwise": 3.383,
-      "norm": 5.014,
-      "copy": 0.652,
+      "attention": 71.966,
+      "gemm": 146.614,
+      "elementwise": 3.39,
+      "norm": 5.084,
+      "copy": 0.673,
       "unclassified": 0.014
     },
     "categories_share_pct": {
-      "attention": 31.42,
-      "gemm": 64.11,
-      "elementwise": 1.67,
-      "norm": 2.47,
-      "copy": 0.32,
+      "attention": 31.6,
+      "gemm": 64.38,
+      "elementwise": 1.49,
+      "norm": 2.23,
+      "copy": 0.3,
       "unclassified": 0.01
     },
     "top_kernels": [
       {
         "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
-        "ms_per_forward": 73.082
+        "ms_per_forward": 84.569
       },
       {
         "name": "void qk_int_sv_f8_attn_kernel<128u, 64u, 32u, 64u, 128u, (DataType)1, (QuantGranularity)2, (QuantGranularity)2, float, true, __nv_bfloat16, (ComputeUnit)1, (MaskMode)0, false, true, false, true>(signed char*, signed char*, signed char*, __nv_bfloat16*, float*, float*, float*, float*, float*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float)",
-        "ms_per_forward": 59.336
+        "ms_per_forward": 67.382
       },
       {
         "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8::Params)",
-        "ms_per_forward": 28.395
+        "ms_per_forward": 31.365
       },
       {
         "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_tn_align8::Params)",
-        "ms_per_forward": 28.088
+        "ms_per_forward": 30.22
       },
       {
         "name": "triton_poi_fused__unsafe_view_gelu_6",
-        "ms_per_forward": 2.121
+        "ms_per_forward": 2.124
       },
       {
         "name": "triton_red_fused__fused_rms_norm__to_copy_mul_sum_view_0",
-        "ms_per_forward": 1.64
+        "ms_per_forward": 1.705
       },
       {
         "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_split_with_sizes_view_10",
-        "ms_per_forward": 1.312
+        "ms_per_forward": 1.317
       },
       {
         "name": "cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0",
-        "ms_per_forward": 1.12
+        "ms_per_forward": 1.227
       },
       {
         "name": "triton_poi_fused__to_copy__unsafe_view_add_mul_split_7",
-        "ms_per_forward": 0.997
+        "ms_per_forward": 0.996
       },
       {
         "name": "void QuantInt8Kernel<128u, 32u, 1u, false, false, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, signed char*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
-        "ms_per_forward": 0.81
+        "ms_per_forward": 0.816
       },
       {
         "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_0",
-        "ms_per_forward": 0.77
+        "ms_per_forward": 0.772
       },
       {
         "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_5",
-        "ms_per_forward": 0.754
+        "ms_per_forward": 0.752
       },
       {
         "name": "void TransposePadPermuteKernel<128u, 64u, true, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
-        "ms_per_forward": 0.652
+        "ms_per_forward": 0.673
       },
       {
         "name": "void MeanScaleKernel<64u, false, __nv_bfloat16>(__nv_bfloat16*, signed char*, float*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
-        "ms_per_forward": 0.631
+        "ms_per_forward": 0.636
       },
       {
         "name": "void pytorch_flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, cutlass::bfloat16_t> >, false, false, false, false, true, false, true, false>(pytorch_flash::Flash_fwd_params)",
-        "ms_per_forward": 0.575
+        "ms_per_forward": 0.635
       },
       {
         "name": "triton_red_fused__to_copy_add_mul_native_layer_norm_split_1",
-        "ms_per_forward": 0.521
+        "ms_per_forward": 0.52
       },
       {
         "name": "triton_per_fused__fused_rms_norm__scaled_dot_product_cudnn_attention_permute_unsqueeze_view_1",
@@ -130,15 +133,15 @@
       },
       {
         "name": "void QuantInt8Kernel<128u, 64u, 1u, false, true, __nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16*, signed char*, float*, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
-        "ms_per_forward": 0.419
+        "ms_per_forward": 0.422
       },
       {
         "name": "triton_red_fused__fused_rms_norm__scaled_dot_product_flash_attention__to_copy_mul_permute_sum_view_1",
-        "ms_per_forward": 0.287
+        "ms_per_forward": 0.31
       },
       {
         "name": "triton_red_fused_mean_0",
-        "ms_per_forward": 0.254
+        "ms_per_forward": 0.259
       }
     ],
     "unclassified_kernels": [

@@ -167,3 +167,96 @@ class RoleMaskTest(absltest.TestCase):
 
 if __name__ == "__main__":
     absltest.main()
+
+
+class ParallelLinearInitTest(absltest.TestCase):
+    """vLLM's parallel Linear layers must be filled by hand in the synthetic
+    block.
+
+    `ColumnParallelLinear` / `RowParallelLinear` allocate with `torch.empty`
+    and expect a checkpoint loader; unlike `torch.nn.Linear` they run no
+    initializer. On a fresh allocation that reads back as zeros, so every
+    projection returns zero and the block "runs" while computing nothing.
+    Dense GEMM and attention take the same time on zeros, so the timings look
+    fine -- and SageAttention's per-block scale is the block maximum, so a
+    zero query gives a zero scale and NaN out.
+
+    These run on the CPU; whether a weight is zero does not depend on the
+    device.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import os
+
+        import vllm.model_executor.layers.linear as linear_mod
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.distributed.parallel_state import (
+            cleanup_dist_env_and_memory,
+            init_distributed_environment,
+            initialize_model_parallel,
+            model_parallel_is_initialized,
+        )
+        from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+        self.enterContext(
+            absltest.mock.patch.object(
+                linear_mod, "dispatch_unquantized_gemm", lambda *a, **k: default_unquantized_gemm
+            )
+        )
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29535")
+        self.enterContext(set_current_vllm_config(VllmConfig()))
+        if not model_parallel_is_initialized():
+            init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+            initialize_model_parallel()
+            self.addCleanup(cleanup_dist_env_and_memory)
+
+    def _tiny_attention(self):
+        """A small Kandinsky6Attention, built the way build_target builds one
+        but without randomizing, so the raw state is visible."""
+        from types import SimpleNamespace
+
+        from vllm_omni.diffusion.config import set_current_diffusion_config
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+        from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import Kandinsky6Attention
+
+        config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+            parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
+        )
+        with set_current_diffusion_config(config):
+            return Kandinsky6Attention(64, 32, visual=True, role="kandinsky6.visual_self", role_category="self")
+
+    def test_the_helper_finds_and_fills_the_projections(self):
+        import torch
+        from block_profile import randomize_parallel_linears
+
+        module = self._tiny_attention()
+        filled = randomize_parallel_linears(module)
+        # to_query, to_key, to_value, out_layer: four weights and four biases.
+        self.assertEqual(filled, 8)
+        for name in ("to_query", "to_key", "to_value", "out_layer"):
+            weight = getattr(module, name).weight
+            self.assertTrue(torch.isfinite(weight).all(), msg=name)
+            self.assertGreater(float(weight.abs().max()), 0.0, msg=f"{name} is still all zero")
+
+    def test_the_weights_map_a_unit_input_to_a_unit_output(self):
+        """std = 1/sqrt(fan_in) is the point: the residual stream must neither
+        vanish nor explode, which is the regime a per-block quantization scale
+        has to be judged in."""
+        import torch
+        from block_profile import randomize_parallel_linears
+
+        module = self._tiny_attention()
+        randomize_parallel_linears(module)
+        out = module.to_query(torch.randn(1024, 64))
+        self.assertAlmostEqual(float(out.square().mean().sqrt()), 1.0, delta=0.15)
+
+    def test_finding_nothing_is_reported_as_zero(self):
+        """A caller can assert the count, so a layer-type change cannot make
+        this silently stop applying."""
+        import torch
+        from block_profile import randomize_parallel_linears
+
+        self.assertEqual(randomize_parallel_linears(torch.nn.Linear(4, 4)), 0)

@@ -229,15 +229,9 @@ def build_target(
     dtype: torch.dtype,
     attention_config_file: Path | None = None,
 ):
-    """One block (or one attention layer) at ``cfg``'s dimensions.
-
-    Weights are random: ``torch.nn.Module`` initialization on the meta-free
-    path already fills them, except ``Kandinsky6Modulation``, which zeroes
-    its output layer by design. Zeroed modulation would make every AdaLN
-    scale exactly 1 and every gate exactly 0 -- numerically degenerate and,
-    worse, it would let the residual stream stay constant across blocks.
-    The time does not depend on the values, but a degenerate stream can
-    denormal-stall, so the modulation weights are re-randomized here.
+    """One block (or one attention layer) at ``cfg``'s dimensions, with
+    random weights -- see ``randomize_parallel_linears`` for why that needs
+    doing by hand here.
     """
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import (
@@ -288,10 +282,60 @@ def build_target(
         else:  # pragma: no cover - argparse restricts the choices
             raise ValueError(f"unknown target {target!r}")
 
-    for name, param in module.named_parameters():
-        if "modulation" in name:
-            torch.nn.init.normal_(param, std=0.02)
-    return module.to(device=device, dtype=dtype).eval()
+    module = module.to(device=device, dtype=dtype).eval()
+    randomize_parallel_linears(module)
+    return module
+
+
+def randomize_parallel_linears(module) -> int:
+    """Fill vLLM's parallel ``Linear`` weights with plausible random values.
+
+    **This is not optional.** vLLM's ``ColumnParallelLinear`` and
+    ``RowParallelLinear`` allocate their weights with ``torch.empty`` and
+    expect a checkpoint loader to fill them; unlike ``torch.nn.Linear`` they
+    run no initializer. On a fresh allocation that reads back as **zeros**, so
+    every projection in the block returns zero and the block "runs" while
+    computing nothing of the right magnitude.
+
+    Dense GEMM and attention kernels take the same time on zeros, which is
+    why this was invisible in the timings for a long while. It is not
+    invisible to a quantizing kernel: SageAttention's per-block scale is the
+    block's maximum absolute value, so an all-zero query makes the scale zero
+    and the kernel returns NaN. That NaN is how this was found, through
+    ``--check-numerics``.
+
+    ``std = 1 / sqrt(fan_in)`` maps a unit-RMS input to a unit-RMS output, so
+    the residual stream neither vanishes nor explodes across a block -- the
+    regime a trained checkpoint is in, and the regime a per-block
+    quantization scale has to be judged in. Biases are zeroed: a trained
+    bias is small next to the GEMM's output and a random one would only add
+    an offset the real model does not have.
+
+    ``nn.LayerNorm`` and ``nn.RMSNorm`` are left alone: they are ordinary
+    ``torch.nn`` modules, already initialized to unit weight and zero bias.
+
+    Returns the number of parameters it filled, so a caller can assert it
+    found some -- zero would mean the layer types changed and this silently
+    stopped applying.
+    """
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+    filled = 0
+    for submodule in module.modules():
+        if not isinstance(submodule, ColumnParallelLinear | RowParallelLinear):
+            continue
+        weight = getattr(submodule, "weight", None)
+        if weight is not None:
+            fan_in = weight.shape[-1]
+            with torch.no_grad():
+                weight.normal_(mean=0.0, std=fan_in**-0.5)
+            filled += 1
+        bias = getattr(submodule, "bias", None)
+        if bias is not None:
+            with torch.no_grad():
+                bias.zero_()
+            filled += 1
+    return filled
 
 
 def maybe_compile(module, mode: str | None):
@@ -454,7 +498,20 @@ def output_deltas(arms: dict, inputs: dict) -> dict:
     with torch.inference_mode():
         reference = [t.float().clone() for t in _flatten_outputs(control_module(**inputs))]
 
-    result: dict[str, dict] = {}
+    # A non-finite control makes every comparison NaN, and a NaN rel_l2 reads
+    # as "could not tell" when it should read as "the baseline is broken".
+    # This happened: a random RoPE table made SageAttention return NaN at W1,
+    # and the check reported NaN deltas for every arm instead of naming the
+    # cause. Report it as a failure of the control, not of the arms.
+    unfinite = [index for index, tensor in enumerate(reference) if not torch.isfinite(tensor).all()]
+    if unfinite:
+        return {
+            "control_is_finite": False,
+            "why": f"the control arm's output tensor(s) {unfinite} are not finite; "
+            "no arm can be compared against them",
+        }
+
+    result: dict[str, dict] = {"control_is_finite": True}
     for label in labels[1:]:
         module = arms[label]
         shared = _parameter_storages(module) == control_storages
@@ -762,7 +819,11 @@ def main() -> int:
                   f"n={row['samples']}){tail}")
     if numerics:
         print("  output vs the control, same weights:")
+        if not numerics.get("control_is_finite", True):
+            print(f"    control arm is broken: {numerics['why']}")
         for label, row in numerics.items():
+            if not isinstance(row, dict) or "comparable" not in row:
+                continue
             if not row["comparable"]:
                 print(f"    {label:<22} not comparable: {row['why']}")
                 continue
