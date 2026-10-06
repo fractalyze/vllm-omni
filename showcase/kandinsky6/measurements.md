@@ -9,6 +9,126 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## End to end: Kandinsky 6 Lite at W1's geometry
+
+The measurements above are one synthetic Pro block. This is a whole request.
+Lite (3.7B) because Pro does not fit on a 32 GB card with its text encoder,
+and W1's geometry so the DiT sees the same 50,220 visual tokens as Pro would.
+Offline `Omni(...)` through
+`examples/offline_inference/text_to_video/text_to_video.py`, one request per
+arm, `--enable-cpu-offload`, seed 42, all five host GPU locks held.
+
+| arm | generation | vs control | steady-state step | peak reserved |
+|---|---:|---:|---:|---:|
+| shipped (platform attention, compiled) | 104.40 s | — | 7.38 s | 29.17 GiB |
+| shipped | 101.56 s | — | — | 29.17 GiB |
+| shipped | 99.61 s | — | — | 29.17 GiB |
+| **`arms/tuned.json`** | **78.22 s** | **−23.0%** | **4.00 s** (−45.8%) | 29.17 GiB |
+| `arms/tuned.json` again | **72.53 s** | **−28.6%** | — | 29.17 GiB |
+| `arms/tuned.json` + `max-autotune-no-cudagraphs` | 142.56 s | +40.4% | 4.00 s | 29.17 GiB |
+| `arms/tuned.json` + `mode="max-autotune"` | **raises** | — | — | — |
+| `mode="reduce-overhead"` | **raises** | — | — | — |
+
+Three controls spanning 99.61–104.40 s (median 101.56, spread 4.7%) and two
+candidate runs at 78.22 and 72.53 s (median 75.38), so the effect is
+**−25.8%** on the medians — against a control spread of 4.7%. The two
+candidate runs differ by 7.3%, more than the controls do, which is worth
+saying rather than hiding: both were cold processes and the spread of a
+single-request cold measurement is simply wider than the steady-state step
+figure beside it. Output verified as H.264 864x480, 121 frames,
+5.06 s, plus AAC 44.1 kHz (219 audio frames) — the joint path, not video only.
+
+The **steady-state step** is the slope of the progress bar between step 2 and
+step 10, which separates the first step's compilation from the per-step
+compute. It matters because the two columns tell different stories: the
+attention arm takes a step from 7.38 s to 4.00 s (**−45.8%**) while taking the
+request only −23.0%, because a request also carries the first step's compile
+and about 19 s of stages outside the denoise loop. On a warm server serving
+many requests the per-step figure is the one that compounds; for the
+single-request headline the whole-request figure is the honest one.
+
+### `max-autotune-no-cudagraphs` gives this model nothing
+
+It is the one value of `--diffusion-compile-mode` that does not capture CUDA
+graphs, so it was the remaining candidate after the other two raised. It costs
+**+40.4%** on the request and its **steady-state step is identical to the
+attention arm's, 4.00 s**: the entire difference is compile time, about 65 s
+more in the first step, and the Triton GEMM templates buy nothing back.
+
+That contradicts the block measurement, where `max-autotune` took the block
+GEMMs from 145.55 ms to 125.15 (−14%) — and the resolution is a scale the two
+measurements do not share. The block was **Pro-shaped** (`model_dim` 4096);
+this request is **Lite** (1792). Triton beating cuBLAS at one GEMM width says
+nothing about another. So the flag may still pay on Pro, and that is
+untestable on this host until Pro fits.
+
+The general caution is the one worth keeping: a Pro-shaped block result does
+not transfer to a Lite-shaped request, in either direction.
+
+### The block-level CUDA-graph win does not survive a real pipeline
+
+`mode="max-autotune"` was −38.5% on one block in isolation. On a request both
+it and `mode="reduce-overhead"` raise:
+
+```
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been
+overwritten by a subsequent run.
+  ... kandinsky6_transformer.py Kandinsky6TransformerEncoderBlock.forward
+  ... kandinsky6_transformer.py apply_gate_sum
+```
+
+The cause looks structural, not incidental. `regionally_compile` compiles each
+repeated block, so a DiT replays many captured graphs back to back — and the
+**residual stream holds a reference across block boundaries**:
+`apply_gate_sum(x, out, gate)` reads the previous block's output. CUDA-graph
+trees assume a graph's output is consumed before the next replay, so that
+reference points at reclaimed memory. Nothing here is Kandinsky-specific; any
+model whose `_repeated_blocks` pass a residual through should be expected to
+hit it.
+
+Both modes fail identically, which is what identifies the graph capture rather
+than `max-autotune`'s GEMM autotuning as the cause.
+
+**This is the single most useful thing the end-to-end run produced.** A 38.5%
+block-level win that raises on the first real request is worth less than
+nothing if it is published as a speedup, and nothing in the block measurement
+— timing, output comparison, or profile — could have revealed it. The arms
+were all one block deep, and the failure needs two.
+
+Taken with the `max-autotune-no-cudagraphs` result below, the honest summary
+of `--diffusion-compile-mode` on Kandinsky 6 is that **no value of it helps**:
+the two that capture graphs raise, and the one that does not costs compile
+time for no steady-state gain at this model's GEMM widths.
+
+### So the adoptable change is the attention arm
+
+−23.0% on a whole request, from one config value and no code change:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers \
+    --model-class-name Kandinsky6TI2VAPipeline --enable-cpu-offload \
+    --height 480 --width 864 --num-frames 121 --num-inference-steps 10 \
+    --diffusion-attention-config showcase/kandinsky6/compute/arms/tuned.json
+```
+
+It is still **ungated on quality**: `approx` tier by attention-kernel error on
+synthetic activations, never scored against a BF16 reference.
+
+### Two numbers for Track M
+
+**About 19 s of the request is outside the denoise loop** — text encode, video
+VAE decode, audio decode, mux. Measured on the profiled run: 114.40 s total
+against a 95.4 s denoise loop. That is 17% of a request that none of the block
+work touches.
+
+**Peak reserved is 29.17 GiB of 32, and the peak is the VAE decode, not the
+DiT.** The process sat at 30.5 GB with the denoise already finished, and the
+figure is identical across every arm — including the one that made the DiT 23%
+faster. For a 3.7B model. Whatever fits Pro will be decided by the decode as
+much as by the weights, so `--vae-use-slicing`, `--vae-use-tiling` and the
+batch-parallel decode are worth pricing before any more DiT work.
+
 ## Where a Pro block's time goes at W1, and what two config values do to it
 
 > Every number in this section was taken after two bugs in the measuring
