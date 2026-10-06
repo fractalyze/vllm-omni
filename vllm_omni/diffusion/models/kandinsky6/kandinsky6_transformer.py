@@ -314,6 +314,49 @@ validated, not a prerequisite for correct tensor-parallel serving.
 # ---------------------------------------------------------------------------
 
 
+def child_prefix(prefix: str, name: str) -> str:
+    """``prefix.name``, or just ``name`` when ``prefix`` is empty.
+
+    The layer prefix is what a quantization config matches its ``ignored_layers``
+    against, and vLLM's ``fp8`` method matches them **exactly**. This DiT is built
+    with an empty root prefix, so an unguarded ``f"{prefix}.{name}"`` produced
+    ``.video_text_embeddings.in_layer`` -- a leading dot that no checkpoint ever
+    names. Every layer meant to stay unquantized was therefore built as an FP8
+    layer whose ``weight_scale`` the checkpoint does not carry, leaving that
+    parameter at its uninitialized ``torch.empty`` contents, and the first forward
+    returned NaN. A missing scale is silent in a way a missing weight is not: the
+    loader raises for a weight it cannot place, but nothing checks that a scale it
+    never saw was filled.
+    """
+    return f"{prefix}.{name}" if prefix else name
+
+
+def activation_dtype(layer: nn.Module) -> torch.dtype:
+    """The dtype activations should carry into ``layer``.
+
+    Several places in this DiT build an intermediate in fp32 (sinusoidal time
+    features, the modulation chain) and then cast it to the linear's dtype before
+    calling it. Reading that dtype off ``layer.weight`` is wrong as soon as the
+    checkpoint is quantized: a quantized linear stores ``weight`` as
+    ``float8_e4m3fn``, so the cast would round every activation to FP8 *before*
+    the kernel, destroying it -- and vLLM's FP8 linear expects a half-precision
+    input which it quantizes itself, with its own per-token scale.
+
+    So: use the weight's dtype only when it is a real >=2-byte float, and
+    otherwise fall back to the bias (which a quantized layer keeps in the compute
+    dtype) and then to BF16. ``Kandinsky6TI2VAPipeline.forward`` already applies
+    the same rule to the latents ("FP8 weights must not become the latent dtype");
+    this is that rule for the activations inside the blocks.
+    """
+    weight_dtype = getattr(getattr(layer, "weight", None), "dtype", None)
+    if isinstance(weight_dtype, torch.dtype) and weight_dtype.is_floating_point and weight_dtype.itemsize >= 2:
+        return weight_dtype
+    bias_dtype = getattr(getattr(layer, "bias", None), "dtype", None)
+    if isinstance(bias_dtype, torch.dtype) and bias_dtype.is_floating_point and bias_dtype.itemsize >= 2:
+        return bias_dtype
+    return torch.bfloat16
+
+
 class Kandinsky6TimeEmbeddings(nn.Module):
     """Sinusoidal time embedding -> tensor-parallel MLP (Column -> Row pair)."""
 
@@ -337,7 +380,7 @@ class Kandinsky6TimeEmbeddings(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_layer" if prefix else "in_layer",
+            prefix=child_prefix(prefix, "in_layer"),
         )
         self.activation = nn.SiLU()
         self.out_layer = RowParallelLinear(
@@ -347,7 +390,7 @@ class Kandinsky6TimeEmbeddings(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
     def forward(self, time: Tensor) -> Tensor:
@@ -360,7 +403,7 @@ class Kandinsky6TimeEmbeddings(nn.Module):
         freqs = self.freqs.to(device=time.device, dtype=torch.float32)
         args = torch.outer(time.float(), freqs)
         embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        h = self.activation(self.in_layer(embed.to(dtype=self.in_layer.weight.dtype)))
+        h = self.activation(self.in_layer(embed.to(dtype=activation_dtype(self.in_layer))))
         return self.out_layer(h)
 
 
@@ -383,12 +426,12 @@ class Kandinsky6TextEmbeddings(nn.Module):
             gather_output=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_layer" if prefix else "in_layer",
+            prefix=child_prefix(prefix, "in_layer"),
         )
         self.norm = nn.LayerNorm(model_dim, elementwise_affine=True)
 
     def forward(self, x: Tensor) -> Tensor:
-        wdtype = self.in_layer.weight.dtype
+        wdtype = activation_dtype(self.in_layer)
         x = self.in_layer(x.to(dtype=wdtype))
         return self.norm(x).to(dtype=x.dtype)
 
@@ -414,7 +457,7 @@ class Kandinsky6VisualEmbeddings(nn.Module):
             gather_output=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_layer" if prefix else "in_layer",
+            prefix=child_prefix(prefix, "in_layer"),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -425,7 +468,7 @@ class Kandinsky6VisualEmbeddings(nn.Module):
             .permute(0, 2, 4, 1, 3, 5, 6)
             .flatten(3, 6)
         )
-        return self.in_layer(x.to(dtype=self.in_layer.weight.dtype))
+        return self.in_layer(x.to(dtype=activation_dtype(self.in_layer)))
 
 
 class Kandinsky6Modulation(nn.Module):
@@ -452,14 +495,14 @@ class Kandinsky6Modulation(nn.Module):
             gather_output=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
         nn.init.zeros_(self.out_layer.weight)
         if self.out_layer.bias is not None:
             nn.init.zeros_(self.out_layer.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        out = self.out_layer(self.activation(x.float()).to(dtype=self.out_layer.weight.dtype))
+        out = self.out_layer(self.activation(x.float()).to(dtype=activation_dtype(self.out_layer)))
         return out.to(dtype=x.dtype)
 
 
@@ -482,7 +525,7 @@ class Kandinsky6FeedForward(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_layer" if prefix else "in_layer",
+            prefix=child_prefix(prefix, "in_layer"),
         )
         self.activation = nn.GELU()
         self.out_layer = RowParallelLinear(
@@ -492,7 +535,7 @@ class Kandinsky6FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -586,7 +629,7 @@ class Kandinsky6Attention(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.to_query" if prefix else "to_query",
+            prefix=child_prefix(prefix, "to_query"),
         )
         self.to_key = ColumnParallelLinear(
             kv_dim,
@@ -595,7 +638,7 @@ class Kandinsky6Attention(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.to_key" if prefix else "to_key",
+            prefix=child_prefix(prefix, "to_key"),
         )
         self.to_value = ColumnParallelLinear(
             kv_dim,
@@ -604,7 +647,7 @@ class Kandinsky6Attention(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.to_value" if prefix else "to_value",
+            prefix=child_prefix(prefix, "to_value"),
         )
         self.query_norm = nn.RMSNorm(head_dim)
         self.key_norm = nn.RMSNorm(head_dim)
@@ -615,7 +658,7 @@ class Kandinsky6Attention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
         self.visual = visual
         self.attention_engine = engine
@@ -734,7 +777,7 @@ class Kandinsky6OutLayer(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.modulation = Kandinsky6Modulation(
-            time_dim, model_dim, 2, quant_config=quant_config, prefix=f"{prefix}.modulation" if prefix else "modulation"
+            time_dim, model_dim, 2, quant_config=quant_config, prefix=child_prefix(prefix, "modulation")
         )
         self.norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.out_layer = ColumnParallelLinear(
@@ -744,7 +787,7 @@ class Kandinsky6OutLayer(nn.Module):
             gather_output=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
     def forward(self, visual_embed: Tensor, time_embed: Tensor) -> Tensor:
@@ -752,7 +795,7 @@ class Kandinsky6OutLayer(nn.Module):
         x = apply_scale_shift_norm(self.norm, visual_embed, scale[:, None, None], shift[:, None, None]).type_as(
             visual_embed
         )
-        x = self.out_layer(x.to(dtype=self.out_layer.weight.dtype))
+        x = self.out_layer(x.to(dtype=activation_dtype(self.out_layer)))
 
         duration, height, width, _ = x.shape
         p_t, p_h, p_w = self.patch_size
@@ -779,7 +822,7 @@ class Kandinsky6OutLayerAudio(nn.Module):
     ):
         super().__init__()
         self.modulation = Kandinsky6Modulation(
-            time_dim, model_dim, 2, quant_config=quant_config, prefix=f"{prefix}.modulation" if prefix else "modulation"
+            time_dim, model_dim, 2, quant_config=quant_config, prefix=child_prefix(prefix, "modulation")
         )
         self.norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.out_layer = ColumnParallelLinear(
@@ -789,14 +832,14 @@ class Kandinsky6OutLayerAudio(nn.Module):
             gather_output=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_layer" if prefix else "out_layer",
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
     def forward(self, audio_embed: Tensor, time_embed: Tensor) -> Tensor:
         shift, scale = torch.chunk(self.modulation(time_embed), 2, dim=-1)
         x = apply_scale_shift_norm(self.norm, audio_embed, scale, shift).type_as(audio_embed)
         x = self.norm(x)  # matches reference training (double norm — do not remove for parity)
-        return self.out_layer(x.to(dtype=self.out_layer.weight.dtype))
+        return self.out_layer(x.to(dtype=activation_dtype(self.out_layer)))
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +868,7 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
             model_dim,
             6,
             quant_config=quant_config,
-            prefix=f"{prefix}.text_modulation" if prefix else "text_modulation",
+            prefix=child_prefix(prefix, "text_modulation"),
         )
         self.self_attention_norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.self_attention = Kandinsky6Attention(
@@ -836,11 +879,11 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
             role="kandinsky6.text_self",
             role_category="self",
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attention" if prefix else "self_attention",
+            prefix=child_prefix(prefix, "self_attention"),
         )
         self.feed_forward_norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.feed_forward = Kandinsky6FeedForward(
-            model_dim, ff_dim, quant_config=quant_config, prefix=f"{prefix}.feed_forward" if prefix else "feed_forward"
+            model_dim, ff_dim, quant_config=quant_config, prefix=child_prefix(prefix, "feed_forward")
         )
 
     def forward(self, x: Tensor, time_embed: Tensor, rope: Tensor, attn_mask: Tensor | None = None) -> Tensor:
@@ -883,7 +926,7 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             model_dim,
             9,
             quant_config=quant_config,
-            prefix=f"{prefix}.visual_modulation" if prefix else "visual_modulation",
+            prefix=child_prefix(prefix, "visual_modulation"),
         )
         self.self_attention_norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.self_attention = Kandinsky6Attention(
@@ -895,7 +938,7 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             role="kandinsky6.visual_self" if self_sequence_parallel else "kandinsky6.audio_self",
             role_category="self",
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attention" if prefix else "self_attention",
+            prefix=child_prefix(prefix, "self_attention"),
         )
         self.cross_attention_norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.cross_attention = Kandinsky6Attention(
@@ -907,11 +950,11 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             role="kandinsky6.text_cross",
             role_category="cross",
             quant_config=quant_config,
-            prefix=f"{prefix}.cross_attention" if prefix else "cross_attention",
+            prefix=child_prefix(prefix, "cross_attention"),
         )
         self.feed_forward_norm = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.feed_forward = Kandinsky6FeedForward(
-            model_dim, ff_dim, quant_config=quant_config, prefix=f"{prefix}.feed_forward" if prefix else "feed_forward"
+            model_dim, ff_dim, quant_config=quant_config, prefix=child_prefix(prefix, "feed_forward")
         )
 
     def forward(
@@ -982,7 +1025,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             text_token_padding,
             self_sequence_parallel=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.video_dec_block" if prefix else "video_dec_block",
+            prefix=child_prefix(prefix, "video_dec_block"),
         )
         self.audio_dec_block = Kandinsky6TransformerDecoderBlock(
             model_dim_a,
@@ -993,7 +1036,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             text_token_padding,
             self_sequence_parallel=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.audio_dec_block" if prefix else "audio_dec_block",
+            prefix=child_prefix(prefix, "audio_dec_block"),
         )
 
         self.va_cross_attention = Kandinsky6Attention(
@@ -1004,7 +1047,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             role="kandinsky6.video_audio_cross",
             role_category="cross",
             quant_config=quant_config,
-            prefix=f"{prefix}.va_cross_attention" if prefix else "va_cross_attention",
+            prefix=child_prefix(prefix, "va_cross_attention"),
         )
         self.av_cross_attention = Kandinsky6Attention(
             model_dim_a,
@@ -1014,7 +1057,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             role="kandinsky6.audio_video_cross",
             role_category="cross",
             quant_config=quant_config,
-            prefix=f"{prefix}.av_cross_attention" if prefix else "av_cross_attention",
+            prefix=child_prefix(prefix, "av_cross_attention"),
         )
 
         self.va_modulation = Kandinsky6Modulation(
@@ -1022,14 +1065,14 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             model_dim if not cross_gates else model_dim * 2 + model_dim_a,
             1 if cross_gates else 3,
             quant_config=quant_config,
-            prefix=f"{prefix}.va_modulation" if prefix else "va_modulation",
+            prefix=child_prefix(prefix, "va_modulation"),
         )
         self.av_modulation = Kandinsky6Modulation(
             time_dim_a,
             model_dim_a if not cross_gates else model_dim_a * 2 + model_dim,
             1 if cross_gates else 3,
             quant_config=quant_config,
-            prefix=f"{prefix}.av_modulation" if prefix else "av_modulation",
+            prefix=child_prefix(prefix, "av_modulation"),
         )
         self.va_normalization = nn.LayerNorm(model_dim, elementwise_affine=False)
         self.av_normalization = nn.LayerNorm(model_dim_a, elementwise_affine=False)
@@ -1234,6 +1277,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
             "visual_cond",
             "is_multimodal",
             "in_audio_dim",
+            "out_audio_dim",
             "model_dim_a",
             "time_dim_a",
             "ff_dim_a",
@@ -1299,6 +1343,12 @@ class Kandinsky6Transformer3DModel(nn.Module):
         is_multimodal: bool = False,
         # Audio (T2VA only)
         in_audio_dim: int = 20,
+        # The audio head's width. It equals in_audio_dim for a plain checkpoint,
+        # but a distilled PiFlow checkpoint predicts n_grid values of x_0 per
+        # channel, so its head is n_grid times wider (400 for in_audio_dim 40) --
+        # exactly as out_visual_dim is already wider than in_visual_dim. None
+        # keeps the old behaviour of sizing the head from the input width.
+        out_audio_dim: int | None = None,
         model_dim_a: int | None = None,
         time_dim_a: int | None = None,
         ff_dim_a: int | None = None,
@@ -1322,6 +1372,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
         self.is_multimodal = is_multimodal
         self.in_visual_dim = in_visual_dim
         self.in_audio_dim = in_audio_dim
+        self.out_audio_dim = int(out_audio_dim) if out_audio_dim else in_audio_dim
         self.text_token_padding = text_token_padding
         self.visual_token_type_num_embeddings = int(visual_token_type_num_embeddings or 0)
         # Time-independent text/pooled projections (cleared each generation).
@@ -1339,25 +1390,34 @@ class Kandinsky6Transformer3DModel(nn.Module):
         # ---- visual backbone (shared) ----
         vis_in_dim = (2 * in_visual_dim + 1) if visual_cond else in_visual_dim
         self.visual_embeddings = Kandinsky6VisualEmbeddings(
-            vis_in_dim, model_dim, patch_size, quant_config=quant_config, prefix=f"{prefix}.visual_embeddings"
+            vis_in_dim,
+            model_dim,
+            patch_size,
+            quant_config=quant_config,
+            prefix=child_prefix(prefix, "visual_embeddings"),
         )
         if self.visual_token_type_num_embeddings > 0:
             self.visual_token_type_embeddings = nn.Embedding(self.visual_token_type_num_embeddings, model_dim)
         self.visual_rope_embeddings = RoPE3D(axes_dims)
         self.out_layer = Kandinsky6OutLayer(
-            model_dim, time_dim, out_visual_dim, patch_size, quant_config=quant_config, prefix=f"{prefix}.out_layer"
+            model_dim,
+            time_dim,
+            out_visual_dim,
+            patch_size,
+            quant_config=quant_config,
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
         if not is_multimodal:
             # T2V: single text/time embedding branch
             self.time_embeddings = Kandinsky6TimeEmbeddings(
-                model_dim, time_dim, quant_config=quant_config, prefix=f"{prefix}.time_embeddings"
+                model_dim, time_dim, quant_config=quant_config, prefix=child_prefix(prefix, "time_embeddings")
             )
             self.text_embeddings = Kandinsky6TextEmbeddings(
-                in_text_dim, model_dim, quant_config=quant_config, prefix=f"{prefix}.text_embeddings"
+                in_text_dim, model_dim, quant_config=quant_config, prefix=child_prefix(prefix, "text_embeddings")
             )
             self.pooled_text_embeddings = Kandinsky6TextEmbeddings(
-                in_text_dim2, time_dim, quant_config=quant_config, prefix=f"{prefix}.pooled_text_embeddings"
+                in_text_dim2, time_dim, quant_config=quant_config, prefix=child_prefix(prefix, "pooled_text_embeddings")
             )
             self.text_rope_embeddings = RoPE1D(head_dim)
             self.text_transformer_blocks = nn.ModuleList(
@@ -1370,7 +1430,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                         attention_engine,
                         text_token_padding,
                         quant_config=quant_config,
-                        prefix=f"{prefix}.text_transformer_blocks.{i}",
+                        prefix=child_prefix(prefix, f"text_transformer_blocks.{i}"),
                     )
                     for i in range(num_text_blocks)
                 ]
@@ -1386,7 +1446,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                     text_token_padding,
                     self_sequence_parallel=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.visual_transformer_blocks.{i}",
+                    prefix=child_prefix(prefix, f"visual_transformer_blocks.{i}"),
                 )
 
             self._pp_block_start, self._pp_block_end, self.visual_transformer_blocks = _partition_visual_blocks(
@@ -1395,11 +1455,15 @@ class Kandinsky6Transformer3DModel(nn.Module):
         else:
             # T2VA: dual (video / audio) text+time branches + fused blocks
             self.audio_embeddings = Kandinsky6TextEmbeddings(
-                in_audio_dim, model_dim_a, quant_config=quant_config, prefix=f"{prefix}.audio_embeddings"
+                in_audio_dim, model_dim_a, quant_config=quant_config, prefix=child_prefix(prefix, "audio_embeddings")
             )
             self.audio_rope_embeddings = RoPE1D(head_dim_a, freqs_scaling=audio_freqs_scaling)
             self.audio_out_layer = Kandinsky6OutLayerAudio(
-                model_dim_a, time_dim_a, in_audio_dim, quant_config=quant_config, prefix=f"{prefix}.audio_out_layer"
+                model_dim_a,
+                time_dim_a,
+                self.out_audio_dim,
+                quant_config=quant_config,
+                prefix=child_prefix(prefix, "audio_out_layer"),
             )
 
             for mod_prefix, md, td, fd, hd in [
@@ -1410,14 +1474,17 @@ class Kandinsky6Transformer3DModel(nn.Module):
                     self,
                     f"{mod_prefix}_time_embeddings",
                     Kandinsky6TimeEmbeddings(
-                        md, td, quant_config=quant_config, prefix=f"{prefix}.{mod_prefix}_time_embeddings"
+                        md, td, quant_config=quant_config, prefix=child_prefix(prefix, f"{mod_prefix}_time_embeddings")
                     ),
                 )
                 setattr(
                     self,
                     f"{mod_prefix}_text_embeddings",
                     Kandinsky6TextEmbeddings(
-                        in_text_dim, md, quant_config=quant_config, prefix=f"{prefix}.{mod_prefix}_text_embeddings"
+                        in_text_dim,
+                        md,
+                        quant_config=quant_config,
+                        prefix=child_prefix(prefix, f"{mod_prefix}_text_embeddings"),
                     ),
                 )
                 setattr(
@@ -1427,7 +1494,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                         in_text_dim2,
                         td,
                         quant_config=quant_config,
-                        prefix=f"{prefix}.{mod_prefix}_pooled_text_embeddings",
+                        prefix=child_prefix(prefix, f"{mod_prefix}_pooled_text_embeddings"),
                     ),
                 )
                 setattr(self, f"{mod_prefix}_text_rope_embeddings", RoPE1D(hd))
@@ -1444,7 +1511,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                                 attention_engine,
                                 text_token_padding,
                                 quant_config=quant_config,
-                                prefix=f"{prefix}.{mod_prefix}_text_transformer_blocks.{i}",
+                                prefix=child_prefix(prefix, f"{mod_prefix}_text_transformer_blocks.{i}"),
                             )
                             for i in range(num_text_blocks)
                         ]
@@ -1467,7 +1534,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                     cross_gates=cross_gates,
                     fix_modulation=fix_modulation,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.visual_transformer_blocks.{i}",
+                    prefix=child_prefix(prefix, f"visual_transformer_blocks.{i}"),
                 )
 
             self._pp_block_start, self._pp_block_end, self.visual_transformer_blocks = _partition_visual_blocks(

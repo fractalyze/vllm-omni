@@ -1,0 +1,51 @@
+{
+  "set": "B",
+  "note": "Prompt set B for the Kandinsky 6 quality gate. Disjoint from set A and built to the same category coverage (face, text, motion, speech/sharp-sound), so a recipe that passes A can be checked against a second set it was not tuned on. The vault's c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09 records an FP8 recipe that passed one 8-prompt set at LPIPS 0.034 and failed a second at 0.162: one set is not evidence.",
+  "prompts": [
+    {
+      "id": "b1-newsreader",
+      "categories": ["face", "text", "speech"],
+      "text": "A news anchor in a dark suit reads to camera in a studio; a lower-third graphic clearly displays the word LIVE in white capitals on red. Even key lighting, shallow background bokeh. Audio: a steady male voice reading, faint studio air handling."
+    },
+    {
+      "id": "b2-market-haggle",
+      "categories": ["face", "speech", "motion"],
+      "text": "A woman in a crowded Marrakesh spice market gestures and talks animatedly to a vendor, saffron and paprika piled in cones around them, dappled sunlight through canvas. Audio: an energetic female voice speaking, overlapping market chatter, a distant moped."
+    },
+    {
+      "id": "b3-storefront-sign",
+      "categories": ["text", "motion"],
+      "text": "Camera dollies slowly left past a vintage American diner front at dusk; the window decal clearly reads EAT in bold black capitals. Chrome trim, pink and blue sky. Audio: passing car tyres on wet asphalt, a jukebox muffled behind glass, a bell on the door."
+    },
+    {
+      "id": "b4-tennis-serve",
+      "categories": ["motion", "sharp-sound", "face"],
+      "text": "A tennis player serves at full stretch on a blue hard court, shot from behind the baseline at high shutter speed, ball compressing on the strings, his face grimacing. Audio: a sharp racket-on-ball pop, squeaking shoes, a brief crowd murmur."
+    },
+    {
+      "id": "b5-glassblower",
+      "categories": ["motion", "face"],
+      "text": "A glassblower rotates a glowing molten gather on a blowpipe in a dim workshop, orange light on her concentrated face, tools resting nearby. Audio: a roaring furnace, hissing as the glass meets wet newspaper, quiet scraping."
+    },
+    {
+      "id": "b6-train-platform",
+      "categories": ["text", "motion", "sharp-sound"],
+      "text": "An express train rushes through a rural station without stopping, camera locked off on the platform; the station board clearly reads WEST in black capitals. Leaves whip up in the slipstream. Audio: a rising roar then doppler drop, a sharp horn blast, rattling signage."
+    },
+    {
+      "id": "b7-child-birthday",
+      "categories": ["face", "sharp-sound"],
+      "text": "A small girl in a paper hat blows out five candles on a chocolate cake in a warm kitchen, her cheeks puffed, relatives leaning in around her. Audio: a sharp collective cheer, a party horn, clapping, then laughter."
+    },
+    {
+      "id": "b8-surf-barrel",
+      "categories": ["motion"],
+      "text": "A surfer drops into a large barrelling wave shot from the water at dawn, spray feathering off the lip, low golden light through the curl. Audio: a heavy churning wave, rushing water, wind across the microphone."
+    },
+    {
+      "id": "b9-piano-tuner",
+      "categories": ["face", "sharp-sound", "speech"],
+      "text": "An elderly piano tuner leans over an open grand piano in a quiet parlour, strikes one key repeatedly, listens, then mutters to himself. Audio: a single piano note struck several times, a tuning lever creak, a low muttering male voice."
+    }
+  ]
+}

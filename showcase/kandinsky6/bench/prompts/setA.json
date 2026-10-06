@@ -1,0 +1,51 @@
+{
+  "set": "A",
+  "note": "Prompt set A for the Kandinsky 6 quality gate. Disjoint from set B. Every prompt names its audio explicitly, because K6 is a joint video+audio model and an unprompted soundtrack is not reproducible enough to score. The `categories` tag what each prompt stresses: the set covers face, text, motion and audio, so a gate result can be broken down by category rather than reported as one number. The vault's c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09 is why: one FP8 recipe passed one 8-prompt set at LPIPS 0.034 and failed another at 0.162, worst on rendered text and faces.",
+  "prompts": [
+    {
+      "id": "a1-portrait-speech",
+      "categories": ["face", "speech"],
+      "text": "Close-up portrait of an elderly fisherman with a weathered face and white stubble, looking into the camera and speaking slowly in a low voice. Shallow depth of field, soft overcast daylight, salt spray in the air. Audio: a calm male voice speaking, gulls in the distance, gentle waves."
+    },
+    {
+      "id": "a2-neon-signage",
+      "categories": ["text", "motion"],
+      "text": "A rain-slicked Tokyo alley at night, camera tracking forward past a glowing neon sign that clearly reads OPEN in red capital letters, reflections rippling in puddles. Audio: steady rain on metal awnings, a distant train, electrical buzz from the sign."
+    },
+    {
+      "id": "a3-sprint-start",
+      "categories": ["motion", "face", "sharp-sound"],
+      "text": "A sprinter explodes out of the starting blocks on a red running track, shot from a low side angle at high shutter speed, her face tense with effort, cinders kicking up. Audio: a sharp starting pistol crack, then rapid spiked footfalls and heavy breathing."
+    },
+    {
+      "id": "a4-chalkboard",
+      "categories": ["text", "face", "speech"],
+      "text": "A young teacher in a sunlit classroom writes the word PHYSICS in large chalk capitals on a blackboard, then turns to the camera and explains, smiling. Audio: chalk squeaking on slate, a clear female voice speaking, faint hum of a ceiling fan."
+    },
+    {
+      "id": "a5-waterfall-drone",
+      "categories": ["motion"],
+      "text": "A drone shot rising fast along a tall jungle waterfall, mist blowing sideways, dense green canopy below, late afternoon sun flaring across the lens. Audio: a loud roaring cascade, insects, wind buffeting the microphone."
+    },
+    {
+      "id": "a6-blacksmith",
+      "categories": ["sharp-sound", "face", "motion"],
+      "text": "A blacksmith in a dim forge hammers a glowing orange horseshoe on an anvil, sparks bursting with every strike, his face lit from below by the metal. Audio: sharp ringing hammer strikes on steel, a roaring bellows, hissing quench."
+    },
+    {
+      "id": "a7-cafe-menu",
+      "categories": ["text", "face"],
+      "text": "A barista slides a cup across a marble counter in a bright cafe; behind her a chalk menu board clearly reads COFFEE in white hand-lettered capitals. Handheld, warm morning light. Audio: a hissing espresso steam wand, clinking ceramic, quiet conversation."
+    },
+    {
+      "id": "a8-skateboard-crash",
+      "categories": ["motion", "sharp-sound"],
+      "text": "A skateboarder attempts a kickflip down a concrete staircase and lands hard, board clattering away, shot from a low tracking angle in harsh midday sun. Audio: rolling urethane wheels, a sharp crack as the board hits concrete, then scraping."
+    },
+    {
+      "id": "a9-violinist",
+      "categories": ["face", "motion"],
+      "text": "A violinist plays intensely on a dark stage under a single warm spotlight, bow moving fast, her eyes closed, dust drifting in the beam. Audio: a solo violin playing a rapid melody, faint room reverb, no audience noise."
+    }
+  ]
+}

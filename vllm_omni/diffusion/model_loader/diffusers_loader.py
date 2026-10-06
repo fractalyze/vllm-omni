@@ -702,8 +702,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
+            # A serialized checkpoint needs no quantization at load time. vLLM's
+            # Fp8Config says so as `is_checkpoint_fp8_serialized`; missing it here
+            # sent pre-quantized FP8 checkpoints down the online path, which ends
+            # in model.to("cpu") for the whole pipeline.
+            is_offline = (
+                getattr(quant_cfg, "data_type", None) == "mx_fp"
+                or getattr(quant_cfg, "is_checkpoint_quantized", False)
+                or getattr(quant_cfg, "is_checkpoint_fp8_serialized", False)
             )
             if not is_offline:
                 load_device = device.type
@@ -716,6 +722,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
+        # Where post-load weight processing runs. Serialized FP8 still needs it
+        # (requantize_with_max_scale), and its kernels are accelerator-only, so an
+        # offline checkpoint loaded on the host is processed one module at a time
+        # on the accelerator and returned -- a per-layer transient, not a copy of
+        # the model.
+        process_device = (
+            device
+            if target_device.type == "cpu" and self.quant_config is not None and device is not None
+            else target_device
+        )
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
@@ -874,7 +890,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         else:
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    self._process_weights_after_loading(model, target_device)
+                    self._process_weights_after_loading(model, process_device)
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
