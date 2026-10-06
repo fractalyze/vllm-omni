@@ -9,6 +9,54 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## The pipeline's own numerical floor is larger than the gate
+
+Track M measured it on set A: the same BF16 checkpoint through the same weight
+path at the same seeds, **compiled against eager**.
+
+| | set mean | set max |
+|---|---:|---:|
+| floor (BF16 compiled vs BF16 eager) | **0.1455** | **0.4160** |
+| the user's gate (G1) | 0.15 | 0.25 |
+| G2 limits (1.25x the floor) | 0.1819 | 0.5200 |
+
+**Turning `torch.compile` on and off moves a single frame by LPIPS 0.416.** The
+mechanism is Inductor's timing-based kernel selection, which Track M confirmed
+by checking that two *eager* processes are byte-identical while two compiled ones
+are not.
+
+That single row reframes the whole exercise. An absolute bar of max 0.25 is
+below the pipeline's own compile setting, so **the reference cannot be shown to
+pass the user's literal gate against itself** -- not because the model is
+unstable in any way a viewer would notice, but because LPIPS on a 121-frame clip
+counts the worst frame anywhere and a differently-scheduled kernel moves it. A
+gate that only a bit-exact change can pass is measuring the harness.
+
+Hence the three bars reported side by side in this file. G1 is the user's and
+stays. G2 is floor-relative: within 1.25x the floor on both halves. G3 is
+distributional. **G2 and G3 are coordinator-chosen pending the user.**
+
+### What that does to the arms
+
+Scored against the eager reference, which is the pairing G2 is defined against:
+
+| arm | request | G1 mean / max | G2 (x floor) | G3 |
+|---|---:|---:|---:|---|
+| BF16 streamed + Sage2 everywhere | 165.9 s | 0.1858 / 0.4738 | 1.28x / 1.14x — **fails** | +0.39%, passes |
+| FP8-min + Sage2 | ~110 s | 0.2791 / 0.5649 (vs compiled ref) | ~1.9x — fails | — |
+| FP8-min + platform attention | 175.5 s | 0.262 / 0.551 (vs compiled ref) | ~1.8x — fails | — |
+
+Sage2 everywhere misses G2 **by 2%** on the mean. Every FP8 arm misses it by
+nearly a factor of two, which is the same conclusion the weight-error table
+reaches from the other end: FP8's error is a property of the format, not of
+anything that can be tuned.
+
+Note what a compiled arm scored against an eager reference is carrying: the
+compile-vs-eager difference *and* its own approximation. The same Sage2 outputs
+against the *compiled* set A reference are 0.1682 / 0.3693. Both pairings are in
+the ledger and they answer different questions; the eager one is what G2 is
+defined against.
+
 ## One-byte weights are closed on sm_120, so the lever is which blocks approximate
 
 ### INT8 would be the right format and has no kernel here
