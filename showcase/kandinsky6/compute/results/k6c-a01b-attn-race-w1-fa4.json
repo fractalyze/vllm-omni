@@ -1,0 +1,129 @@
+{
+  "shapes": {
+    "visual_tokens": 50220,
+    "audio_len": 218,
+    "text_len": 256,
+    "q_tokens_override": null
+  },
+  "arms_requested": [
+    "CUDNN_ATTN",
+    "FLASH_ATTN",
+    "SAGE_ATTN",
+    "SAGE_ATTN_3"
+  ],
+  "dtype": "torch.bfloat16",
+  "torch": "2.13.0+cu132",
+  "device": "NVIDIA GeForce RTX 5090",
+  "locks_held": "run_when_free.py pid 1234972: /data/jooman/gemma4nv/gpu.lock, /data/jooman/k6/gpu.lock, /data/jooman/qwen-image21/megakernel/gpu.lock, /data/jooman/tmp/gpu.lock, /home/jooman/.cache/diffusion-bench/qwen-image21/gpu.lock",
+  "foreign_gpu_procs": [],
+  "abba_rounds": 2,
+  "repeats_per_visit": 3,
+  "roles_requested": [
+    "visual_self"
+  ],
+  "complete": true,
+  "roles": [
+    {
+      "role": "visual_self",
+      "q": 50220,
+      "kv": 50220,
+      "heads": 32,
+      "head_dim": 128,
+      "tflop_per_call": 41.321,
+      "timings": {
+        "CUDNN_ATTN": {
+          "median_ms": 178.5769,
+          "min_ms": 177.6301,
+          "max_ms": 178.8155,
+          "spread_pct": 0.66,
+          "samples": 12,
+          "achieved_tflops": 231.4,
+          "all_ms": [
+            177.8053,
+            177.6326,
+            177.6301,
+            177.7543,
+            178.5353,
+            178.6115,
+            178.7662,
+            178.713,
+            178.7232,
+            178.5423,
+            178.7779,
+            178.8155
+          ]
+        },
+        "SAGE_ATTN": {
+          "median_ms": 70.9328,
+          "min_ms": 70.4937,
+          "max_ms": 71.2313,
+          "spread_pct": 1.04,
+          "samples": 12,
+          "achieved_tflops": 582.5,
+          "all_ms": [
+            70.4937,
+            70.8595,
+            70.8782,
+            70.7936,
+            70.6746,
+            71.0147,
+            71.2313,
+            71.0995,
+            71.0133,
+            70.9874,
+            70.8444,
+            71.0419
+          ]
+        },
+        "SAGE_ATTN_3": {
+          "median_ms": 55.5231,
+          "min_ms": 55.1578,
+          "max_ms": 55.8752,
+          "spread_pct": 1.29,
+          "samples": 12,
+          "achieved_tflops": 744.2,
+          "all_ms": [
+            55.7128,
+            55.7676,
+            55.6213,
+            55.1578,
+            55.274,
+            55.2882,
+            55.6661,
+            55.4991,
+            55.8752,
+            55.5026,
+            55.3832,
+            55.5436
+          ]
+        }
+      },
+      "accuracy": {
+        "CUDNN_ATTN": {
+          "rel_l2": 0.002322,
+          "max_abs": 0.00015,
+          "mean_abs": 1.3e-05,
+          "cosine": 0.99999738,
+          "ref_rms": 0.007304
+        },
+        "SAGE_ATTN": {
+          "rel_l2": 0.038957,
+          "max_abs": 0.001691,
+          "mean_abs": 0.000227,
+          "cosine": 0.99924088,
+          "ref_rms": 0.007304
+        },
+        "SAGE_ATTN_3": {
+          "rel_l2": 0.188251,
+          "max_abs": 0.007907,
+          "mean_abs": 0.001097,
+          "cosine": 0.98229402,
+          "ref_rms": 0.007304
+        }
+      },
+      "errors": {
+        "FLASH_ATTN": "AttributeError: 'NoneType' object has no attribute '_trait'"
+      }
+    }
+  ]
+}

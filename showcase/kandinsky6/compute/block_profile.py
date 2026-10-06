@@ -193,22 +193,42 @@ def single_process_parallel():
                 cleanup_dist_env_and_memory()
 
 
-def _diffusion_config(backend: str | None):
-    """A minimal current-diffusion-config that pins one attention backend.
+def _diffusion_config(backend: str | None, attention_config_file: Path | None):
+    """A minimal current-diffusion-config carrying one attention selection.
 
-    ``backend=None`` leaves the platform default in place (CUDNN_ATTN on
-    sm_120), which is the control arm of the backend race.
+    ``attention_config_file`` is an arm from ``arms/`` -- the same JSON a
+    server is given as ``--diffusion-attention-config``, so a block profiled
+    here used the per-role selection production would use, masks and all.
+    ``backend`` is the blunter form, one backend for every role, which is what
+    a single-kernel comparison wants. Neither set leaves the platform default
+    in place (CUDNN_ATTN on sm_120).
     """
-    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+    import json as json_module
 
-    attention_config = AttentionConfig(default=AttentionSpec(backend=backend)) if backend else AttentionConfig()
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, build_attention_config
+
+    if attention_config_file and backend:
+        raise ValueError("pass --attention-config or --backend, not both: they would disagree per role")
+    if attention_config_file:
+        attention_config = build_attention_config(json_module.loads(attention_config_file.read_text()))
+    elif backend:
+        attention_config = AttentionConfig(default=AttentionSpec(backend=backend))
+    else:
+        attention_config = AttentionConfig()
     return SimpleNamespace(
         diffusion_attention_config=attention_config,
         parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
     )
 
 
-def build_target(target: str, cfg, backend: str | None, device: torch.device, dtype: torch.dtype):
+def build_target(
+    target: str,
+    cfg,
+    backend: str | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    attention_config_file: Path | None = None,
+):
     """One block (or one attention layer) at ``cfg``'s dimensions.
 
     Weights are random: ``torch.nn.Module`` initialization on the meta-free
@@ -228,7 +248,7 @@ def build_target(target: str, cfg, backend: str | None, device: torch.device, dt
 
     head_dim = sum(cfg.axes_dims)
     head_dim_a = sum(cfg.axes_dims_a)
-    with set_current_diffusion_config(_diffusion_config(backend)):
+    with set_current_diffusion_config(_diffusion_config(backend, attention_config_file)):
         if target == "fused":
             module = Kandinsky6FusedTransformerDecoderBlock(
                 cfg.model_dim,
@@ -272,6 +292,30 @@ def build_target(target: str, cfg, backend: str | None, device: torch.device, dt
         if "modulation" in name:
             torch.nn.init.normal_(param, std=0.02)
     return module.to(device=device, dtype=dtype).eval()
+
+
+def maybe_compile(module, mode: str | None):
+    """``torch.compile`` the block, or return it untouched.
+
+    The fusion hypothesis this switch measures: the port does its AdaLN
+    modulation, RoPE and residual gates in fp32 on the whole residual stream
+    (``apply_scale_shift_norm``, ``apply_rotary``, ``apply_gate_sum`` all
+    upcast). At W1's 50,220 x 4096 one such upcast is a 823 MB fp32 tensor,
+    and ``apply_rotary``'s broadcast intermediate -- ``(N, H, D/2, 2, 2)``
+    before its ``sum(-1)`` -- is 1.65 GB. Eager mode fuses none of it, so each
+    of those is a full round trip to HBM. Inductor should fuse the chain into
+    the norm and the gate.
+
+    ``fullgraph=False`` deliberately: the attention backends call into
+    extensions Dynamo cannot trace (SageAttention's `_qattn_sm89`, cuDNN's
+    fused MHA), so a full graph would either fail or silently fall back to a
+    slower traceable path and measure the wrong thing. Graph breaks at the
+    attention calls are the intended shape here -- the elementwise chain
+    between them is what is being fused.
+    """
+    if not mode:
+        return module
+    return torch.compile(module, mode=mode, fullgraph=False, dynamic=False)
 
 
 def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: torch.dtype) -> dict:
@@ -335,6 +379,48 @@ def time_forward(module, inputs: dict, repeats: int, warmups: int) -> Timing:
     return timing
 
 
+def compare_arms(arms: dict, inputs: dict, repeats: int, warmups: int, rounds: int) -> dict:
+    """Time several modules on the same inputs, in ABBA order, in one process.
+
+    Each round visits the arms forwards then backwards, so a clock or
+    co-tenant drift during the run hits every arm about equally instead of
+    favouring whichever ran first. Everything the arms could differ by except
+    the change itself -- the inputs, the weights' shapes, the session, the
+    allocator state -- is held fixed, which a comparison across two processes
+    cannot promise.
+    """
+    labels = list(arms)
+    order = []
+    for _ in range(rounds):
+        order.extend(labels)
+        order.extend(reversed(labels))
+
+    samples: dict[str, list[float]] = {label: [] for label in labels}
+    for label in order:
+        samples[label].extend(time_forward(arms[label], inputs, repeats, warmups).ms)
+
+    result = {}
+    for label, values in samples.items():
+        median = statistics.median(values)
+        result[label] = {
+            "median_ms": round(median, 3),
+            "min_ms": round(min(values), 3),
+            "max_ms": round(max(values), 3),
+            "spread_pct": round(100.0 * (max(values) - min(values)) / median, 2),
+            "samples": len(values),
+        }
+    control = result[labels[0]]["median_ms"]
+    for label in labels[1:]:
+        candidate = result[label]["median_ms"]
+        result[label]["delta_pct_vs_" + labels[0]] = round(100.0 * (candidate - control) / control, 2)
+        # A delta inside the control's own min-max spread is null, per the
+        # study's measurement rule. Say so here rather than leave a reader to
+        # compare two columns by eye.
+        control_spread = result[labels[0]]["max_ms"] - result[labels[0]]["min_ms"]
+        result[label]["inside_control_spread"] = abs(candidate - control) <= control_spread
+    return result
+
+
 def profile_forward(module, inputs: dict, iters: int) -> dict:
     """Device time per kernel category, and the launch gap, over ``iters``.
 
@@ -396,8 +482,31 @@ def main() -> int:
     parser.add_argument(
         "--backend", default=None, help="diffusion attention backend, e.g. CUDNN_ATTN (default: platform)"
     )
+    parser.add_argument(
+        "--attention-config",
+        type=Path,
+        default=None,
+        help="an arm file from arms/ (the same JSON a server takes as --diffusion-attention-config), "
+        "for a per-role selection instead of one backend everywhere",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_mode",
+        default=None,
+        choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+        help="torch.compile the block in this mode; omitted runs eager. Compilation happens inside the "
+        "warm-ups, so --warmups must be at least 1 (it is 2 by default)",
+    )
+    parser.add_argument(
+        "--compare-compile",
+        action="store_true",
+        help="time eager and --compile in ABBA order in one process, on the same module and the same "
+        "inputs, and report the delta. The honest way to compare them: a ratio taken across two "
+        "processes is a ratio across two clock states",
+    )
     parser.add_argument("--text-len", type=int, default=None, help="override the prompt's embedding count")
     parser.add_argument("--repeats", type=int, default=5, help="timed forwards")
+    parser.add_argument("--rounds", type=int, default=2, help="ABBA rounds for --compare-compile")
     parser.add_argument("--warmups", type=int, default=2, help="untimed forwards first")
     parser.add_argument("--profile-iters", type=int, default=3, help="forwards inside the profiler; 0 skips it")
     parser.add_argument("--json", type=Path, default=None, help="write the full result here")
@@ -437,10 +546,29 @@ def main() -> int:
         device = torch.device("cuda")
         dtype = torch.bfloat16
         stack.enter_context(single_process_parallel())
-        module = build_target(args.target, cfg, args.backend, device, dtype)
+        module = maybe_compile(
+            build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
+            args.compile_mode,
+        )
         inputs = make_inputs(args.target, cfg, shapes, device, dtype)
+        if args.compile_mode and args.warmups < 1:
+            parser.error("--compile needs --warmups >= 1, or the first timed forward pays for compilation")
 
         torch.accelerator.reset_peak_memory_stats()
+        if args.compare_compile:
+            compare = compare_arms(
+                {"eager": build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
+                 f"compile={args.compile_mode or 'default'}": maybe_compile(
+                     build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
+                     args.compile_mode or "default",
+                 )},
+                inputs,
+                repeats=args.repeats,
+                warmups=max(args.warmups, 1),
+                rounds=args.rounds,
+            )
+        else:
+            compare = None
         timing = time_forward(module, inputs, args.repeats, args.warmups)
         peak_gib = torch.accelerator.max_memory_allocated() / 2**30
         profile_result = profile_forward(module, inputs, args.profile_iters) if args.profile_iters else None
@@ -450,6 +578,8 @@ def main() -> int:
             "geometry": args.geometry,
             "target": args.target,
             "backend": args.backend or "platform-default",
+            "attention_config_file": str(args.attention_config) if args.attention_config else None,
+            "compile_mode": args.compile_mode,
             "shapes": asdict(shapes),
             "dtype": str(dtype),
             "torch": torch.__version__,
@@ -458,10 +588,12 @@ def main() -> int:
             "foreign_gpu_procs": [str(p) for p in foreign],
             "peak_allocated_gib": round(peak_gib, 3),
             "timing": timing.summary(),
+            "compare_compile": compare,
             "profile": profile_result,
         }
 
-    print(f"{args.config}/{args.target}/{args.backend or 'platform-default'} at {args.geometry}: "
+    print(f"{args.config}/{args.target}/{args.backend or 'platform-default'}"
+          f"{'/compile=' + args.compile_mode if args.compile_mode else ''} at {args.geometry}: "
           f"{shapes.visual_tokens} visual tokens, {shapes.audio_len} audio, {shapes.text_len} text")
     s = timing.summary()
     print(f"  one block: {s['median_ms']:.2f} ms median ({s['min_ms']:.2f}-{s['max_ms']:.2f}, "
@@ -469,6 +601,16 @@ def main() -> int:
     if args.target != "attn":
         whole_backbone_s = s["median_ms"] * cfg.num_visual_blocks / 1e3
         print(f"  x{cfg.num_visual_blocks} visual blocks: {whole_backbone_s:.2f} s a forward")
+    if compare:
+        print("  eager vs compiled, ABBA in one process:")
+        for label, row in compare.items():
+            delta = row.get("delta_pct_vs_eager")
+            tail = "" if delta is None else (
+                f"  {delta:+.2f}%" + ("  (inside the control's spread: null)" if row["inside_control_spread"] else "")
+            )
+            print(f"    {label:<22} {row['median_ms']:8.2f} ms  "
+                  f"({row['min_ms']:.2f}-{row['max_ms']:.2f}, spread {row['spread_pct']:.2f}%, "
+                  f"n={row['samples']}){tail}")
     if profile_result:
         print(f"  device {profile_result['device_ms_per_forward']:.2f} ms, "
               f"launch gap {profile_result['launch_gap_ms_per_forward']:.2f} ms")

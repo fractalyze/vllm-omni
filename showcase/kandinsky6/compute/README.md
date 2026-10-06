@@ -48,14 +48,35 @@ recorded run still names the locks it ran under.
 | `block_profile.py` | Times one Pro- or Lite-shaped DiT block at W1's token counts and splits the step into attention / GEMM / elementwise / norm / copy, plus the launch gap. |
 | `attn_race.py` | Races the registered diffusion attention backends at each of Kandinsky 6's five attention call sites, with accuracy against a chunked fp32 reference. |
 | `kernel_classes.py` | The ordered kernel-name table the split comes from. |
-| `test_compute_tools.py` | 34 tests, no GPU and no checkpoint. |
+| `session.sh`, `session2.sh` | The run sequences the recorded measurements used, one per GPU window. |
+| `arms/` | One `--diffusion-attention-config` value per attention arm. |
+| `results/` | The JSON each run wrote, so a published table can be audited from the tree. |
+| `test_compute_tools.py`, `test_role_masks.py` | 53 tests, no GPU and no checkpoint. |
 
 ```bash
-python block_profile.py --list-shapes                 # the derived token counts
-python block_profile.py --target fused --repeats 5     # one T2VA block at W1
+python block_profile.py --list-shapes                  # the derived token counts
+python block_profile.py --attention-config arms/tuned.json   # one T2VA block at W1
+python block_profile.py --attention-config arms/tuned.json \
+    --compare-compile --compile default                # eager vs compiled, ABBA, one process
 python attn_race.py --all-roles --json race.json       # the backend race
-/data/jooman/k6/venv/bin/python -m pytest test_compute_tools.py -q
+/data/jooman/k6/venv/bin/python -m pytest . -q
 ```
+
+`--attention-config` takes an arm file, the same JSON a server is given as
+`--diffusion-attention-config`, so a profiled block used the per-role
+selection production would use. `--backend` is the blunter form (one backend
+for every role) and the two are mutually exclusive, because they would
+disagree per role.
+
+`--compare-compile` times eager and compiled **in one process**, on the same
+module and the same inputs, in ABBA order. A ratio taken across two processes
+is a ratio across two clock states; this one is not.
+
+On a shared GPU a free window is often big enough for several runs but gets
+used for one if each queues separately. `session.sh` and `session2.sh` are the
+sequences the recorded measurements used: `run_when_free.py` takes the locks
+once and the script spends the window, with each run independent so one
+failure does not cost the rest of it.
 
 ## W1's shapes
 
@@ -94,6 +115,17 @@ those flags.
 Pro-distill's `out_visual_dim` is 160 and `out_audio_dim` 400, ten times the
 input dims: the distilled output layer emits `PiflowScheduler`'s 10-point
 policy grid, not one velocity.
+
+## A kernel no rule names is reported, never bucketed
+
+`kernel_classes.py` leaves an unmatched kernel in `unclassified` and prints it
+by name, and that design earned itself in the first profile of the tuned
+attention arm: 61.43 ms of a 260 ms block (23.5%) landed there and attention
+read as 0.7%, because the table had SageAttention's `qk_int8_sv` name from its
+other variants but not the `qk_int_sv_f8_attn_kernel` its sm_120 path actually
+emits, nor the `QuantInt8Kernel` and `MeanScaleKernel` prologues. Had the
+table folded unknown names into elementwise, the number would have been wrong
+and plausible. Those names are now in the table with a test each.
 
 ## What the accuracy numbers are and are not
 

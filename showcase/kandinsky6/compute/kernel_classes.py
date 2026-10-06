@@ -37,9 +37,17 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [
     ("attention", re.compile(r"cudnn.*(sdpa|attn|mha)|(sdpa|attn|mha).*cudnn", re.I)),
     ("attention", re.compile(r"efficient_attention|attention_kernel|scaled_dot_product", re.I)),
     ("attention", re.compile(r"BatchPrefill|batch_prefill|ragged.*prefill", re.I)),
-    # SageAttention: qk_int8_sv_f8_*, qk_int8_sv_f16_*, and its quantization
-    # prologues (per-block mean/scale over Q and K).
-    ("attention", re.compile(r"qk_int8_sv|qk_int4_sv|sageattn|sage_attn|quant_per_block|sub_mean", re.I)),
+    # SageAttention. The CUDA kernels the sm_120 path actually emits are
+    # `qk_int_sv_f8_attn_kernel` (no digit after `int`), plus two prologues --
+    # `QuantInt8Kernel` and `MeanScaleKernel` -- that quantize Q and K per
+    # block. An earlier version of this table had only the `qk_int8_sv` name
+    # from SageAttention's other variants and its Triton kernels'
+    # `quant_per_block`, so 61.43 ms of a 260 ms block (23.5%) landed in
+    # `unclassified` and attention read as 0.7%. The `\d*` and the two
+    # prologue names are the fix; the names are kept rather than loosened to
+    # `qk_` so an unrelated kernel cannot drift into the attention share.
+    ("attention", re.compile(r"qk_int\d*_sv|qk_int\d*_pv|sageattn|sage_attn", re.I)),
+    ("attention", re.compile(r"QuantInt8Kernel|MeanScaleKernel|quant_per_block|quant_per_thread|sub_mean")),
     ("attention", re.compile(r"flex_attention|triton_tem_fused_.*attention", re.I)),
     # --- GEMM ----------------------------------------------------------
     # cuBLASLt's Blackwell kernels are nvjet_*; cuBLAS classic kernels keep
