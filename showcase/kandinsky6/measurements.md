@@ -140,36 +140,54 @@ one thing: how much exact attention the arm keeps, in blocks or in steps. The
 174-184 s band is where the measured arms cross from failing to passing, and the
 arm now running is the cheapest crossing found.
 
-## The verdict: nothing here passes on both prompt sets
+## The verdict: one arm passes on both prompt sets
 
-Each set's floor is its own compiled reference against its own eager one, both
-on the same host, which is the only pairing that means anything after the
-autotune result below.
+**SageAttention2 on visual blocks 6-53, with the first sampler step exact**, on
+exact BF16 weights streamed from the mmapped checkpoint. Each set scored against
+its own floor -- that set's compiled reference against its own eager one, both on
+the same host, which is the only pairing that means anything.
 
-| set | floor mean / max | `sage2-mid` mean / max | ratio | G2 (1.25x) |
-|---|---:|---:|---:|---|
-| A | 0.1455 / 0.4160 | 0.1543 / 0.4591 | 1.06x / 1.10x | **passes** |
-| B | 0.1615 / 0.3476 | 0.1976 / 0.4989 | 1.22x / **1.44x** | **fails** |
+| set | arm mean / max | floor mean / max | ratio | G2 (1.25x) | G1 | G3 |
+|---|---:|---:|---:|---|---|---|
+| A (9 prompts) | **0.1296 / 0.3560** | 0.1455 / 0.4160 | **0.89x / 0.86x** | **passes** | mean inside, max over | **-0.07% passes** |
+| B (8 scorable) | **0.1561 / 0.3380** | 0.1615 / 0.3476 | **0.97x / 0.97x** | **passes** | both over | — |
 
-The **mean** passes on both sets. The **max** fails on set B, and on one prompt:
-b6-train-platform at 0.4989 against a 0.4345 limit, with b3-storefront-sign
-behind it. Both are text-plus-motion.
+**All four ratios are below 1.0.** The difference between this arm and the BF16
+reference is smaller than the difference between compiling that reference and
+running it eager -- on both sets, on both the mean and the worst frame. It is not
+one set getting lucky.
 
-The shape of the failure is worth stating because it is counter-intuitive. Set
-B is the harder set -- its floor mean is higher, 0.1615 against 0.1455. But its
-floor **max** is *lower*, 0.3476 against 0.4160. A floor's max is the single
-worst frame the pipeline moves by on its own, and set A happens to contain a
-clip where recompilation moves one frame a long way. So set B's max limit is
-**tighter** than set A's, exactly where this arm is worst. Expecting the harder
-set to be more forgiving is a reasonable guess and it is wrong: the mean and the
-max are set by different clips and move independently.
+Median **182.6 s** on set A (n=9, 182.4-186.7) and **183.9 s** on set B (n=9,
+182.2-186.3), cold start 22-28 s. Against the platform-default reference at
+231.8 s -- the only other configuration that passes anything -- that is **-21%**.
+Against the FP8 baseline at 173.6 s it is 5% slower, and that baseline fails
+every gate at 0.262 / 0.551.
 
-**So the user's question -- the fastest single-RTX-5090 configuration that
-produces W1 and passes the gate -- has no affirmative answer from this track
-tonight.** `sage2-mid` at 177.7 s passes the floor-relative gate at 1.06x and the
-distributional gate at +0.00% on set A, and fails the floor-relative gate's max
-on set B. Every faster arm fails by more; the only arm that passes everything is
-the reference configuration at 231.8 s, which is not an optimization.
+It does **not** pass the user's absolute gate. Set A's mean is inside (0.1296
+against 0.15) and set B's is just over (0.1561); both sets' worst frames exceed
+0.25. Given that the pipeline's own compile setting moves a worst frame by 0.416
+on set A and 0.348 on set B, no arm can clear a 0.25 absolute max here -- the
+reference cannot clear it against itself.
+
+### What fixed the prompt that failed everything else
+
+b6-train-platform was the single prompt that failed set B for every earlier arm,
+at 0.4989 against a 0.4345 limit. The block schedule alone could not reach it;
+doubling the band to 24 exact blocks took it to 0.3326 for 12 s a request. One
+exact *sampler step* took it to **0.3380** for 4.9 s, and did better on b3
+besides (0.2774 against 0.3349).
+
+| arm | b3 mean / max | b6 mean / max | request |
+|---|---:|---:|---:|
+| blocks 6-53 (12 exact) | 0.3307 / 0.3646 | 0.4387 / **0.4989** | 178.3 s |
+| blocks 12-47 (24 exact) | 0.3349 / 0.3681 | 0.2767 / 0.3326 | ~190 s |
+| **blocks 6-53 + exact step 1** | **0.2774 / 0.3084** | 0.2494 / **0.3380** | **~184 s** |
+
+**Trajectory position beats stack position.** An exact first step is worth more
+than twelve more exact blocks and costs less than half as much, which is the
+vault's Qwen-Image finding -- an error injected at an early step grows about 20x
+by the final latent -- reproduced on a different model and a different
+approximation.
 
 ## Set B is 28% harder than set A, which is why there are two sets
 
