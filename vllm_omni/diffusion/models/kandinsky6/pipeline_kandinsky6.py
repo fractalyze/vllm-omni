@@ -1507,6 +1507,11 @@ class Kandinsky6TI2VAPipeline(
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
 
+    # The direct checkpoint-mmap loader (distributed layerwise offload) binds
+    # every DiT parameter to a checkpoint key through this hook, so it must
+    # apply the same renames load_weights does.
+    _remap_ckpt_key = staticmethod(_adapt_k6_weight_name)
+
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
         """Load each Hub folder into its module.
 

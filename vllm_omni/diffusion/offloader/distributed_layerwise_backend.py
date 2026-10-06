@@ -313,16 +313,19 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     f"Rank-local mmap storage requires CPU checkpoint views, but {name!r} is on {source.device}."
                 )
 
-            dtype = source.dtype
-            offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
-            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
+            # A transform may cast (a checkpoint can store some tensors wider than
+            # the runtime dtype, which the ordinary loader casts on copy), so the
+            # staging slot is keyed by the dtype the transform produces. It must
+            # not reshape: the runtime layout is fixed by the module.
+            if runtime_source.shape != source.shape:
                 raise ValueError(
-                    "mmap weight transform changed tensor metadata for "
-                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
-                    f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
+                    "mmap weight transform changed tensor shape for "
+                    f"{name!r}: expected {tuple(source.shape)}, got {tuple(runtime_source.shape)}"
                 )
+            dtype = runtime_source.dtype
+            offset = offsets.get(dtype, 0)
             stride = runtime_source.stride()
             storage_numel = (
                 0
@@ -1594,6 +1597,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         for buffer in dit_module._buffers.values():
             if buffer is not None:
                 buffer.data = buffer.data.to(self.device, non_blocking=True)
+        self._apply_resident_mmap_transforms(dit_module, stack)
+
+    def _apply_resident_mmap_transforms(self, dit_module: nn.Module, stack: BlockStack) -> None:
+        """Apply checkpoint-to-runtime transforms to the DiT's resident tensors.
+
+        Under rank-local mmap every DiT tensor starts as a raw view of the
+        checkpoint. Streamed blocks get their transforms while being packed into
+        a staging slot; the resident parts (embeddings, output heads, top-level
+        norms) are placed with a plain ``.to(device)``, which would leave them in
+        the checkpoint's layout and dtype. Kandinsky 6's bundle stores those in
+        FP32 while the module runs in BF16, and the FP32 activations they produce
+        meet BF16 ones in the first attention call and fail there.
+        """
+        if not self._mmap_transforms_by_tensor_id:
+            return
+        streamed = {id(t) for block in stack.blocks for t in chain(block.parameters(), block.buffers())}
+        for tensor in chain(dit_module.parameters(), dit_module.buffers()):
+            if id(tensor) in streamed:
+                continue
+            transform = self._mmap_transforms_by_tensor_id.get(id(tensor))
+            if callable(transform):
+                set_tensor_storage(tensor, transform(tensor.data))
 
     def enable(self, pipeline: nn.Module) -> None:
         """Enable DLO and make partial startup failures transactional."""
