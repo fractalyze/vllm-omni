@@ -303,6 +303,16 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # tuned.json with Sage3 (FP4) on the dominant call. Its kernel is
+        # 1.27x Sage2's, so this is the fastest arm worth gating -- the
+        # objective is the fastest config that passes, and on Pro the first
+        # prompt left error budget to spend.
+        "sage3-tuned.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN_3",
+            "kandinsky6.video_audio_cross": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
     }
 
     # Roles that receive a padding mask, so a mask-rejecting backend must
@@ -320,6 +330,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("lossless", "lossless.json"),
         ("sage2_visual_only", "sage2-visual-only.json"),
         ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_arm_resolves_exactly_the_roles_it_claims(self, filename):
         import json
@@ -342,6 +353,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("lossless", "lossless.json"),
         ("sage2_visual_only", "sage2-visual-only.json"),
         ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_no_mask_rejecting_backend_on_a_masked_role(self, filename):
         """SageAttention raises on attn_mask, and the two text roles get one.
@@ -358,6 +370,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("lossless", "lossless.json"),
         ("sage2_visual_only", "sage2-visual-only.json"),
         ("sage2_accurate", "sage2-accurate.json"),
+        ("sage3_tuned", "sage3-tuned.json"),
     )
     def test_the_named_backends_exist_in_the_registry(self, filename):
         """A backend name that is not a registry member would only fail at
