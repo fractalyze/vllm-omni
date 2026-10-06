@@ -41,7 +41,13 @@ ledger alone.
 |---|---|---|---|
 | `serve/serve_pro_bf16_ref.sh` | BF16, exact | streamed from the mmapped checkpoint | the quality gate's reference; slowest |
 | `serve/serve_pro_fp8.sh` | FP8 E4M3, per-tensor scales | pinned host memory, staged per block | fails the user's quality gate |
-| `serve/serve_pro_int8.sh` | INT8, per-output-row scales | quantized at load from the BF16 checkpoint | 2.9x less weight error than FP8 at the same size |
+| `serve/serve_pro_int8.sh` | INT8, per-output-row scales | quantized at load from the BF16 checkpoint | **does not run on sm_120** — kept because the format is the right one and the kernel is the only thing missing |
+
+The INT8 script is in that table as a signpost, not an option: INT8 at per-row
+scales costs 2.9x less weight error than FP8 at the same one byte per weight,
+and consumer Blackwell has no INT8 GEMM to spend it on (CUTLASS's
+`dispatch_scaled_mm`: "Int8 not supported on SM120"). On a datacenter Blackwell
+or an Ada card it is the arm to try first.
 
 The server is ready when `curl -sf localhost:$PORT/health` succeeds. Add an
 attention arm to any of them:
