@@ -109,8 +109,29 @@ KEEP_BF16_BLOCK_PREFIXES = (
 )
 
 
-def keeps_bf16(name: str) -> bool:
-    """True when ``name`` is on the sensitive list and must stay BF16."""
+# The input and output projections only: every embedding and both output heads.
+# What `minimal` keeps.
+_MINIMAL_ROOT_PREFIXES = tuple(p for p in KEEP_BF16_ROOT_PREFIXES if not p.endswith("_text_transformer_blocks."))
+
+# Which layers stay BF16, by name. `sensitive` is the plan's full sensitive set
+# (above). `minimal` keeps only the embeddings and output heads, which are tiny;
+# it exists because the sensitive set costs host RAM the 60 GB host does not
+# have: at W1 the Pro DiT is streamed from pinned host memory, and keeping all
+# 60 blocks' modulation, both text towers and blocks 0 and 59 in BF16 puts the
+# checkpoint at 36.7 GB against 30.4 GB for `minimal` -- the difference between
+# a server that loads and one the OOM killer takes. Which one passes the quality
+# gate is what the gate is for.
+KEEP_PROFILES = ("sensitive", "minimal", "none")
+
+
+def keeps_bf16(name: str, profile: str = "sensitive") -> bool:
+    """True when ``name`` must stay BF16 under ``profile``."""
+    if profile == "none":
+        return False
+    if profile == "minimal":
+        return name.startswith(_MINIMAL_ROOT_PREFIXES)
+    if profile != "sensitive":
+        raise ValueError(f"unknown keep profile {profile!r}; expected one of {KEEP_PROFILES}")
     components = name.split(".")
     return (
         name.startswith(KEEP_BF16_ROOT_PREFIXES)
@@ -122,7 +143,7 @@ def keeps_bf16(name: str) -> bool:
 SHARD_BYTES = 4 * 1024**3
 
 
-def is_quantizable(name: str, tensor_shape: tuple[int, ...], *, protect_sensitive: bool = True) -> bool:
+def is_quantizable(name: str, tensor_shape: tuple[int, ...], *, keep: str = "sensitive") -> bool:
     """True for a 2-D linear weight that is not on the keep-wide list.
 
     Only a rank-2 ``*.weight`` is a GEMM operand. Biases, norms, RoPE buffers and
@@ -131,7 +152,7 @@ def is_quantizable(name: str, tensor_shape: tuple[int, ...], *, protect_sensitiv
     """
     if not name.endswith(".weight") or len(tensor_shape) != 2:
         return False
-    return not (protect_sensitive and keeps_bf16(name))
+    return not keeps_bf16(name, keep)
 
 
 def quantize_weight(weight: torch.Tensor, *, granularity: str = "tensor") -> tuple[torch.Tensor, torch.Tensor]:
@@ -196,7 +217,7 @@ def quantize_checkpoint(
     src: Path,
     dst: Path,
     *,
-    protect_sensitive: bool = True,
+    keep: str = "sensitive",
     granularity: str = "tensor",
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, object]:
@@ -237,7 +258,7 @@ def quantize_checkpoint(
             for name in reader.keys():  # noqa: SIM118 - safetensors reader, not a dict
                 tensor = reader.get_tensor(name)
                 bytes_in += tensor.numel() * tensor.element_size()
-                if is_quantizable(name, tuple(tensor.shape), protect_sensitive=protect_sensitive):
+                if is_quantizable(name, tuple(tensor.shape), keep=keep):
                     weight, scale = quantize_weight(tensor, granularity=granularity)
                     buffer[name] = weight
                     buffer[name.removesuffix("weight") + "weight_scale"] = scale
@@ -294,6 +315,7 @@ def quantize_checkpoint(
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
         "scale_granularity": granularity,
+        "keep_profile": keep,
         "compression": bytes_in / bytes_out if bytes_out else None,
         "seconds": time.perf_counter() - started,
     }
@@ -326,9 +348,10 @@ def main() -> None:
     parser.add_argument("--src", type=Path, required=True, help="source model root (a Diffusers snapshot)")
     parser.add_argument("--dst", type=Path, required=True, help="destination model root to create")
     parser.add_argument(
-        "--quantize-everything",
-        action="store_true",
-        help="also quantize the layers keeps_bf16() protects (a quality arm, not a default)",
+        "--keep",
+        choices=KEEP_PROFILES,
+        default="sensitive",
+        help="which layers stay BF16: the plan's sensitive set, only embeddings and heads, or none",
     )
     parser.add_argument(
         "--scale",
@@ -342,7 +365,7 @@ def main() -> None:
     report = quantize_checkpoint(
         args.src.resolve(),
         args.dst.resolve(),
-        protect_sensitive=not args.quantize_everything,
+        keep=args.keep,
         granularity=args.scale,
         shard_bytes=int(args.shard_gib * 1024**3),
     )

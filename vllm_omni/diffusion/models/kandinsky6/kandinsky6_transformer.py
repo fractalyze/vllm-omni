@@ -1390,13 +1390,22 @@ class Kandinsky6Transformer3DModel(nn.Module):
         # ---- visual backbone (shared) ----
         vis_in_dim = (2 * in_visual_dim + 1) if visual_cond else in_visual_dim
         self.visual_embeddings = Kandinsky6VisualEmbeddings(
-            vis_in_dim, model_dim, patch_size, quant_config=quant_config, prefix=child_prefix(prefix, "visual_embeddings")
+            vis_in_dim,
+            model_dim,
+            patch_size,
+            quant_config=quant_config,
+            prefix=child_prefix(prefix, "visual_embeddings"),
         )
         if self.visual_token_type_num_embeddings > 0:
             self.visual_token_type_embeddings = nn.Embedding(self.visual_token_type_num_embeddings, model_dim)
         self.visual_rope_embeddings = RoPE3D(axes_dims)
         self.out_layer = Kandinsky6OutLayer(
-            model_dim, time_dim, out_visual_dim, patch_size, quant_config=quant_config, prefix=child_prefix(prefix, "out_layer")
+            model_dim,
+            time_dim,
+            out_visual_dim,
+            patch_size,
+            quant_config=quant_config,
+            prefix=child_prefix(prefix, "out_layer"),
         )
 
         if not is_multimodal:
@@ -1472,7 +1481,10 @@ class Kandinsky6Transformer3DModel(nn.Module):
                     self,
                     f"{mod_prefix}_text_embeddings",
                     Kandinsky6TextEmbeddings(
-                        in_text_dim, md, quant_config=quant_config, prefix=child_prefix(prefix, f"{mod_prefix}_text_embeddings")
+                        in_text_dim,
+                        md,
+                        quant_config=quant_config,
+                        prefix=child_prefix(prefix, f"{mod_prefix}_text_embeddings"),
                     ),
                 )
                 setattr(

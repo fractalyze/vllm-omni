@@ -33,16 +33,16 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 from transformers import AutoProcessor as QwenAutoProcessor
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm.logger import init_logger
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.offloader.config import offload_enabled
+from vllm_omni.diffusion.offloader.config import offload_enabled, offload_streams_blocks
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -908,6 +908,7 @@ def piflow_denoise_loop(  # noqa: PLR0913
             )
 
         if _PIFLOW_DEBUG:
+
             def _stat(t, name):
                 f = t.float()
                 return (
@@ -915,11 +916,17 @@ def piflow_denoise_loop(  # noqa: PLR0913
                     f"max={f.max().item():.4g} mean={f.mean().item():.4g} "
                     f"nan={int(torch.isnan(f).sum())} inf={int(torch.isinf(f).sum())}"
                 )
+
             logger.warning(
                 "PiFlow step %d tau %.4f->%.4f sigma %.4f | %s | %s | %s | %s",
-                segment.step_index, segment.tau_src, segment.tau_dst, float(sigma_src[0]),
-                _stat(grid_video, "pred_v"), _stat(grid_audio, "pred_a"),
-                _stat(video, "video"), _stat(audio, "audio"),
+                segment.step_index,
+                segment.tau_src,
+                segment.tau_dst,
+                float(sigma_src[0]),
+                _stat(grid_video, "pred_v"),
+                _stat(grid_audio, "pred_a"),
+                _stat(video, "video"),
+                _stat(audio, "audio"),
             )
 
         if progress_callback is not None:
@@ -1130,8 +1137,7 @@ def _resolve_quant_config(od_config, transformer_config: dict):
     method = str(on_disk.get("quant_method") or on_disk.get("method") or "").lower()
     if not method:
         raise ValueError(
-            "transformer/config.json has a quantization_config without a quant_method; "
-            f"got keys {sorted(on_disk)}"
+            f"transformer/config.json has a quantization_config without a quant_method; got keys {sorted(on_disk)}"
         )
 
     from vllm.model_executor.layers.quantization import get_quantization_config
@@ -1369,9 +1375,7 @@ class Kandinsky6TI2VAPipeline(
                 resident_dit_paths=frozenset({"transformer"}),
             )
 
-        self._nonfinite_locator = (
-            _NonFiniteLocator(_raw_dit(self.transformer)) if _PIFLOW_DEBUG else None
-        )
+        self._nonfinite_locator = _NonFiniteLocator(_raw_dit(self.transformer)) if _PIFLOW_DEBUG else None
 
         if od_config is not None:
             self.setup_diffusion_pipeline_profiler(
@@ -1401,6 +1405,15 @@ class Kandinsky6TI2VAPipeline(
         # Allocating the bf16 DiT (~56 GiB) plus Qwen (~17 GiB) on the GPU
         # before weights arrive does not fit an 80 GB device.
         load_device = torch.device("cpu") if offload_enabled(od_config) else self.device
+        # Under a block-streaming policy (layerwise offload) only the DiT's
+        # blocks live on the host; the offload policy moves the encoders and
+        # VAEs to the GPU right after loading. Building them on the host first is
+        # therefore a pure transient, and it lands at the worst moment: with the
+        # Pro DiT's shards arriving, Qwen2.5-VL (16.6 GB) plus the VAEs on the
+        # host took the worker from 22 GB to 41.7 GB of RSS in six seconds on a
+        # 59 GB machine. So under block streaming everything but the DiT is built
+        # on the execution device directly.
+        component_device = self.device if offload_streams_blocks(od_config) else load_device
 
         transformer_dir = os.path.join(model_root, "transformer")
         with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
@@ -1422,13 +1435,13 @@ class Kandinsky6TI2VAPipeline(
         vae_dir = os.path.join(model_root, "vae")
         with open(os.path.join(vae_dir, "config.json"), encoding="utf-8") as handle:
             vae_config = json.load(handle)
-        with torch.device(load_device), no_init_weights():
+        with torch.device(component_device), no_init_weights():
             vae = AutoencoderKLHunyuanVideo.from_config(vae_config)
         vae.to(dtype=torch.float16)
 
         text_encoder_dir = os.path.join(model_root, "text_encoder")
         text_encoder_config = AutoConfig.from_pretrained(text_encoder_dir)
-        with torch.device(load_device), no_init_weights():
+        with torch.device(component_device), no_init_weights():
             text_encoder = Qwen2_5_VLForConditionalGeneration(text_encoder_config)
         text_encoder.to(dtype=dtype)
 
@@ -1445,7 +1458,7 @@ class Kandinsky6TI2VAPipeline(
 
         clip_dir = os.path.join(model_root, "text_encoder_2")
         clip_config = AutoConfig.from_pretrained(clip_dir)
-        with torch.device(load_device), no_init_weights():
+        with torch.device(component_device), no_init_weights():
             text_encoder_2 = CLIPTextModel(clip_config)
         text_encoder_2.to(dtype=dtype)
         tokenizer_2 = CLIPTokenizer.from_pretrained(os.path.join(model_root, "tokenizer_2"))
@@ -1454,7 +1467,7 @@ class Kandinsky6TI2VAPipeline(
         audio_vae_dir = os.path.join(model_root, "audio_vae")
         include_audio_vae = bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir)
         if include_audio_vae:
-            with torch.device(load_device), no_init_weights():
+            with torch.device(component_device), no_init_weights():
                 audio_vae = _build_audio_vae(audio_vae_dir)
             audio_vae.to(dtype=dtype)
 
@@ -1488,9 +1501,7 @@ class Kandinsky6TI2VAPipeline(
                 f"n_grid={head_grid_points}. A PiFlow scheduler needs a grid head and vice versa."
             )
         if wants_piflow:
-            scheduler = KandinskyPiflowScheduler.from_configs(
-                scheduler_json, transformer_config, device=self.device
-            )
+            scheduler = KandinskyPiflowScheduler.from_configs(scheduler_json, transformer_config, device=self.device)
         else:
             scheduler = KandinskyFlowMatchScheduler(scheduler_scale=scheduler_scale, device=self.device)
 

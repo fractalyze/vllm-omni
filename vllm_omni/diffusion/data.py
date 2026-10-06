@@ -536,6 +536,29 @@ class DiffusionParallelConfig:
         return cls(**{key: value for key, value in values.items() if value is not None})
 
 
+def _build_disk_quant_config(disk_qc: dict[str, Any], method: str | None) -> "QuantizationConfig | None":
+    """The quantization config a checkpoint declares for its own stored weights.
+
+    A ``quantization_config`` inside a checkpoint describes weights that are
+    already on disk, so it is always a *serialized* format. ``build_quant_config``
+    maps the name ``fp8`` to ``DiffusionFp8Config``, the online quantizer, which
+    builds BF16 parameters with no ``weight_scale`` and reports
+    ``is_checkpoint_fp8_serialized = False``. That breaks both consumers of this
+    config: the model cannot load the checkpoint's scales, and the loader takes
+    its online path, loading on the GPU and then moving the **whole pipeline** to
+    the host -- on Kandinsky 6 Pro that pulled the 16.6 GB text encoder back into
+    host RAM after load and the worker into the OOM killer. vLLM's own ``fp8``
+    is serialized-only (``DiffusionFp8Config``'s docstring: "Serialized FP8
+    checkpoints require upstream Fp8Config"), so a disk-declared fp8 resolves
+    there. Other methods keep the factory.
+    """
+    if str(method or "").lower() == "fp8":
+        from vllm.model_executor.layers.quantization import get_quantization_config
+
+        return get_quantization_config("fp8").from_config(dict(disk_qc))
+    return build_quant_config(disk_qc)
+
+
 @dataclass
 class TransformerConfig:
     """Container for raw transformer configuration dictionaries."""
@@ -555,7 +578,7 @@ class TransformerConfig:
         disk_qc = params.get("quantization_config")
         if isinstance(disk_qc, dict):
             raw_quant_method = disk_qc.get("quant_method", disk_qc.get("method"))
-            quant_config = build_quant_config(disk_qc)
+            quant_config = _build_disk_quant_config(disk_qc, raw_quant_method)
             if quant_config is not None:
                 quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 
