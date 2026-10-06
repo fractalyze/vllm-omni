@@ -66,6 +66,37 @@ So the band was chosen on the only signal that survives -- `sage2-mid` is the
 one band better than Sage2-everywhere on *both* screened prompts -- and the
 decision is made on its full nine-prompt set, not on the screen.
 
+## The verdict: nothing here passes on both prompt sets
+
+Each set's floor is its own compiled reference against its own eager one, both
+on the same host, which is the only pairing that means anything after the
+autotune result below.
+
+| set | floor mean / max | `sage2-mid` mean / max | ratio | G2 (1.25x) |
+|---|---:|---:|---:|---|
+| A | 0.1455 / 0.4160 | 0.1543 / 0.4591 | 1.06x / 1.10x | **passes** |
+| B | 0.1615 / 0.3476 | 0.1976 / 0.4989 | 1.22x / **1.44x** | **fails** |
+
+The **mean** passes on both sets. The **max** fails on set B, and on one prompt:
+b6-train-platform at 0.4989 against a 0.4345 limit, with b3-storefront-sign
+behind it. Both are text-plus-motion.
+
+The shape of the failure is worth stating because it is counter-intuitive. Set
+B is the harder set -- its floor mean is higher, 0.1615 against 0.1455. But its
+floor **max** is *lower*, 0.3476 against 0.4160. A floor's max is the single
+worst frame the pipeline moves by on its own, and set A happens to contain a
+clip where recompilation moves one frame a long way. So set B's max limit is
+**tighter** than set A's, exactly where this arm is worst. Expecting the harder
+set to be more forgiving is a reasonable guess and it is wrong: the mean and the
+max are set by different clips and move independently.
+
+**So the user's question -- the fastest single-RTX-5090 configuration that
+produces W1 and passes the gate -- has no affirmative answer from this track
+tonight.** `sage2-mid` at 177.7 s passes the floor-relative gate at 1.06x and the
+distributional gate at +0.00% on set A, and fails the floor-relative gate's max
+on set B. Every faster arm fails by more; the only arm that passes everything is
+the reference configuration at 231.8 s, which is not an optimization.
+
 ## Set B is 28% harder than set A, which is why there are two sets
 
 The same arm, the same eight-of-nine prompts it could be scored on (Track M's
