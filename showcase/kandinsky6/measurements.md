@@ -349,6 +349,47 @@ against 0.15) and set B's is just over (0.1561); both sets' worst frames exceed
 on set A and 0.348 on set B, no arm can clear a 0.25 absolute max here -- the
 reference cannot clear it against itself.
 
+### The primary verdict: scored against a same-host reference
+
+Everything above is scored against Track M's reference, generated on the other
+host. By the rule the autotune result forces -- an arm is charged for the
+autotune choices of whatever machine built its reference -- the number that
+isolates the arm is against a reference built **here**, with the same warm
+Inductor cache. That reference is the platform-default configuration over all
+nine set A prompts on this host.
+
+| reference | set mean | set max |
+|---|---:|---:|
+| remote, eager | 0.1296 | 0.3560 |
+| **same host, same cache** | **0.1117** | **0.3446** |
+
+**About 14% of the arm's measured mean was the two hosts' compilers**, not the
+arm.
+
+| prompt | categories | LPIPS mean | max |
+|---|---|---:|---:|
+| a5-waterfall-drone | motion | 0.0223 | 0.0248 |
+| a1-portrait-speech | face, speech | 0.0489 | 0.0976 |
+| a4-chalkboard | text, face, speech | 0.0688 | 0.0744 |
+| a9-violinist | face, motion | 0.1061 | 0.1632 |
+| a6-blacksmith | sharp-sound, face, motion | 0.1100 | 0.1930 |
+| a7-cafe-menu | text, face | 0.1237 | 0.1519 |
+| a2-neon-signage | text, motion | 0.1436 | 0.1760 |
+| a8-skateboard-crash | motion, sharp-sound | 0.1817 | 0.2452 |
+| a3-sprint-start | motion, face, sharp-sound | 0.2002 | **0.3446** |
+| **set** | | **0.1117** | **0.3446** |
+
+**Eight of the nine prompts are under the user's 0.25 max**, and the set mean
+0.1117 is comfortably inside the 0.15 limit. The arm misses the absolute gate on
+**one prompt's worst frame** -- a3-sprint-start, which is the clip whose contact
+sheet shows the arm framing the same shot slightly tighter rather than degrading
+it. A global framing shift moves every pixel and scores near a per-frame
+metric's worst; CLIP agreement on that clip is -0.43%.
+
+So the honest summary of this arm is: **inside the user's gate on the mean,
+inside it on eight of nine worst frames, and outside it on one clip where the
+metric and a viewer would disagree about whether anything is wrong.**
+
 ### What fixed the prompt that failed everything else
 
 b6-train-platform was the single prompt that failed set B for every earlier arm,
