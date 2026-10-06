@@ -9,6 +9,78 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## One-byte weights are closed on sm_120, so the lever is which blocks approximate
+
+### INT8 would be the right format and has no kernel here
+
+The weight-error table below says INT8 at per-output-row scales costs 2.9x less
+than FP8 E4M3 at the same one byte per weight. It cannot be spent on this GPU.
+CUTLASS's own dispatch refuses:
+
+    RuntimeError: dispatch_scaled_mm, scaled_mm_helper.hpp:34,
+    Int8 not supported on SM120. Use FP8 quantization instead, or run on
+    older arch (SM < 100).
+
+reached by the repo's CUDA smoke test for `Int8LinearMethod.apply` rather than
+inferred from a serving failure. The weight-only route is closed too: vLLM's
+online quantization registry has no INT8 linear, its supported online weight
+keys being FP8 (per-tensor, per-channel, per-128-block) and the MX formats.
+
+So the one-byte formats available on consumer Blackwell are FP8 E4M3 and the MX
+family, which share E4M3's 3-bit mantissa, and NVFP4, which has fewer bits
+still. With the scale-invariance result below, **no sub-BF16 weight format on
+this GPU gets under ~2.6% relative weight error**, and 2.6% measures LPIPS 0.262
+against the BF16 reference -- against a 0.15 limit. The weights have to stay
+BF16, and precision is not the lever for either track.
+
+One real bug came out of the attempt and is fixed:
+`Int8OnlineLinearMethod.process_weights_after_loading` called the CUDA-only
+`scaled_int8_quant` on `layer.weight` wherever it happened to be, which under
+layer-wise offload is host memory -- so online INT8 plus offload died during
+load on *any* architecture, not only this one.
+
+### SageAttention's accuracy knobs are dominated
+
+With the weights fixed at BF16, attention is the only lever, and Sage2's default
+dispatch is too lossy (0.1682/0.3693, below). `arms/sage2-accurate.json` turns on
+the accuracy settings -- INT8 QK at per-thread granularity, PV in FP16 with FP32
+accumulation instead of FP8, smooth_k -- and is worse on both axes:
+
+| arm | a1 mean/max | a2 mean/max | request |
+|---|---:|---:|---:|
+| Sage2, default dispatch | 0.0495 / 0.0865 | 0.1551 / 0.1780 | 163.9 s |
+| Sage2, accuracy knobs on | 0.0563 / 0.0941 | 0.1867 / 0.2148 | 192.8 s |
+
+A two-prompt screen, which is enough to stop an arm and never enough to pass
+one. The mechanism is in the dispatcher: on sm_120 `sageattn` already selects
+`pv_accum_dtype="fp32+fp16"`, a two-level accumulation, so FP16 PV with FP32
+accumulation is not an upgrade over what the default already does, and
+per-thread QK granularity costs time at 50,220 queries without buying it back.
+**An accuracy knob is only an improvement relative to what the default actually
+does**, which has to be read out of the dispatcher rather than assumed from the
+knob's name.
+
+### What was missing was a way to approximate *some* blocks
+
+Both endpoints are measured and neither is adoptable -- Sage2 on all 60 blocks
+is 165.9 s and LPIPS 0.1682/0.3693, the platform default is 232.2 s and exact --
+and nothing in between could be expressed, because an attention config is
+per-role and a role spans every block. `AttentionSpec.layers` now takes a
+half-open range of layer indices, and a layer outside it falls through to the
+rest of the existing lookup, so:
+
+```json
+{"per_role": {"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN", "layers": "6:54"}}}}
+```
+
+puts the fast kernel through blocks 6-53 and leaves the platform default at both
+ends, where a perturbation has the most of the network left to amplify it or
+lands nearly in the output. The server log confirms it resolves both ways for
+the same role:
+
+    Resolved diffusion attention backend 'SAGE_ATTN' for role='kandinsky6.visual_self' via attention_config.per_role
+    Resolved diffusion attention backend 'CUDNN_ATTN' for role='kandinsky6.visual_self' (platform default)
+
 ## What actually limits W1 on one 5090, and what a one-byte weight costs
 
 Three measurements that together pick the arms worth running. All on
