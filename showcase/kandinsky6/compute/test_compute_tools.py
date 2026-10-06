@@ -995,3 +995,34 @@ class BandedArmTest(parameterized.TestCase):
         ends, so an asymmetric band would be measuring two changes."""
         start, stop = (int(part) for part in layers.split(":"))
         self.assertEqual(start, 60 - stop, f"{filename}: {start} exact at the front, {60 - stop} at the back")
+
+
+class CompileDynamicFlagTest(parameterized.TestCase):
+    """Static-shape compilation, which this workload can use and does not by default.
+
+    The platform compiles the DiT with `dynamic=True`, which is right for a
+    server that sees many geometries. These arms only ever run W1, so
+    specialising on 50,220 tokens is available for free -- except that changing
+    compilation changes which kernels run, and on this pipeline that is worth
+    LPIPS 0.1455 against a differently-compiled reference. Hence the flag is
+    opt-in and absent by default.
+    """
+
+    def test_absent_by_default_so_the_platform_decides(self):
+        from gate_pro import serve_flags
+
+        self.assertNotIn("--diffusion-compile-dynamic", serve_flags("dlo-mmap", None, None))
+
+    @parameterized.parameters((True, "true"), (False, "false"))
+    def test_the_choice_reaches_the_server_as_a_string(self, value, expected):
+        from gate_pro import serve_flags
+
+        flags = serve_flags("dlo-mmap", None, None, compile_dynamic=value)
+        self.assertEqual(flags[flags.index("--diffusion-compile-dynamic") + 1], expected)
+
+    def test_vllm_omni_still_defaults_to_dynamic(self):
+        """If upstream ever flips this, the arm stops being a change and the
+        comparison it is in becomes a null result that looks like a win."""
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+        self.assertIs(OmniDiffusionConfig.__dataclass_fields__["diffusion_compile_dynamic"].default, True)

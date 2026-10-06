@@ -99,6 +99,7 @@ def serve_flags(
     quantization: str | None = None,
     resident_layers: int = 0,
     offload_text_encoder: bool = False,
+    compile_dynamic: bool | None = None,
 ) -> list[str]:
     """The ``vllm serve`` flags for one arm, beyond the model.
 
@@ -139,6 +140,16 @@ def serve_flags(
         flags += ["--diffusion-compile-mode", compile_mode]
     if quantization:
         flags += ["--diffusion-quantization-config", quantization]
+    if compile_dynamic is not None:
+        # The platform compiles the DiT with dynamic=True, which is right for a
+        # server that sees many geometries and wrong for this one: W1 is the only
+        # shape these arms ever run, so dynamic=False lets Inductor specialise on
+        # 50,220 tokens instead of emitting shape-generic kernels. It is a
+        # *compilation* change, not a numerical one -- but compilation changes
+        # which kernels run, and on this pipeline that is worth LPIPS 0.1455
+        # against a differently-compiled reference, so an arm built this way has
+        # to be scored against a reference built the same way.
+        flags += ["--diffusion-compile-dynamic", "true" if compile_dynamic else "false"]
     return flags
 
 
@@ -192,6 +203,12 @@ def main() -> int:
     )
     parser.add_argument("--compile-mode", default=None, help="--diffusion-compile-mode for this arm")
     parser.add_argument(
+        "--compile-dynamic",
+        choices=("true", "false"),
+        default=None,
+        help="--diffusion-compile-dynamic; the platform default is true, false specialises on W1's shapes",
+    )
+    parser.add_argument(
         "--resident-layers",
         type=int,
         default=0,
@@ -238,6 +255,7 @@ def main() -> int:
         args.quantization,
         args.resident_layers,
         args.offload_text_encoder,
+        None if args.compile_dynamic is None else args.compile_dynamic == "true",
     )
 
     arm = Arm(
@@ -261,6 +279,7 @@ def main() -> int:
         "attention_config": args.arm,
         "compile_mode": args.compile_mode,
         "quantization": args.quantization,
+        "compile_dynamic": args.compile_dynamic,
         "resident_layers": args.resident_layers,
         "offload_text_encoder": args.offload_text_encoder,
         "checkpoint": checkpoint,
