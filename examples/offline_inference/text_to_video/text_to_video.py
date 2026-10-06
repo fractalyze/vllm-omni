@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import resolve_model_class_name
+from vllm_omni.diffusion.data import DIFFUSION_COMPILE_MODES, resolve_model_class_name
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -216,6 +216,27 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def parse_diffusion_attention_config(value: str) -> dict[str, Any]:
+    """A JSON object, or a path to a file holding one.
+
+    Accepting a path matters in practice: the useful values are long enough
+    that they live in a file (for example
+    ``showcase/kandinsky6/compute/arms/tuned.json``), and a shell is then the
+    only thing standing between the file and the flag.
+    """
+    text = value
+    candidate = Path(value)
+    if candidate.is_file():
+        text = candidate.read_text()
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--diffusion-attention-config must be valid JSON or a path to it: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--diffusion-attention-config must be a JSON object")
+    return config
+
+
 def parse_extra_body(value: str) -> dict[str, Any]:
     """Parse a JSON object of model-specific extra_body params.
 
@@ -372,6 +393,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=24000,
         help="Sample rate for audio output when saved (default: 24000).",
+    )
+    parser.add_argument(
+        "--diffusion-attention-config",
+        type=parse_diffusion_attention_config,
+        default=None,
+        help=(
+            "Per-role diffusion attention selection, as JSON or a path to a JSON file. Same value the "
+            'server takes: \'{"per_role": {"wan2_2": {"self": {"backend": "SAGE_ATTN"}}}}\'.'
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-compile-mode",
+        choices=sorted(DIFFUSION_COMPILE_MODES),
+        default=None,
+        help=(
+            "torch.compile 'mode' for the DiT. Unset leaves torch's own default. 'reduce-overhead' and "
+            "'max-autotune' also capture CUDA graphs and cost compile time at start-up."
+        ),
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
@@ -562,6 +601,8 @@ def main():
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=args.enforce_eager,
+        diffusion_attention_config=args.diffusion_attention_config,
+        diffusion_compile_mode=args.diffusion_compile_mode,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,

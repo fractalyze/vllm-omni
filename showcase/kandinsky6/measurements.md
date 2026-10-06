@@ -9,14 +9,140 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
-## Making W1's checkpoint serve at all, and what host RAM costs (Track M)
+## End to end: Kandinsky 6 Lite at W1's geometry
 
-Track M, build-server-2, 2026-10-06 19:00-24:00 KST. `kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers`
-(29B) now loads and serves on one RTX 5090 with an FP8 DiT and pi-Flow sampling.
-**The served output is not yet correct**, so no latency number in this section is
-a headline and none should be quoted as one: the smoke requests return an MP4
-whose video and audio both decode to exactly zero, and the DiT's own output is
-NaN from the first step. The cause is being bisected (below).
+The measurements above are one synthetic Pro block. This is a whole request.
+Lite (3.7B) because Pro does not fit on a 32 GB card with its text encoder,
+and W1's geometry so the DiT sees the same 50,220 visual tokens as Pro would.
+Offline `Omni(...)` through
+`examples/offline_inference/text_to_video/text_to_video.py`, one request per
+arm, `--enable-cpu-offload`, seed 42, all five host GPU locks held.
+
+| arm | generation | vs control | steady-state step | peak reserved |
+|---|---:|---:|---:|---:|
+| shipped (platform attention, compiled) | 104.40 s | — | 7.38 s | 29.17 GiB |
+| shipped | 101.56 s | — | — | 29.17 GiB |
+| shipped | 99.61 s | — | — | 29.17 GiB |
+| **`arms/tuned.json`** | **78.22 s** | **−23.0%** | **4.00 s** (−45.8%) | 29.17 GiB |
+| `arms/tuned.json` again | **72.53 s** | **−28.6%** | — | 29.17 GiB |
+| `arms/tuned.json` + `max-autotune-no-cudagraphs` | 142.56 s | +40.4% | 4.00 s | 29.17 GiB |
+| `arms/tuned.json` + `mode="max-autotune"` | **raises** | — | — | — |
+| `mode="reduce-overhead"` | **raises** | — | — | — |
+
+Three controls spanning 99.61–104.40 s (median 101.56, spread 4.7%) and two
+candidate runs at 78.22 and 72.53 s (median 75.38), so the effect is
+**−25.8%** on the medians — against a control spread of 4.7%. The two
+candidate runs differ by 7.3%, more than the controls do, which is worth
+saying rather than hiding: both were cold processes and the spread of a
+single-request cold measurement is simply wider than the steady-state step
+figure beside it. Output verified as H.264 864x480, 121 frames,
+5.06 s, plus AAC 44.1 kHz (219 audio frames) — the joint path, not video only.
+
+The **steady-state step** is the slope of the progress bar between step 2 and
+step 10, which separates the first step's compilation from the per-step
+compute. It matters because the two columns tell different stories: the
+attention arm takes a step from 7.38 s to 4.00 s (**−45.8%**) while taking the
+request only −23.0%, because a request also carries the first step's compile
+and about 19 s of stages outside the denoise loop. On a warm server serving
+many requests the per-step figure is the one that compounds; for the
+single-request headline the whole-request figure is the honest one.
+
+### `max-autotune-no-cudagraphs` gives this model nothing
+
+It is the one value of `--diffusion-compile-mode` that does not capture CUDA
+graphs, so it was the remaining candidate after the other two raised. It costs
+**+40.4%** on the request and its **steady-state step is identical to the
+attention arm's, 4.00 s**: the entire difference is compile time, about 65 s
+more in the first step, and the Triton GEMM templates buy nothing back.
+
+That contradicts the block measurement, where `max-autotune` took the block
+GEMMs from 145.55 ms to 125.15 (−14%) — and the resolution is a scale the two
+measurements do not share. The block was **Pro-shaped** (`model_dim` 4096);
+this request is **Lite** (1792). Triton beating cuBLAS at one GEMM width says
+nothing about another. So the flag may still pay on Pro, and that is
+untestable on this host until Pro fits.
+
+The general caution is the one worth keeping: a Pro-shaped block result does
+not transfer to a Lite-shaped request, in either direction.
+
+### The block-level CUDA-graph win does not survive a real pipeline
+
+`mode="max-autotune"` was −38.5% on one block in isolation. On a request both
+it and `mode="reduce-overhead"` raise:
+
+```
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been
+overwritten by a subsequent run.
+  ... kandinsky6_transformer.py Kandinsky6TransformerEncoderBlock.forward
+  ... kandinsky6_transformer.py apply_gate_sum
+```
+
+The cause looks structural, not incidental. `regionally_compile` compiles each
+repeated block, so a DiT replays many captured graphs back to back — and the
+**residual stream holds a reference across block boundaries**:
+`apply_gate_sum(x, out, gate)` reads the previous block's output. CUDA-graph
+trees assume a graph's output is consumed before the next replay, so that
+reference points at reclaimed memory. Nothing here is Kandinsky-specific; any
+model whose `_repeated_blocks` pass a residual through should be expected to
+hit it.
+
+Both modes fail identically, which is what identifies the graph capture rather
+than `max-autotune`'s GEMM autotuning as the cause.
+
+**This is the single most useful thing the end-to-end run produced.** A 38.5%
+block-level win that raises on the first real request is worth less than
+nothing if it is published as a speedup, and nothing in the block measurement
+— timing, output comparison, or profile — could have revealed it. The arms
+were all one block deep, and the failure needs two.
+
+Taken with the `max-autotune-no-cudagraphs` result below, the honest summary
+of `--diffusion-compile-mode` on Kandinsky 6 is that **no value of it helps**:
+the two that capture graphs raise, and the one that does not costs compile
+time for no steady-state gain at this model's GEMM widths.
+
+### So the adoptable change is the attention arm
+
+−23.0% on a whole request, from one config value and no code change:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers \
+    --model-class-name Kandinsky6TI2VAPipeline --enable-cpu-offload \
+    --height 480 --width 864 --num-frames 121 --num-inference-steps 10 \
+    --diffusion-attention-config showcase/kandinsky6/compute/arms/tuned.json
+```
+
+It is still **ungated on quality**: `approx` tier by attention-kernel error on
+synthetic activations, never scored against a BF16 reference.
+
+### Two numbers for Track M
+
+**About 19 s of the request is outside the denoise loop** — text encode, video
+VAE decode, audio decode, mux. Measured on the profiled run: 114.40 s total
+against a 95.4 s denoise loop. That is 17% of a request that none of the block
+work touches.
+
+**Peak reserved is 29.17 GiB of 32, and the peak is the VAE decode, not the
+DiT.** The process sat at 30.5 GB with the denoise already finished, and the
+figure is identical across every arm — including the one that made the DiT 23%
+faster. For a 3.7B model. Whatever fits Pro will be decided by the decode as
+much as by the weights, so `--vae-use-slicing`, `--vae-use-tiling` and the
+batch-parallel decode are worth pricing before any more DiT work.
+
+## Making W1's checkpoint serve on one 5090 with a 60 GB host (Track M)
+
+Track M, build-server-2, 2026-10-06. `kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers`
+(29B) now serves W1 end to end on one RTX 5090 with an FP8 DiT and pi-Flow
+sampling: the first correct W1 request (21:13 KST) returned a 2.4 MB MP4 with
+121 frames and 44.1 kHz audio, every DiT module output finite. **Its 249.5 s is
+not a headline**: it was one request on a server with per-module NaN probes on,
+which synchronize after every module. The timed W1 baseline follows in its own
+section. Two defects remain open and are stated below: the decoded video is
+816x448 rather than 864x480, and host RSS is 33 GB against a 25 GB goal.
+
+The first end-to-end requests returned a black, silent MP4 with
+`status: completed`; the history of that bug and its fix is kept below because
+the fix is a whole-class one (any FP8 layer meant to stay BF16).
 
 ### FP8 conversion of the DiT
 
@@ -93,7 +219,7 @@ server. One server at a time on a 60 GB host, and nothing heavy beside it.
 The smoke geometry has about 4.5k visual tokens against W1's 50k, so it
 exercises the plumbing and not the workload.
 
-### The zero-output bug: what is ruled out, and by what
+### The zero-output bug: fixed (`ca247172d`), and how it was found
 
 | hypothesis | tested by | verdict |
 |---|---|---|
@@ -113,6 +239,21 @@ pi-Flow head. The two differ from Track C's working arm in exactly those two
 ways, which is what the next experiment separates: Lite-**distill** is BF16 *and*
 pi-Flow *and* has the same n_grid-10 heads, so a correct video there indicts FP8
 and a NaN there indicts the head handling.
+
+**Cause and fix.** It was neither of those: Lite-distill in BF16 produced correct
+video on this branch, so pi-Flow and the wide heads were fine, and FP8 Lite
+reproduced the NaN in a one-minute loop. An in-worker locator then named the
+first non-finite module -- `video_text_embeddings.in_layer`, a layer the
+checkpoint meant to keep in BF16. Two faults, both in naming the unquantized
+layers: every layer prefix began with "." (the DiT's root prefix is empty and
+`f"{prefix}.{name}"` was unguarded), and the quantizer wrote `ignored_layers` as
+checkpoint keys while vLLM matches module paths, which differ for the three
+remapped families. Either way the layer was built as FP8, its `weight_scale`
+was absent from the checkpoint, and nothing requires a scale to be filled, so it
+kept its `torch.empty` contents. Ruled out on the way, each by a run:
+modulation quantized, text padding into cross-attention, 0-dim scales, and
+CLIP (the pooled embedding entering the DiT was finite). After the fix FP8 Lite
+returns a 281 KB MP4 (pixels mean 150.6, std 49.0; audio rms 0.186).
 
 Instrumentation left behind, gated on `VLLM_OMNI_K6_PIFLOW_DEBUG=1`: per-step
 latent and DiT-output statistics inside the pi-Flow loop, plus the final latents,
