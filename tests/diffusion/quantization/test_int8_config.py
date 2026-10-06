@@ -19,6 +19,30 @@ npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="N
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 
 
+def _has_int8_scaled_mm() -> bool:
+    """Whether this GPU has an INT8 W8A8 GEMM at all.
+
+    CUTLASS's `dispatch_scaled_mm` refuses on sm_120 (consumer Blackwell, e.g.
+    RTX 5090) with "Int8 not supported on SM120. Use FP8 quantization instead,
+    or run on older arch (SM < 100)". The INT8 *path* is still worth testing
+    there -- weights quantize, parameters are created, offload staging works --
+    but a forward through the kernel cannot run, so the tests that call one are
+    skipped rather than left failing.
+    """
+    if not current_omni_platform.is_cuda():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    return major < 12
+
+
+int8_mm_available = pytest.mark.skipif(
+    not _has_int8_scaled_mm(), reason="no INT8 scaled_mm on this architecture (sm_120 and newer consumer parts)"
+)
+
+
 def test_int8_config_creation():
     """Test that Int8 config can be created."""
     config = build_quant_config("int8")
@@ -470,7 +494,20 @@ class TestInt8OnlineLinearMethod:
         layer = Module()
         layer.weight = Parameter(torch.randn(128, 64))
         method.process_weights_after_loading(layer)
-        mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
+
+        # Quantized once, on the device the kernel can run on, with the weight's
+        # own values. It is deliberately not `layer.weight` itself: that weight
+        # may be in host memory under layer-wise offload, where
+        # `scaled_int8_quant` has no implementation, so the method stages a copy.
+        # Comparing against the parameter directly would also raise here, since
+        # the two live on different devices.
+        from vllm_omni.quantization.int8_config import kernel_device
+
+        mock_deps["quant"].assert_called_once()
+        passed = mock_deps["quant"].call_args.args[0]
+        assert passed.device == kernel_device()
+        assert torch.equal(passed.cpu(), layer.weight.detach().cpu())
+        assert mock_deps["quant"].call_args.kwargs == {"scale": None}
 
 
 @npu_available
@@ -610,6 +647,7 @@ class TestNPUInt8Smoke:
 
 
 @cuda_available
+@int8_mm_available
 class TestCudaInt8Smoke:
     """Smoke tests using real CUDA kernels, only on CUDA"""
 
