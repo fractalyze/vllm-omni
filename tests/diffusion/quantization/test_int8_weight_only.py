@@ -18,13 +18,16 @@ import importlib.util
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from absl.testing import absltest
 
 from vllm_omni.diffusion.data import TransformerConfig
 from vllm_omni.quantization.int8_config import (
+    FP8_BAND_ENV,
     DiffusionInt8Config,
+    Int8Fp8BandLinearMethod,
     Int8WeightOnlyLinearMethod,
     dequantize_int8_rows,
 )
@@ -246,6 +249,71 @@ class WeightOnlyModelTest(absltest.TestCase):
         video_int8, audio_int8 = self._forward(int8)
         self.assertTrue(torch.equal(video_ref, video_int8))
         self.assertTrue(torch.equal(audio_ref, audio_int8))
+
+
+class Fp8BandTest(absltest.TestCase):
+    """``VLLM_OMNI_INT8_FP8_BAND`` moves matching layers to a load-time FP8 GEMM."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _init_single_rank(self)
+        self.quantizer = _load_quantizer()
+
+    def _layer(self, prefix: str, out_features: int = 64, in_features: int = 128):
+        from vllm.model_executor.layers.linear import ReplicatedLinear
+
+        with mock.patch.dict(os.environ, {FP8_BAND_ENV: r"blocks\.1\..*feed_forward"}):
+            config = DiffusionInt8Config(is_checkpoint_int8_serialized=True, weight_only=True)
+        return ReplicatedLinear(
+            in_features, out_features, bias=False, quant_config=config, prefix=prefix, params_dtype=torch.bfloat16
+        )
+
+    def test_band_dispatch(self) -> None:
+        inside = self._layer("blocks.1.video.feed_forward.in_layer")
+        outside = self._layer("blocks.0.video.feed_forward.in_layer")
+        self.assertIsInstance(inside.quant_method, Int8Fp8BandLinearMethod)
+        self.assertIsInstance(outside.quant_method, Int8WeightOnlyLinearMethod)
+
+    def test_no_band_without_the_variable(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(FP8_BAND_ENV, None)
+            config = DiffusionInt8Config(is_checkpoint_int8_serialized=True, weight_only=True)
+        self.assertIsNone(config.fp8_band)
+
+    def _loaded(self, prefix: str):
+        layer = self._layer(prefix)
+        weight = (torch.randn(64, 128, generator=torch.Generator().manual_seed(3)) * 0.05).to(torch.bfloat16)
+        q, scale = self.quantizer.quantize_weight_int8(weight)
+        with torch.no_grad():
+            layer.weight.copy_(q)
+            layer.weight_scale.copy_(scale)
+        int8_weight = dequantize_int8_rows(q, scale, torch.bfloat16)
+        layer.quant_method.process_weights_after_loading(layer)
+        return layer, int8_weight
+
+    def test_requantizes_the_int8_weight_to_per_tensor_fp8(self) -> None:
+        layer, int8_weight = self._loaded("blocks.1.video.feed_forward.in_layer")
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(layer.weight_scale.shape), (1,))
+        fp8_weight = layer.weight.to(torch.float32) * layer.weight_scale
+        # E4M3 keeps 3 mantissa bits: relative error at most 2^-4 per element,
+        # plus subnormal flush near zero; the Frobenius error is far smaller.
+        relative = (fp8_weight - int8_weight.float()).norm() / int8_weight.float().norm()
+        self.assertLess(float(relative), 0.05)
+
+    def test_forward_matches_a_bf16_gemm_within_fp8_error(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
+        layer, int8_weight = self._loaded("blocks.1.video.feed_forward.in_layer")
+        layer = layer.cuda()
+        x = torch.randn(3, 32, 128, generator=torch.Generator().manual_seed(4)).to(torch.bfloat16).cuda()
+        with torch.no_grad():
+            out = layer(x)[0]
+        reference = torch.nn.functional.linear(x.float(), int8_weight.float().cuda())
+        self.assertEqual(tuple(out.shape), (3, 32, 64))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        relative = (out.float() - reference).norm() / reference.norm()
+        self.assertLess(float(relative), 0.08)
 
 
 class ScaleSourceDtypeTest(absltest.TestCase):

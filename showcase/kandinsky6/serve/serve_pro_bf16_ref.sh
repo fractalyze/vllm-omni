@@ -10,6 +10,10 @@ export HF_HOME=${HF_HOME:-/data/jooman/hf}
 export PATH=/data/jooman/k6/venv/bin:$PATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-131072}
+# One Inductor cache for every arm and reference on this host. Compiled runs are
+# bit-identical only when they reuse the same autotune choices, and the gate
+# compares an arm against a compiled BF16 reference, so both must read it.
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/data/jooman/k6/inductor-cache}
 exec /data/jooman/k6/venv/bin/vllm serve ${K6_BF16_MODEL:-kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers} \
   --omni --host 127.0.0.1 --port ${K6_PORT:-8094} \
   --num-gpus 1 \

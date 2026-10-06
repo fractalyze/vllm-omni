@@ -6,6 +6,8 @@ Supports both online (dynamic) and offline (checkpoint) INT8 quantization
 on CUDA and NPU platforms.
 """
 
+import os
+import re
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -155,6 +157,26 @@ def dequantize_int8_rows(weight: torch.Tensor, scale: torch.Tensor, dtype: torch
     return (weight.to(torch.float32) * scale.to(torch.float32)).to(dtype)
 
 
+# Regular expression over layer prefixes. In a weight-only INT8 model, matching
+# layers are re-quantized once at load to per-tensor FP8 and run an FP8 GEMM
+# (Int8Fp8BandLinearMethod); the rest keep INT8 storage and BF16 compute. A scan
+# over bands is then an environment change, not a new checkpoint.
+FP8_BAND_ENV = "VLLM_OMNI_INT8_FP8_BAND"
+FP8_E4M3_MAX = 448.0
+
+
+def quantize_fp8_per_tensor(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``weight`` -> per-tensor ``float8_e4m3fn`` and its FP32 scale, shape ``(1,)``.
+
+    ``amax / 448`` in FP32; an all-zero tensor gets scale 1.0.
+    """
+    as_float = weight.to(torch.float32)
+    amax = as_float.abs().amax()
+    scale = torch.where(amax > 0, amax / FP8_E4M3_MAX, torch.ones_like(amax))
+    quantized = (as_float / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return quantized, scale.reshape(1)
+
+
 def create_weight_parameter(
     output_size_per_partition: int,
     input_size_per_partition: int,
@@ -201,6 +223,8 @@ class DiffusionInt8Config(QuantizationConfig):
         if weight_only and not is_checkpoint_int8_serialized:
             raise ValueError("weight_only INT8 requires a serialized INT8 checkpoint")
         self.weight_only = weight_only
+        band = os.environ.get(FP8_BAND_ENV, "") if weight_only else ""
+        self.fp8_band = re.compile(band) if band else None
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
@@ -265,6 +289,8 @@ class DiffusionInt8Config(QuantizationConfig):
                     raise NotImplementedError("The current platform is not supported int8 online quant.")
                 return online_method
             elif self.weight_only:
+                if self.fp8_band is not None and self.fp8_band.search(prefix):
+                    return Int8Fp8BandLinearMethod(self)
                 return Int8WeightOnlyLinearMethod(self)
             else:
                 if current_omni_platform.is_cuda():
@@ -550,6 +576,48 @@ class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
     ) -> torch.Tensor:
         weight = dequantize_int8_rows(layer.weight, layer.weight_scale, x.dtype)
         return self._gemm_impl(layer, x, weight, bias)
+
+
+class Int8Fp8BandLinearMethod(BaseInt8LinearMethod):
+    """A weight-only INT8 layer re-quantized at load to run an FP8 GEMM.
+
+    Loads the INT8 checkpoint's weight and row scales like
+    ``Int8WeightOnlyLinearMethod``, then, once, dequantizes them to the BF16
+    weight the INT8 model computes with and quantizes that to per-tensor FP8.
+    ``apply`` quantizes the activation per tensor (dynamic) and calls
+    ``torch._scaled_mm`` -- cuBLASLt, the same call as vLLM's
+    ``PerTensorTorchFP8ScaledMMLinearKernel``, and 1.4-1.5x CUTLASS's FP8 GEMM at
+    Kandinsky 6 Pro's W1 shapes on sm_120.
+
+    The weight is rounded twice (INT8, then FP8). FP8's per-tensor error is
+    about three times INT8's per-row error, so the second rounding dominates.
+    Everything in ``process_weights_after_loading`` is host-safe torch, since
+    the parameters live in host memory under offload.
+    """
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        dequantized = dequantize_int8_rows(layer.weight.data, layer.weight_scale.data, layer.orig_dtype)
+        weight, scale = quantize_fp8_per_tensor(dequantized)
+        replace_parameter(layer, "weight", torch.nn.Parameter(weight, requires_grad=False))
+        replace_parameter(layer, "weight_scale", torch.nn.Parameter(scale, requires_grad=False))
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_fp8, x_scale = ops.scaled_fp8_quant(x_2d, None)
+        out = torch._scaled_mm(
+            x_fp8,
+            layer.weight.t(),
+            scale_a=x_scale.reshape(1),
+            scale_b=layer.weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
+        )
+        return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class NPUInt8LinearMethod(BaseInt8LinearMethod):
