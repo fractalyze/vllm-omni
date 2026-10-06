@@ -280,6 +280,13 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # The two cheap audio roles only. Dense bf16 either way, so this arm
+        # is the one expected to sit at the gate's noise floor -- `tuned.json`
+        # does not (set mean LPIPS 0.118 against a 0.05 limit).
+        "lossless.json": {
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
     }
 
     # Roles that receive a padding mask, so a mask-rejecting backend must
@@ -294,6 +301,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
     )
     def test_arm_resolves_exactly_the_roles_it_claims(self, filename):
         import json
@@ -313,6 +321,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
     )
     def test_no_mask_rejecting_backend_on_a_masked_role(self, filename):
         """SageAttention raises on attn_mask, and the two text roles get one.
@@ -326,6 +335,7 @@ class AttentionArmConfigTest(parameterized.TestCase):
         ("sage3", "sage3.json"),
         ("flash", "flash.json"),
         ("tuned", "tuned.json"),
+        ("lossless", "lossless.json"),
     )
     def test_the_named_backends_exist_in_the_registry(self, filename):
         """A backend name that is not a registry member would only fail at
@@ -536,7 +546,6 @@ class NablaGeometryTest(parameterized.TestCase):
     )
     def test_sparse_params_accepts_only_a_divisible_grid(self, geometry, expected_ok):
         import torch
-
         from block_profile import GEOMETRIES, PRO, Shapes, sparse_params
 
         shapes = Shapes(**GEOMETRIES[geometry])
@@ -564,3 +573,47 @@ class NablaGeometryTest(parameterized.TestCase):
         rope = torch.zeros(frames, height, width, 1, 4, 2, 2)
         with self.assertRaises(RuntimeError):
             fractal_flatten(x, rope, (frames, height, width), block_mask=True)
+
+
+class GateTierTest(parameterized.TestCase):
+    """The two bars are separate and both are reported.
+
+    The adoption gate (mean <= 0.15, max <= 0.25) says whether an arm may
+    ship; the `approx` tier (0.05 / 0.10) says what to call it. An arm can
+    clear the first and still be `lossy`, and a showcase that collapses the
+    two is how a lossy arm gets published as near-lossless.
+    """
+
+    @parameterized.named_parameters(
+        # (set_mean, set_max, noise_floor_max, expected tier)
+        ("identical", 0.0, 0.0, None, "exact"),
+        ("inside_the_noise_floor", 0.001, 0.0025, 0.0030, "reorder"),
+        ("above_the_floor_but_tight", 0.01, 0.02, 0.0030, "approx"),
+        ("no_floor_measured_never_reorder", 0.001, 0.0025, None, "approx"),
+        ("sage2_on_set_a", 0.1178, 0.3745, 0.0030, "lossy"),
+        ("mean_ok_max_not", 0.02, 0.2, 0.0030, "lossy"),
+    )
+    def test_tier(self, set_mean, set_max, floor, expected):
+        from gate_score import tier
+
+        self.assertEqual(tier(set_mean, set_max, floor), expected)
+
+    def test_sage2_on_set_a_passes_the_mean_and_fails_the_max(self):
+        """The measured numbers, as a regression on the limits themselves: if
+        someone widens a limit, this says which conclusion changes."""
+        from gate_score import ADOPTION_MAX_LPIPS, ADOPTION_MEAN_LPIPS
+
+        set_mean, set_max = 0.1178, 0.3745
+        self.assertLessEqual(set_mean, ADOPTION_MEAN_LPIPS)
+        self.assertGreater(set_max, ADOPTION_MAX_LPIPS)
+
+    def test_the_adoption_bar_is_looser_than_the_approx_tier(self):
+        from gate_score import (
+            ADOPTION_MAX_LPIPS,
+            ADOPTION_MEAN_LPIPS,
+            APPROX_MAX_LPIPS,
+            APPROX_MEAN_LPIPS,
+        )
+
+        self.assertGreater(ADOPTION_MEAN_LPIPS, APPROX_MEAN_LPIPS)
+        self.assertGreater(ADOPTION_MAX_LPIPS, APPROX_MAX_LPIPS)

@@ -21,16 +21,57 @@ set passed at 0.034 and another failed at 0.162.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-# The gate of PLAN.md, for the `approx` tier.
-GATE_MEAN_LPIPS = 0.05
-GATE_MAX_LPIPS = 0.10
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gpulock import GpuLocks, foreign_gpu_procs  # noqa: E402
+
+# Two bars, deliberately separate.
+#
+# ADOPTION is the user's gate for this showcase (set 2026-10-06): per prompt
+# set, LPIPS mean <= 0.15 and max <= 0.25 against the same-checkpoint BF16
+# reference. An arm that clears it may ship.
+#
+# APPROX is PLAN.md's and the world-model vocabulary's `approx` tier, which is
+# a far tighter claim about how close to the reference an arm is. Both are
+# reported because they answer different questions: "may we ship this" and
+# "what do we call it". An arm can be adoptable and still be `lossy`, and
+# saying so is the point -- a showcase that calls a lossy arm near-lossless is
+# the failure mode these two numbers exist to prevent.
+ADOPTION_MEAN_LPIPS = 0.15
+ADOPTION_MAX_LPIPS = 0.25
+APPROX_MEAN_LPIPS = 0.05
+APPROX_MAX_LPIPS = 0.10
+
+# Kept for callers that imported the old names.
+GATE_MEAN_LPIPS = ADOPTION_MEAN_LPIPS
+GATE_MAX_LPIPS = ADOPTION_MAX_LPIPS
+
+
+def tier(set_mean: float, set_max: float, noise_floor_max: float | None = None) -> str:
+    """The world-model tier for a set's LPIPS pair.
+
+    ``reorder`` needs a noise floor to mean anything: an arm indistinguishable
+    from the reference *at this pipeline's reproducibility* is a reordering,
+    not an approximation, and without the floor there is no way to tell that
+    from a lucky `approx`. Callers that have not measured the floor get
+    `approx` at worst, never `reorder`.
+    """
+    if set_max == 0.0:
+        return "exact"
+    if noise_floor_max is not None and set_max <= noise_floor_max:
+        return "reorder"
+    if set_mean <= APPROX_MEAN_LPIPS and set_max <= APPROX_MAX_LPIPS:
+        return "approx"
+    return "lossy"
 
 
 def _load(directory: Path, prompt_id: str) -> dict:
@@ -64,13 +105,25 @@ def video_scores(reference: np.ndarray, candidate: np.ndarray, device: torch.dev
             per_frame.extend(net(ref[start:stop], cand[start:stop]).flatten().tolist())
     per_frame_array = np.asarray(per_frame, dtype=np.float64)
 
-    # PSNR and SSIM on [0, 1], over the whole clip.
-    ref01 = (ref + 1.0) / 2.0
-    cand01 = (cand + 1.0) / 2.0
-    mse = float(torch.mean((ref01 - cand01) ** 2))
-    psnr = float("inf") if mse == 0 else 10.0 * math.log10(1.0 / mse)
+    # PSNR and SSIM on [0, 1]. Both are computed in frame batches: SSIM
+    # concatenates five tensors the size of its input, so a whole 121-frame
+    # clip at 480x864 asks for 2.9 GB in one allocation and OOMs on a GPU that
+    # is doing anything else. Batching makes the scorer cost about a frame's
+    # worth of memory, which also means it can run beside other work.
+    squared_error = 0.0
+    ssim_sum = 0.0
+    batches = 0
     with torch.inference_mode():
-        ssim = float(structural_similarity_index_measure(cand01, ref01, data_range=1.0))
+        for start in range(0, ref.shape[0], batch):
+            stop = start + batch
+            ref01 = (ref[start:stop] + 1.0) / 2.0
+            cand01 = (cand[start:stop] + 1.0) / 2.0
+            squared_error += float(torch.sum((ref01 - cand01) ** 2))
+            ssim_sum += float(structural_similarity_index_measure(cand01, ref01, data_range=1.0)) * ref01.shape[0]
+            batches += ref01.shape[0]
+    mse = squared_error / float(ref.numel())
+    psnr = float("inf") if mse == 0 else 10.0 * math.log10(1.0 / mse)
+    ssim = ssim_sum / max(batches, 1)
 
     return {
         "lpips_mean": round(float(per_frame_array.mean()), 6),
@@ -163,8 +216,37 @@ def main() -> int:
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--no-locks",
+        action="store_true",
+        help="score without taking the host GPU locks. Only for a CPU run (--device cpu) or when "
+        "nothing else is using the GPU: scoring on a shared GPU can perturb a timed run",
+    )
+    parser.add_argument(
+        "--noise-floor-max",
+        type=float,
+        default=None,
+        help="the max LPIPS of a same-arm control run, which is what lets an arm be called `reorder` "
+        "rather than a lucky `approx`. Measured on this pipeline as 0.0030",
+    )
     args = parser.parse_args()
 
+    # The scorer runs on the GPU, so it takes the host's locks like anything
+    # else that does. This is not ceremony: scoring without them once stole
+    # 6.4 GB from a timed ABBA comparison that was holding them, which is
+    # exactly the contamination the locks exist to prevent.
+    with contextlib.ExitStack() as stack:
+        if not args.no_locks:
+            stack.enter_context(GpuLocks())
+            foreign = foreign_gpu_procs()
+            if foreign:
+                print("foreign process(es) on the GPU; scoring anyway, but this is shared:", file=sys.stderr)
+                for proc in foreign:
+                    print(f"  {proc}", file=sys.stderr)
+        return _score(args)
+
+
+def _score(args) -> int:
     ref_manifest = json.loads((args.reference / "manifest.json").read_text())
     cand_manifest = json.loads((args.candidate / "manifest.json").read_text())
     if ref_manifest["geometry"] != cand_manifest["geometry"]:
@@ -196,29 +278,38 @@ def main() -> int:
 
     means = [r["video"]["lpips_mean"] for r in rows]
     maxes = [r["video"]["lpips_max"] for r in rows]
+    set_mean = round(float(np.mean(means)), 6) if means else None
+    set_max = round(float(np.max(maxes)), 6) if maxes else None
     verdict = {
         "prompts": len(rows),
-        "set_lpips_mean": round(float(np.mean(means)), 6) if means else None,
-        "set_lpips_max": round(float(np.max(maxes)), 6) if maxes else None,
-        "gate_mean_limit": GATE_MEAN_LPIPS,
-        "gate_max_limit": GATE_MAX_LPIPS,
+        "set_lpips_mean": set_mean,
+        "set_lpips_max": set_max,
+        "adoption_mean_limit": ADOPTION_MEAN_LPIPS,
+        "adoption_max_limit": ADOPTION_MAX_LPIPS,
+        "approx_mean_limit": APPROX_MEAN_LPIPS,
+        "approx_max_limit": APPROX_MAX_LPIPS,
+        "noise_floor_max": args.noise_floor_max,
     }
-    verdict["passes_approx_gate"] = bool(
-        means and verdict["set_lpips_mean"] <= GATE_MEAN_LPIPS and verdict["set_lpips_max"] <= GATE_MAX_LPIPS
+    verdict["passes_adoption_gate"] = bool(
+        means and set_mean <= ADOPTION_MEAN_LPIPS and set_max <= ADOPTION_MAX_LPIPS
     )
-    # Name the prompts that fail on their own, not just the set aggregate: the
-    # gate is a set threshold, but a single bad prompt is the finding.
-    verdict["prompts_over_max_limit"] = [
-        r["id"] for r in rows if r["video"]["lpips_max"] > GATE_MAX_LPIPS
-    ]
+    verdict["passes_approx_tier"] = bool(means and set_mean <= APPROX_MEAN_LPIPS and set_max <= APPROX_MAX_LPIPS)
+    verdict["tier"] = tier(set_mean, set_max, args.noise_floor_max) if means else "unmeasured"
+    # Name the prompts that breach on their own. The gate is a set threshold,
+    # but which prompt breaches is the finding -- an arm that fails only on
+    # rendered text is a different problem from one that fails everywhere.
+    verdict["prompts_over_adoption_max"] = [r["id"] for r in rows if r["video"]["lpips_max"] > ADOPTION_MAX_LPIPS]
+    verdict["prompts_over_approx_max"] = [r["id"] for r in rows if r["video"]["lpips_max"] > APPROX_MAX_LPIPS]
 
     print(
-        f"\nset: mean LPIPS {verdict['set_lpips_mean']} (limit {GATE_MEAN_LPIPS}), "
-        f"max {verdict['set_lpips_max']} (limit {GATE_MAX_LPIPS}) -> "
-        + ("PASSES approx" if verdict["passes_approx_gate"] else "FAILS approx")
+        f"\nset: mean LPIPS {set_mean}, max {set_max}"
+        f"\n  adoption gate (mean <= {ADOPTION_MEAN_LPIPS}, max <= {ADOPTION_MAX_LPIPS}): "
+        + ("PASSES" if verdict["passes_adoption_gate"] else "FAILS")
+        + f"\n  tier: {verdict['tier']}"
+        + (f" (noise floor max {args.noise_floor_max})" if args.noise_floor_max is not None else "")
     )
-    if verdict["prompts_over_max_limit"]:
-        print("over the max limit on their own: " + ", ".join(verdict["prompts_over_max_limit"]))
+    if verdict["prompts_over_adoption_max"]:
+        print("over the adoption max on their own: " + ", ".join(verdict["prompts_over_adoption_max"]))
 
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,87 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## The quality gate: SageAttention on Kandinsky 6 is lossy, not approx
+
+This is the section that decides whether the speed numbers below are
+adoptable, and the answer is no for the attention arms.
+
+Scored the way [PLAN.md](PLAN.md) sets the gate: the same checkpoint, the same
+prompts, the same seeds, LPIPS per frame against the arm the model ships with
+— which is cuDNN in bf16 and so *is* the BF16 reference the gate asks for.
+Prompt set A, eight prompts, Kandinsky 6 Lite at W1's geometry. (Lite because
+Pro does not fit a 32 GB card with its text encoder.)
+
+| arm | set mean LPIPS | set max | verdict | prompts over the 0.10 max |
+|---|---:|---:|---|---:|
+| gate limits for `approx` | 0.05 | 0.10 | — | — |
+| `arms/tuned.json` (Sage2) | **0.1178** | **0.3745** | **FAILS** | 6 of 8 |
+| `arms/sage3.json` (Sage3) | **0.2530** | **0.5310** | **FAILS** | 8 of 8 |
+| *the same arm twice* | 0.0023 | 0.0030 | passes | 0 |
+
+### The last row is the one that makes the rest quotable
+
+Running the shipped arm twice — same prompt, same seed, same configuration —
+gives LPIPS mean 0.0023, max 0.0030, PSNR 52.3 dB. That is the **noise floor**
+of this pipeline, and it cost one extra request. Without it, 0.1178 is a
+number you have to argue about. With it, Sage2's mean is **50x the floor** and
+its max is **125x**, so neither failure is measurement noise and neither needs
+defending.
+
+### The failure is prompt-dependent, by a factor of 62
+
+Sage2, per prompt:
+
+| prompt | LPIPS mean | LPIPS max | PSNR | SSIM |
+|---|---:|---:|---:|---:|
+| a1 face close-up | 0.0046 | 0.0060 | 47.8 dB | 0.995 |
+| a2 person speaking | 0.0146 | 0.0173 | 41.2 dB | 0.991 |
+| a7 sharp sound | 0.0883 | 0.1311 | 33.3 dB | 0.964 |
+| a4 text on screen | 0.1006 | 0.1124 | 28.9 dB | 0.933 |
+| a5 fast motion | 0.1228 | 0.1908 | 33.2 dB | 0.939 |
+| a8 sharp sound + music | 0.1295 | 0.1506 | 28.9 dB | 0.881 |
+| a6 fast motion, crowd | 0.1983 | 0.3072 | 25.2 dB | 0.860 |
+| **a3 rendered text** | **0.2839** | **0.3745** | **20.4 dB** | **0.598** |
+
+Best on a face at 0.0046 — twice the noise floor, which anyone would call
+lossless. Worst on rendered text at 0.2839, with SSIM 0.598. **Had this been
+scored on one prompt, and had that prompt been the face, the arm would have
+been published as `reorder` tier.**
+
+That is `c-qwen-image21-fp8-quality-is-prompt-dependent-2026-09` reproduced on
+a different model family with a different kernel: an INT8/FP8 attention recipe
+that is near-lossless on faces and destroys rendered text. It is the reason
+PLAN.md demands two disjoint prompt sets and why both of them require a text
+prompt.
+
+### What the kernel-level error did and did not predict
+
+The attention-kernel rel L2 against fp32 (0.039 for Sage2, 0.188 for Sage3)
+got the **order** right: Sage3 is 4.8x the kernel error and lands at 2.1x the
+set mean LPIPS. It got the **tier** wrong. A kernel rel L2 of 0.039 reads as
+small, and on an image it is lossy. **A kernel error is not a tier**, and the
+upper-bound argument in the attention-race section — that synthetic
+activations overstate a quantizing kernel's error — did not save it.
+
+### The audio half of the gate is not usable yet
+
+SI-SDR is **−1.4 dB for the control**: the same arm, same seed, run twice. At
+−1.4 dB the two audio tracks are substantially different signals, so the audio
+metric cannot currently distinguish an arm from a rerun. The video half of the
+same control is clean (LPIPS 0.0023, PSNR 52.3 dB), so this is the audio
+branch, not the harness. No audio figure in this document is quoted as an arm
+effect, and the audio branch needs a seeded deterministic path before the
+gate's audio half means anything.
+
+### What is adoptable
+
+`arms/lossless.json` moves only the two cheap audio roles to `TORCH_SDPA` and
+leaves `visual_self` on the platform default. Both are dense bf16 kernels
+computing the same operation as cuDNN, so the output should sit at the noise
+floor, and the swap was worth about 1.9 ms a block on a Pro-shaped block —
+roughly 114 ms a step over 60 blocks. Small and free, which is the opposite
+trade from the arm above.
+
 ## End to end: Kandinsky 6 Lite at W1's geometry
 
 The measurements above are one synthetic Pro block. This is a whole request.
@@ -112,8 +193,11 @@ python examples/offline_inference/text_to_video/text_to_video.py \
     --diffusion-attention-config showcase/kandinsky6/compute/arms/tuned.json
 ```
 
-It is still **ungated on quality**: `approx` tier by attention-kernel error on
-synthetic activations, never scored against a BF16 reference.
+> **It fails the quality gate.** When this was written its only accuracy
+> evidence was an attention-kernel error on synthetic activations. Scored
+> properly (see the gate section above) it is set mean LPIPS 0.1178 against a
+> 0.05 limit, so the arm is **lossy**, not `approx`, and the −23% is a lossy
+> speed number rather than an adoptable default.
 
 ### Two numbers for Track M
 
