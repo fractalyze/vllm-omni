@@ -82,6 +82,13 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=W1["width"])
     parser.add_argument("--height", type=int, default=W1["height"])
     parser.add_argument("--note", default="")
+    parser.add_argument(
+        "--server-pid",
+        type=int,
+        action="append",
+        default=[],
+        help="pid of the server being timed (repeatable); its GPU use is ours, not a co-tenant's",
+    )
     args = parser.parse_args()
 
     prompts = load_prompts(args.prompts)[: args.n_prompts]
@@ -102,7 +109,9 @@ def main() -> None:
     run = run_id(f"W1-{args.arm}" if is_w1 else f"SMOKE-{args.arm}")
     ledger = Ledger(args.out)
     run_dir = ledger.run_dir(run)
-    guard = GpuGuard(interval_s=1.0)
+    # The server under test is on the GPU too; without its pid the guard would
+    # call our own server a co-tenant and mark every run contaminated.
+    guard = GpuGuard(interval_s=1.0, own_pids=args.server_pid)
 
     records: list[dict] = []
     print(f"run {run}: holding {len(guard.lock_paths())} lock(s)")

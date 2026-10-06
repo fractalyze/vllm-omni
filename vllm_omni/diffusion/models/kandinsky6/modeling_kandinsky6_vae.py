@@ -709,8 +709,12 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
         """Same spatial tiles as ``tiled_decode``, one task per tile."""
         _, _, _, height, width = z.shape
         tile_h, tile_w, stride_h, stride_w = self._decode_tile_params()
-        h_starts = list(range(0, height - tile_h + 1, stride_h))
-        w_starts = list(range(0, width - tile_w + 1, stride_w))
+        # Start a tile every stride and let the last one be partial, as upstream
+        # diffusers does. `range(0, size - tile + 1, stride)` left the tail
+        # undecoded whenever (size - tile) is not a multiple of the stride: W1's
+        # 60x108 latent came out as 448 pixel rows instead of 480.
+        h_starts = list(range(0, height, stride_h))
+        w_starts = list(range(0, width, stride_w))
         tasks: list[TileTask] = []
         for row, i in enumerate(h_starts):
             for col, j in enumerate(w_starts):
@@ -901,9 +905,9 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
         blend_width = tile_latent_min_width - tile_latent_stride_width
 
         rows = []
-        for i in range(0, height - self.tile_sample_min_height + 1, self.tile_sample_stride_height):
+        for i in range(0, height, self.tile_sample_stride_height):
             row = []
-            for j in range(0, width - self.tile_sample_min_width + 1, self.tile_sample_stride_width):
+            for j in range(0, width, self.tile_sample_stride_width):
                 tile = x[
                     :,
                     :,
@@ -974,9 +978,10 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
         blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
 
         rows = []
-        for i in range(0, height - tile_latent_min_height + 1, tile_latent_stride_height):
+        # Every stride, last tile partial -- see _decode_tile_split.
+        for i in range(0, height, tile_latent_stride_height):
             row = []
-            for j in range(0, width - tile_latent_min_width + 1, tile_latent_stride_width):
+            for j in range(0, width, tile_latent_stride_width):
                 tile = z[
                     :,
                     :,
