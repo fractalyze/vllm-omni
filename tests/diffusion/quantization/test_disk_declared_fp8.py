@@ -28,6 +28,30 @@ FP8_DECLARED = {
 }
 
 
+FP8_DYNAMIC_DECLARED = {
+    "in_visual_dim": 16,
+    "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "quantization_status": "compressed",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": False, "symmetric": True},
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "strategy": "token",
+                    "dynamic": True,
+                    "symmetric": True,
+                },
+            }
+        },
+        "ignore": ["out_layer.out_layer"],
+    },
+}
+
+
 class DiskDeclaredFp8Test(absltest.TestCase):
     def test_resolves_to_serialized_config(self) -> None:
         config = TransformerConfig.from_dict(FP8_DECLARED)
@@ -37,6 +61,14 @@ class DiskDeclaredFp8Test(absltest.TestCase):
     def test_keeps_ignored_layers(self) -> None:
         config = TransformerConfig.from_dict(FP8_DECLARED)
         self.assertEqual(config.quant_config.ignored_layers, ["out_layer.out_layer"])
+
+    def test_compressed_tensors_resolves_through_vllm(self) -> None:
+        # vLLM-Omni's factory does not know compressed-tensors at all; the
+        # FP8_DYNAMIC scheme (per-channel weights, per-token activations) is
+        # what a checkpoint built with --format compressed-tensors declares.
+        config = TransformerConfig.from_dict(FP8_DYNAMIC_DECLARED)
+        self.assertEqual(type(config.quant_config).__name__, "CompressedTensorsConfig")
+        self.assertEqual(config.quant_config.ignore, ["out_layer.out_layer"])
 
     def test_no_declared_config_stays_unquantized(self) -> None:
         config = TransformerConfig.from_dict({"in_visual_dim": 16})

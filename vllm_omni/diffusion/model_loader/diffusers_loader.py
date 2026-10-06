@@ -710,6 +710,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 getattr(quant_cfg, "data_type", None) == "mx_fp"
                 or getattr(quant_cfg, "is_checkpoint_quantized", False)
                 or getattr(quant_cfg, "is_checkpoint_fp8_serialized", False)
+                # A config the checkpoint itself declared describes stored
+                # weights, whatever the method calls its flag (compressed-tensors
+                # has none).
+                or getattr(self.od_config, "quantization_config_is_auto_detected", False)
             )
             if not is_offline:
                 load_device = device.type

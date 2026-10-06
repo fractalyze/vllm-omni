@@ -116,9 +116,15 @@ def read_audio(path: Path) -> tuple[np.ndarray, int]:
 
 def _lpips_net(cache: dict[str, Any]) -> Any:
     if "lpips" not in cache:
+        import contextlib
+        import sys
+
         import lpips as lpips_lib
 
-        cache["lpips"] = lpips_lib.LPIPS(net="alex").to(_device()).eval()
+        # lpips announces itself on stdout, which would corrupt the JSON this
+        # module prints there.
+        with contextlib.redirect_stdout(sys.stderr):
+            cache["lpips"] = lpips_lib.LPIPS(net="alex").to(_device()).eval()
     return cache["lpips"]
 
 
@@ -355,6 +361,115 @@ def encode_floor(reference: Path, *, crf: int = 18) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------- G2 and G3
+#
+# The user's gate (G1, above) compares each arm to BF16 frame by frame for the
+# same seed. On Pro-distill that mostly measures trajectory divergence: the same
+# BF16 weights compiled vs eager already differ by about the gate's width. Until
+# the user decides otherwise the coordinator set two working gates beside it:
+#
+# G2, floor-relative: the arm's set mean and set max LPIPS against the BF16 eager
+#     reference are each within G2_FACTOR of the floor -- the same quantities for
+#     BF16 compiled vs BF16 eager on the same prompts.
+# G3, distributional: the arm's set-mean CLIP text-video score is within
+#     G3_TOLERANCE of the BF16 reference's, and a contact sheet goes to a human.
+
+G2_FACTOR = 1.25
+G3_TOLERANCE = 0.02
+CLIP_MODEL = "openai/clip-vit-large-patch14"
+CLIP_FRAME_STRIDE = 8
+
+
+def _clip(cache: dict[str, Any]) -> tuple[Any, Any]:
+    if "clip" not in cache:
+        from transformers import CLIPModel, CLIPProcessor
+
+        model = CLIPModel.from_pretrained(CLIP_MODEL, torch_dtype=torch.float16).to(_device()).eval()
+        cache["clip"] = (model, CLIPProcessor.from_pretrained(CLIP_MODEL))
+    return cache["clip"]
+
+
+def clip_score(path: Path, text: str, *, cache: dict[str, Any] | None = None) -> float:
+    """Mean over sampled frames of 100 * cos(CLIP image, CLIP text).
+
+    The text is truncated to CLIP's 77 tokens, which keeps each prompt's subject
+    and drops most of its audio description -- this is a video score.
+    """
+    cache = cache if cache is not None else {}
+    model, processor = _clip(cache)
+    frames = read_video(path)[::CLIP_FRAME_STRIDE]
+    with torch.no_grad():
+        inputs = processor(text=[text], images=list(frames), return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(_device()) for k, v in inputs.items()}
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+        out = model(**inputs)
+        image = out.image_embeds / out.image_embeds.norm(dim=-1, keepdim=True)
+        words = out.text_embeds / out.text_embeds.norm(dim=-1, keepdim=True)
+        return float(100.0 * (image @ words.T).mean())
+
+
+def clip_scores(directory: Path, prompts: list[dict], *, cache: dict[str, Any] | None = None) -> dict[str, float]:
+    """CLIP scores for every prompt's MP4 in ``directory``, cached in clip.json."""
+    store = directory / "clip.json"
+    scores = json.loads(store.read_text()) if store.exists() else {}
+    if scores.get("_model") != CLIP_MODEL:
+        scores = {"_model": CLIP_MODEL}
+    for prompt in prompts:
+        if prompt["id"] not in scores:
+            scores[prompt["id"]] = clip_score(directory / f"{prompt['id']}.mp4", prompt["text"], cache=cache)
+    store.write_text(json.dumps(scores, indent=2))
+    return {k: v for k, v in scores.items() if not k.startswith("_")}
+
+
+def contact_sheet(directory: Path, prompts: list[dict], out: Path, *, columns: int = 5, width: int = 216) -> Path:
+    """One row per prompt, ``columns`` frames spread over the clip, as a PNG."""
+    from PIL import Image
+
+    rows = []
+    for prompt in prompts:
+        frames = read_video(directory / f"{prompt['id']}.mp4")
+        picks = [frames[int(i * (len(frames) - 1) / (columns - 1))] for i in range(columns)]
+        thumbs = [Image.fromarray(f).resize((width, int(width * f.shape[0] / f.shape[1]))) for f in picks]
+        row = Image.new("RGB", (width * columns, thumbs[0].height))
+        for i, thumb in enumerate(thumbs):
+            row.paste(thumb, (i * width, 0))
+        rows.append(row)
+    sheet = Image.new("RGB", (rows[0].width, sum(r.height for r in rows)))
+    y = 0
+    for row in rows:
+        sheet.paste(row, (0, y))
+        y += row.height
+    sheet.save(out)
+    return out
+
+
+def working_gates(
+    report: dict[str, Any],
+    *,
+    floor_mean: float | None,
+    floor_max: float | None,
+    clip_candidate: float | None,
+    clip_reference: float | None,
+) -> dict[str, Any]:
+    """G2 and G3 verdicts; None ("undecided") when their inputs are missing."""
+    g2 = None
+    if floor_mean is not None and floor_max is not None:
+        g2 = report["lpips_mean"] <= G2_FACTOR * floor_mean and report["lpips_max"] <= G2_FACTOR * floor_max
+    g3 = None
+    if clip_candidate is not None and clip_reference:
+        g3 = clip_candidate >= (1.0 - G3_TOLERANCE) * clip_reference
+    return {
+        "g1_pass": report["gate_pass"],
+        "g2_pass": g2,
+        "g2_floor_mean": floor_mean,
+        "g2_floor_max": floor_max,
+        "g3_pass": g3,
+        "clip_candidate": clip_candidate,
+        "clip_reference": clip_reference,
+        "clip_ratio": (clip_candidate / clip_reference) if (clip_candidate and clip_reference) else None,
+    }
+
+
 def main() -> None:
     import argparse
 
@@ -364,6 +479,11 @@ def main() -> None:
     parser.add_argument("--prompts", type=Path, help="prompt-set JSON (required for directories)")
     parser.add_argument("--out", type=Path, help="write the set report as JSON here")
     parser.add_argument("--floor", action="store_true", help="report the encode floor of the reference instead")
+    parser.add_argument("--g2-floor-mean", type=float, help="G2: floor set mean (BF16 compiled vs eager)")
+    parser.add_argument("--g2-floor-max", type=float, help="G2: floor set max (worst frame)")
+    parser.add_argument(
+        "--g3", action="store_true", help="G3: CLIP text-video score vs the reference, and a contact sheet"
+    )
     args = parser.parse_args()
 
     if args.floor:
@@ -384,6 +504,26 @@ def main() -> None:
         if missing:
             raise SystemExit(f"missing MP4s: {missing}")
         report = score_set(pairs)
+        clip_c = clip_r = None
+        if args.g3:
+            cache: dict[str, Any] = {}
+            cand = clip_scores(args.candidate, prompts, cache=cache)
+            ref = clip_scores(args.reference, prompts, cache=cache)
+            clip_c = float(np.mean([cand[p["id"]] for p in prompts]))
+            clip_r = float(np.mean([ref[p["id"]] for p in prompts]))
+            report["clip_per_prompt"] = {
+                p["id"]: {"candidate": cand[p["id"]], "reference": ref[p["id"]]} for p in prompts
+            }
+            report["contact_sheet"] = str(contact_sheet(args.candidate, prompts, args.candidate / "contact_sheet.png"))
+        report.update(
+            working_gates(
+                report,
+                floor_mean=args.g2_floor_mean,
+                floor_max=args.g2_floor_max,
+                clip_candidate=clip_c,
+                clip_reference=clip_r,
+            )
+        )
         if args.out:
             args.out.write_text(json.dumps(report, indent=2))
         summary = {k: v for k, v in report.items() if k not in ("per_prompt",)}

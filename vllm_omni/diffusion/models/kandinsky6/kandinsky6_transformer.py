@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextvars
 import math
+import os
 from typing import Any
 
 import torch
@@ -314,6 +315,43 @@ validated, not a prerequisite for correct tensor-parallel serving.
 # ---------------------------------------------------------------------------
 
 
+# Exact-attention schedule for the visual self-attention.
+#
+# A quantized attention kernel (SageAttention) is the largest speed lever at W1
+# and also the largest error: its error lands hardest on rendered text and fine
+# motion, and an error made early in the trajectory or at the ends of the block
+# stack is amplified by everything after it. So the visual self-attention can run
+# the configured (fast) backend on some calls and an exact one on others:
+#
+#   VLLM_OMNI_K6_EXACT_ATTN_STEPS=k   the first k sampler steps use exact attention
+#   VLLM_OMNI_K6_EXACT_ATTN_BLOCKS=n  the first n and last n visual blocks always do
+#
+# Both default to 0: the configured backend everywhere, i.e. unchanged behavior.
+# "Exact" is the backend the role ``kandinsky6.visual_self_exact`` resolves to,
+# which no arm config names, so it is the platform default (cuDNN on sm_120).
+EXACT_ATTN_ROLE = "kandinsky6.visual_self_exact"
+
+
+def exact_attention_steps() -> int:
+    return max(0, int(os.environ.get("VLLM_OMNI_K6_EXACT_ATTN_STEPS", "0") or 0))
+
+
+def exact_attention_blocks() -> int:
+    return max(0, int(os.environ.get("VLLM_OMNI_K6_EXACT_ATTN_BLOCKS", "0") or 0))
+
+
+def set_exact_attention_step(dit: nn.Module, enabled: bool) -> None:
+    """Make the current sampler step use exact visual self-attention, or not.
+
+    A plain module attribute rather than a context variable: the blocks are
+    regionally compiled, and Dynamo guards on module attributes (two cached
+    variants) where reading a context variable could break the graph.
+    """
+    for module in dit.modules():
+        if isinstance(module, Kandinsky6Attention) and module.attn_exact is not None:
+            module.step_exact = bool(enabled)
+
+
 def child_prefix(prefix: str, name: str) -> str:
     """``prefix.name``, or just ``name`` when ``prefix`` is empty.
 
@@ -547,6 +585,19 @@ class Kandinsky6FeedForward(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _mark_exact_attention_blocks(blocks: nn.ModuleList, first_index: int, num_blocks: int) -> None:
+    """Pin the first and last ``VLLM_OMNI_K6_EXACT_ATTN_BLOCKS`` blocks to exact attention."""
+    edge = exact_attention_blocks()
+    if not edge:
+        return
+    for offset, block in enumerate(blocks):
+        index = first_index + offset
+        if index < edge or index >= num_blocks - edge:
+            for module in block.modules():
+                if isinstance(module, Kandinsky6Attention) and module.attn_exact is not None:
+                    module.always_exact = True
+
+
 def _partition_visual_blocks(num_blocks: int, factory) -> tuple[int, int, nn.ModuleList]:
     """Keep every rank's block index stable; non-local slots are ``PPMissingLayer``."""
     from vllm.model_executor.models.utils import PPMissingLayer
@@ -677,6 +728,31 @@ class Kandinsky6Attention(nn.Module):
             gather_idx=1,
             skip_sequence_parallel=not sequence_parallel,
         )
+        # The exact twin used by the exact-attention schedule (see
+        # EXACT_ATTN_ROLE). Only the visual self-attention gets one: it is the
+        # call a fast approximate backend is pointed at. It holds no weights.
+        self.attn_exact = None
+        self.always_exact = False
+        self.step_exact = False
+        if role == "kandinsky6.visual_self" and (exact_attention_steps() or exact_attention_blocks()):
+            self.attn_exact = Attention(
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                causal=False,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+                num_kv_heads=self.num_heads,
+                prefix=child_prefix(prefix, "exact"),
+                role=EXACT_ATTN_ROLE,
+                role_category="self",
+                scatter_idx=2,
+                gather_idx=1,
+                skip_sequence_parallel=not sequence_parallel,
+            )
+
+    def _attention_for_call(self) -> nn.Module:
+        if self.attn_exact is not None and (self.always_exact or self.step_exact):
+            return self.attn_exact
+        return self.attn
 
     def forward(
         self,
@@ -749,7 +825,7 @@ class Kandinsky6Attention(nn.Module):
                 out = SeqAllToAll4D.apply(ulysses_group, out, 1, 2, False)
         else:
             metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-            out = self.attn(query, key, value, metadata)
+            out = self._attention_for_call()(query, key, value, metadata)
 
         if strip_output_batch:
             out = out[0]
@@ -1540,6 +1616,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
             self._pp_block_start, self._pp_block_end, self.visual_transformer_blocks = _partition_visual_blocks(
                 num_visual_blocks, _fused_block
             )
+            _mark_exact_attention_blocks(self.visual_transformer_blocks, self._pp_block_start, num_visual_blocks)
 
         from vllm.model_executor.models.utils import PPMissingLayer
 

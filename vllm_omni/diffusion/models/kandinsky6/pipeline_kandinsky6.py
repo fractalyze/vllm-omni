@@ -47,7 +47,11 @@ from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .kandinsky6_transformer import Kandinsky6Transformer3DModel
+from .kandinsky6_transformer import (
+    Kandinsky6Transformer3DModel,
+    exact_attention_steps,
+    set_exact_attention_step,
+)
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
@@ -837,7 +841,10 @@ def piflow_denoise_loop(  # noqa: PLR0913
     eps = scheduler.eps
     scheduler.set_timesteps(num_steps, device=device)
 
+    exact_steps = exact_attention_steps()
     for segment in scheduler.segments(num_steps):
+        if exact_steps:
+            set_exact_attention_step(_raw_dit(dit), segment.step_index < exact_steps)
         tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
         tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
         sigma_src = shift_timesteps(tau_src, shift)
@@ -1380,7 +1387,11 @@ class Kandinsky6TI2VAPipeline(
         if od_config is not None:
             self.setup_diffusion_pipeline_profiler(
                 enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
-                profiler_targets=["forward"],
+                # One entry per request stage the showcase reports: prompt
+                # encoding, the denoise loop, video decode, audio decode. With
+                # only "forward" the profiler could time a request but not say
+                # where its time went.
+                profiler_targets=["forward", "encode_prompt", "diffuse", "vae.decode", "audio_vae.wrapped_decode"],
             )
 
     # ------------------------------------------------------------------
@@ -1438,6 +1449,13 @@ class Kandinsky6TI2VAPipeline(
         with torch.device(component_device), no_init_weights():
             vae = AutoencoderKLHunyuanVideo.from_config(vae_config)
         vae.to(dtype=torch.float16)
+        # The Hunyuan VAE tiles its spatial decode by default (256-px tiles every
+        # 192 px, so a third of the work is overlap). VLLM_OMNI_K6_VAE_TILING=0
+        # decodes whole frames instead -- faster when the GPU has room for it,
+        # which depends on what else is resident at decode time. Temporal
+        # (framewise) chunking is unaffected.
+        if os.environ.get("VLLM_OMNI_K6_VAE_TILING", "1") == "0":
+            vae.use_tiling = False
 
         text_encoder_dir = os.path.join(model_root, "text_encoder")
         text_encoder_config = AutoConfig.from_pretrained(text_encoder_dir)

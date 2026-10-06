@@ -36,9 +36,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--label", required=True, help="what produced these (arm name, 'bf16-reference')")
     parser.add_argument("--limit", type=int, default=0, help="only the first N prompts (0 = all)")
+    parser.add_argument("--only", default="", help="comma-separated prompt ids to generate, in set order")
     args = parser.parse_args()
 
     prompts = json.loads(args.prompts.read_text())["prompts"]
+    if args.only:
+        wanted = set(args.only.split(","))
+        prompts = [p for p in prompts if p["id"] in wanted]
     if args.limit:
         prompts = prompts[: args.limit]
     args.out.mkdir(parents=True, exist_ok=True)

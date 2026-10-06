@@ -552,11 +552,19 @@ def _build_disk_quant_config(disk_qc: dict[str, Any], method: str | None) -> "Qu
     checkpoints require upstream Fp8Config"), so a disk-declared fp8 resolves
     there. Other methods keep the factory.
     """
-    if str(method or "").lower() == "fp8":
+    name = str(method or "").lower().replace("_", "-")
+    if name in _SERIALIZED_UPSTREAM_METHODS:
         from vllm.model_executor.layers.quantization import get_quantization_config
 
-        return get_quantization_config("fp8").from_config(dict(disk_qc))
+        return get_quantization_config(name).from_config(dict(disk_qc))
     return build_quant_config(disk_qc)
+
+
+# Disk-declared methods resolved through vLLM's own registry: "fp8" because
+# vLLM-Omni's factory maps it to the online quantizer, and "compressed-tensors"
+# (e.g. FP8_DYNAMIC: per-channel weights, per-token activations) because the
+# factory does not know it at all.
+_SERIALIZED_UPSTREAM_METHODS = frozenset({"fp8", "compressed-tensors"})
 
 
 @dataclass
