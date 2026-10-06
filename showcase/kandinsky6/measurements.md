@@ -236,10 +236,13 @@ twelve edge blocks over steps 2-10.
    post-denoise, so it cannot move the trajectory.
 4. **Streaming, at most 8.6 s per request.** Already overlapped. Little is left.
 
-### Screen: VAE tile overlap is not a lever, because the served decode is untiled
+### Screen: the VAE decode plans its own tiling on every call, from free GPU memory
+
+*(Corrected 08:50 KST. An earlier version of this section said the served
+decode was spatially untiled. That was wrong.)*
 
 Screened at 05:42-06:10 (informational; the headline is unchanged). The
-headline arm decoded a1 and b6 under four spatial-tiling settings: the default
+headline arm decoded a1 and b6 under four tiling settings: the default
 (256-px tiles every 192 px), 256:224, 384:352, and `VLLM_OMNI_K6_VAE_TILING=0`.
 Each setting ran on a fresh server with the stage profiler, under every GPU
 lock.
@@ -251,28 +254,44 @@ lock.
 | 384:352 | 18.91 s | 18.73 s | bit-identical |
 | untiled | 18.85 s | 18.73 s | bit-identical |
 
-All four decodes are bit-identical (audio too), and their times agree within
-0.4%. The reason: vLLM-Omni's model registry sets `vae.use_tiling` from
-`od_config.vae_use_tiling` after the pipeline is built, and that flag
-(`--vae-use-tiling`) defaults to off. **Every served W1 decode on this branch,
-headline and gate runs included, has been spatially untiled.** The pipeline's
-own tiling switch never reached a server. Its comment is corrected here.
+All four are bit-identical, because none of the settings survives to the
+decode. `AutoencoderKLHunyuanVideo.decode` calls `get_dec_optimal_tiling` and
+`apply_tiling` on every call. That sets `use_tiling = True` and replaces the
+tile size and stride with a plan computed from the **free GPU memory reported
+by `cudaMemGetInfo` at that moment**:
 
-So the 18.9 s has no spatial overlap to remove. What it still has: temporal
-chunking (16-frame chunks every 12 frames, so about a quarter of the frames
-are decoded twice and blended) and the decoder's own convolution kernels
-(fp16, not compiled). Both are post-denoise and unscreened. Larger temporal
-chunks are the next thing to try, if the GPU has the memory at decode time.
+- With enough free memory, it uses full-frame spatial tiles.
+- Otherwise, it factorizes the frame into smaller spatial tiles.
+- Either way, it uses **16-frame temporal chunks with an 8-frame stride**, so
+  about half of all frames are decoded twice and blended.
+
+`cudaMemGetInfo` does not count memory that PyTorch's caching allocator holds
+but is not using, so the plan, the decode time and the decoded pixels all
+depend on allocator state.
+
+Measured standalone (`bench/vae_decode_bench.py`, W1 latents, fp16, same
+weights): the same eager decode took **14.77 s** when the memory was free
+(full-frame plan) and **18.86 s** once the allocator held its cache (spatial
+tiles). Run with less free memory, the same latents decoded to output that
+differs from the first by relative L2 0.035 (max-abs 0.60 on a [-1, 1] scale).
+
+So the decode has two levers that do not touch its kernels:
+1. **A deterministic plan.** Plan from memory that is actually free (including
+   the allocator's reserved-but-unused blocks), or fix the plan per workload.
+   This removes run-to-run decode noise, and with it the reference noise in the
+   next section.
+2. **Less temporal overlap.** A stride of 12 instead of 8 decodes a quarter of
+   the frames twice instead of half.
 
 ### Reference reproducibility on this host
 
 `ref/setA` (compiled BF16) was regenerated for a5 under the pinned Inductor
 cache. Audio was bit-identical; video was not: LPIPS 0.022 mean / 0.024 worst
 frame, PSNR 37 dB. Audio and video are denoised jointly with cross-attention,
-so identical audio means the DiT trajectory reproduced. The difference comes
-later, in the video path, most likely per-process kernel choice in the VAE
-decode, which the Inductor cache does not pin. Every G1 number above
-carries that ~0.02.
+so identical audio means the DiT trajectory reproduced. The difference is in
+the video decode. Its tiling plan is chosen per call from free GPU memory
+(previous section), so two processes in different memory states decode the same
+latents differently. Every G1 number above carries that ~0.02.
 
 ## The block schedule: speed is linear in the band, quality is not resolvable by a screen
 
