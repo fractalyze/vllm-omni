@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.model_loader.reload.meta import (
     CopyCounter as CopyNumelCounter,
 )
@@ -140,6 +141,20 @@ def _fell_back_to_unquantized_npu(
     return True
 
 
+def dequantize_int8_rows(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """INT8 ``(out, in)`` weight and FP32 ``(out, 1)`` row scales -> ``dtype``.
+
+    The product is formed in FP32 and rounded once to ``dtype``. Every INT8 value
+    is exact in FP32 and an FP32 multiply is correctly rounded on every device, so
+    this is bit-identical wherever it runs: a BF16 model whose weights were
+    replaced by this function's output on the host computes exactly what the
+    weight-only INT8 layer computes on the GPU. Under ``torch.compile`` the cast,
+    multiply and round fuse into one elementwise kernel, so the FP32
+    intermediate is never materialized.
+    """
+    return (weight.to(torch.float32) * scale.to(torch.float32)).to(dtype)
+
+
 def create_weight_parameter(
     output_size_per_partition: int,
     input_size_per_partition: int,
@@ -174,10 +189,18 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
+        weight_only: bool = False,
     ) -> None:
         super().__init__()
 
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
+        # Weight-only: INT8 is the storage (and offload transfer) format and the
+        # GEMM stays in the activation dtype. Only serialized checkpoints carry
+        # it: an online weight-only quantization would halve nothing that
+        # matters, since the BF16 weights would already have been loaded.
+        if weight_only and not is_checkpoint_int8_serialized:
+            raise ValueError("weight_only INT8 requires a serialized INT8 checkpoint")
+        self.weight_only = weight_only
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
@@ -218,6 +241,7 @@ class DiffusionInt8Config(QuantizationConfig):
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
+            weight_only=bool(cls.get_from_keys_or(config, ["weight_only"], False)),
         )
 
     def get_quant_method(
@@ -240,6 +264,8 @@ class DiffusionInt8Config(QuantizationConfig):
                 else:
                     raise NotImplementedError("The current platform is not supported int8 online quant.")
                 return online_method
+            elif self.weight_only:
+                return Int8WeightOnlyLinearMethod(self)
             else:
                 if current_omni_platform.is_cuda():
                     offline_method = Int8LinearMethod(self)
@@ -491,6 +517,39 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.int8_linear.apply_weights(layer, x, bias)
+
+
+class Int8WeightOnlyLinearMethod(BaseInt8LinearMethod):
+    """INT8 weights, per-row FP32 scales, and a GEMM in the activation dtype.
+
+    For hardware without an INT8 GEMM (sm_120 among them: vLLM's W8A8 kernel
+    refuses it) where the weights' *bytes* are the cost rather than the
+    multiply: a model streamed through layer-wise offload copies each block's
+    parameters host-to-device every step, and INT8 halves that copy against
+    BF16. ``apply`` dequantizes on the device (:func:`dequantize_int8_rows`)
+    and runs the same unquantized GEMM a BF16 layer would, so the layer is
+    exactly a BF16 layer whose weight was fake-quantized to INT8.
+
+    ``process_weights_after_loading`` touches no device and runs no kernel, so
+    it is safe for parameters that live in host memory under offload.
+    """
+
+    def __init__(self, quant_config: DiffusionInt8Config):
+        super().__init__(quant_config)
+        self._gemm_impl = dispatch_unquantized_gemm()
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        replace_parameter(layer, "weight", torch.nn.Parameter(layer.weight.data, requires_grad=False))
+        replace_parameter(layer, "weight_scale", torch.nn.Parameter(layer.weight_scale.data, requires_grad=False))
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = dequantize_int8_rows(layer.weight, layer.weight_scale, x.dtype)
+        return self._gemm_impl(layer, x, weight, bias)
 
 
 class NPUInt8LinearMethod(BaseInt8LinearMethod):

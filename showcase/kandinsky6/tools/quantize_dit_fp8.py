@@ -62,6 +62,8 @@ from safetensors.torch import save_file
 # uses the format's full range; the clamp below catches the rounding edge.
 FP8_E4M3_MAX = 448.0
 FP8_DTYPE = torch.float8_e4m3fn
+# Symmetric INT8: +-127, so the grid is symmetric and -128 is never produced.
+INT8_MAX = 127.0
 
 # Kept in BF16, matched against the checkpoint's own key names. The DiT stores
 # its keys at the root (``visual_transformer_blocks.3.…``, ``out_layer.…``); the
@@ -194,6 +196,27 @@ def quantize_weight(weight: torch.Tensor, *, granularity: str = "tensor") -> tup
     return quantized, scale.reshape(1) if granularity == "tensor" else scale
 
 
+def quantize_weight_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(out, in)`` BF16 -> INT8 with one FP32 scale per output row, ``(out, 1)``.
+
+    For the weight-only ``int8`` format: the weight is stored and streamed as
+    INT8 and dequantized back to BF16 on the GPU before an ordinary BF16 GEMM
+    (``Int8WeightOnlyLinearMethod``), because sm_120 has no INT8 GEMM. Per-row
+    INT8 keeps 7 bits of mantissa-equivalent resolution across each row's range,
+    where E4M3 keeps 3 at any scale: its median relative weight error on Pro is
+    about a third of FP8's.
+
+    The scale is ``amax / 127`` in FP32; an all-zero row gets scale 1.0 and
+    quantizes to zeros. Rounding is to nearest, half to even (``torch.round``).
+    """
+    as_float = weight.to(torch.float32)
+    amax = as_float.abs().amax(dim=1, keepdim=True)
+    scale = (amax / INT8_MAX).clamp(min=torch.finfo(torch.float32).tiny)
+    scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+    quantized = torch.round(as_float / scale).clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+    return quantized, scale
+
+
 def module_path(checkpoint_key: str) -> str:
     """A transformer checkpoint key -> the path of the module it loads into.
 
@@ -213,7 +236,7 @@ def find_dit_weights(src_transformer: Path) -> list[Path]:
     return shards
 
 
-FORMATS = ("fp8", "compressed-tensors")
+FORMATS = ("fp8", "compressed-tensors", "int8")
 
 
 def quantization_config(fmt: str, ignored_layers: list[str]) -> dict:
@@ -228,7 +251,17 @@ def quantization_config(fmt: str, ignored_layers: list[str]) -> dict:
     ``compressed-tensors``: the FP8_DYNAMIC scheme -- one scale per output
     channel of each weight and one dynamic scale per *token* of each activation.
     Same storage and the same FP8 GEMM, far finer scales on both operands.
+
+    ``int8``: weight-only INT8 with per-row scales, read by vLLM-Omni's
+    ``DiffusionInt8Config`` (``weight_only``). Activations stay BF16 and the GEMM
+    is BF16; only the stored and streamed bytes shrink.
     """
+    if fmt == "int8":
+        return {
+            "quant_method": "int8",
+            "weight_only": True,
+            "ignored_layers": ignored_layers,
+        }
     if fmt == "fp8":
         return {
             "quant_method": "fp8",
@@ -274,7 +307,7 @@ def quantize_checkpoint(
     fmt: str = "fp8",
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, object]:
-    """Write an FP8 copy of ``src``'s transformer into ``dst``; link the rest."""
+    """Write a quantized copy of ``src``'s transformer into ``dst``; link the rest."""
     src_transformer = src / "transformer"
     dst_transformer = dst / "transformer"
     dst_transformer.mkdir(parents=True, exist_ok=True)
@@ -312,7 +345,10 @@ def quantize_checkpoint(
                 tensor = reader.get_tensor(name)
                 bytes_in += tensor.numel() * tensor.element_size()
                 if is_quantizable(name, tuple(tensor.shape), keep=keep):
-                    weight, scale = quantize_weight(tensor, granularity=granularity)
+                    if fmt == "int8":
+                        weight, scale = quantize_weight_int8(tensor)
+                    else:
+                        weight, scale = quantize_weight(tensor, granularity=granularity)
                     buffer[name] = weight
                     buffer[name.removesuffix("weight") + "weight_scale"] = scale
                     buffer_bytes += weight.numel() + scale.numel() * 4
@@ -412,7 +448,10 @@ def main() -> None:
         "--format",
         choices=FORMATS,
         default="fp8",
-        help="checkpoint format; compressed-tensors implies per-channel weight scales and per-token activations",
+        help=(
+            "checkpoint format; compressed-tensors implies per-channel weight scales and per-token activations, "
+            "int8 is weight-only INT8 with per-row scales"
+        ),
     )
     parser.add_argument("--shard-gib", type=float, default=4.0)
     args = parser.parse_args()
@@ -421,7 +460,7 @@ def main() -> None:
         args.src.resolve(),
         args.dst.resolve(),
         keep=args.keep,
-        granularity="channel" if args.format == "compressed-tensors" else args.scale,
+        granularity="channel" if args.format in ("compressed-tensors", "int8") else args.scale,
         fmt=args.format,
         shard_bytes=int(args.shard_gib * 1024**3),
     )
