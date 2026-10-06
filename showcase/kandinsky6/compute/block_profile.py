@@ -327,16 +327,37 @@ def make_inputs(target: str, cfg, shapes: Shapes, device: torch.device, dtype: t
     fp32 form. Text and audio stay unbatched, which is what the blocks'
     cross-attention expects.
     """
-    head_dim = sum(cfg.axes_dims)
+    from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import RoPE1D, RoPE3D
+
     head_dim_a = sum(cfg.axes_dims_a)
     n_vis = shapes.visual_tokens
 
     def randn(*shape, d=dtype):
         return torch.randn(*shape, device=device, dtype=d)
 
-    # RoPE tables are fp32 everywhere in the port (`apply_rotary` upcasts).
-    vis_rope = randn(n_vis, 1, head_dim // 2, 2, 2, d=torch.float32)
-    aud_rope = randn(shapes.audio_len, 1, head_dim_a // 2, 2, 2, d=torch.float32)
+    # The RoPE tables are built by the port's own modules, not drawn from
+    # `randn`. This is not tidiness. A RoPE table's 2x2 blocks are
+    # [[cos, -sin], [sin, cos]], so `apply_rotary` is a rotation and preserves
+    # the per-head norm that `query_norm`/`key_norm` just set. Random entries
+    # make it an arbitrary linear map that stretches some rows far more than
+    # others, and SageAttention's per-block INT8 scale is set by the largest
+    # entry in a block -- with a random table the visual self-attention
+    # returns NaN at W1, which is how this was found. The dense bf16 backends
+    # stay finite, so a random table looks harmless until a quantizing kernel
+    # is measured.
+    vis_rope_table = RoPE3D(cfg.axes_dims).to(device)(
+        shape=(shapes.latent_frames, shapes.latent_h, shapes.latent_w),
+        pos=[
+            torch.arange(shapes.latent_frames, device=device),
+            torch.arange(shapes.latent_h, device=device),
+            torch.arange(shapes.latent_w, device=device),
+        ],
+    )
+    # `_embed_visual` flattens (T, H, W, ...) to (N, ...) before the blocks.
+    vis_rope = vis_rope_table.flatten(0, 2)
+    aud_rope = RoPE1D(head_dim_a, max_pos=max(shapes.audio_len, 1)).to(device)(
+        torch.arange(shapes.audio_len, device=device)
+    )
     vis = randn(1, n_vis, cfg.model_dim)
     time_v = randn(1, cfg.time_dim)
 
@@ -377,6 +398,82 @@ def time_forward(module, inputs: dict, repeats: int, warmups: int) -> Timing:
             torch.accelerator.synchronize()
             timing.ms.append(start.elapsed_time(end))
     return timing
+
+
+def parse_arm_spec(spec: str) -> tuple[str, Path | None, str]:
+    """``LABEL=ATTENTION@MODE`` -> ``(label, attention_path_or_None, mode)``.
+
+    ``ATTENTION`` is ``default`` (the platform default, ``None`` here) or a
+    path to an arms/ file. The separator is ``@`` and not ``:`` or ``/``
+    because the attention value is a path, which contains ``/`` and on some
+    hosts a drive-style ``:``.
+    """
+    label, sep, rest = spec.partition("=")
+    if not sep or not label:
+        raise ValueError(f"{spec!r} is not LABEL=ATTENTION@MODE: no LABEL= part")
+    attention, sep, mode = rest.partition("@")
+    if not sep or not attention or not mode:
+        raise ValueError(f"{spec!r} is not LABEL=ATTENTION@MODE: no ATTENTION@MODE part")
+    return label, (None if attention == "default" else Path(attention)), mode
+
+
+def _flatten_outputs(out) -> list:
+    """A block returns ``(vis, aud)``; an attention layer returns one tensor."""
+    if isinstance(out, torch.Tensor):
+        return [out]
+    return [t for t in out if isinstance(t, torch.Tensor)]
+
+
+def _parameter_storages(module) -> frozenset[int]:
+    """Every parameter's storage pointer, as an order- and name-free set."""
+    return frozenset(tensor.data_ptr() for tensor in module.parameters())
+
+
+def output_deltas(arms: dict, inputs: dict) -> dict:
+    """Each arm's output against the first arm's, on the same weights.
+
+    A faster arm is only adoptable if its numbers are close, and for a
+    compiled arm "close" is not free: Inductor reorders reductions, and
+    ``max-autotune`` swaps cuBLAS GEMMs for Triton templates whose accumulate
+    order differs. Both arms here share the *same* module weights only when
+    the caller built them that way; when they do not, this comparison is
+    meaningless, so it checks and says so rather than reporting a number.
+
+    Reported per output tensor: relative L2 and max absolute difference. The
+    control's own RMS is included so a reader can see what the absolute
+    numbers are relative to.
+    """
+    labels = list(arms)
+    control_module = arms[labels[0]]
+    # Compare storage pointers, not names: `torch.compile` returns an
+    # OptimizedModule whose `named_parameters()` prefixes every name with
+    # `_orig_mod.`, so a name comparison calls a compiled arm "not the same
+    # weights" even when it wraps exactly the control module.
+    control_storages = _parameter_storages(control_module)
+
+    with torch.inference_mode():
+        reference = [t.float().clone() for t in _flatten_outputs(control_module(**inputs))]
+
+    result: dict[str, dict] = {}
+    for label in labels[1:]:
+        module = arms[label]
+        shared = _parameter_storages(module) == control_storages
+        if not shared:
+            result[label] = {"comparable": False, "why": "this arm does not share the control's weights"}
+            continue
+        with torch.inference_mode():
+            candidate = _flatten_outputs(module(**inputs))
+        rows = []
+        for index, (got, want) in enumerate(zip(candidate, reference)):
+            diff = got.float() - want
+            rows.append({
+                "output": index,
+                "rel_l2": round(float(torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(want)), 8),
+                "max_abs": round(float(diff.abs().max()), 8),
+                "control_rms": round(float(want.square().mean().sqrt()), 6),
+            })
+        result[label] = {"comparable": True, "outputs": rows}
+    return result
 
 
 def compare_arms(arms: dict, inputs: dict, repeats: int, warmups: int, rounds: int) -> dict:
@@ -491,18 +588,40 @@ def main() -> int:
     )
     parser.add_argument(
         "--compile",
-        dest="compile_mode",
+        dest="compile_modes",
+        action="append",
         default=None,
         choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
-        help="torch.compile the block in this mode; omitted runs eager. Compilation happens inside the "
-        "warm-ups, so --warmups must be at least 1 (it is 2 by default)",
+        help="torch.compile the block in this mode; omitted runs eager. Repeatable, which only makes "
+        "sense with --compare-compile. Compilation happens inside the warm-ups, so --warmups must be "
+        "at least 1 (it is 2 by default)",
     )
     parser.add_argument(
         "--compare-compile",
         action="store_true",
-        help="time eager and --compile in ABBA order in one process, on the same module and the same "
-        "inputs, and report the delta. The honest way to compare them: a ratio taken across two "
-        "processes is a ratio across two clock states",
+        help="time eager and every --compile mode in ABBA order in one process, on the same inputs, "
+        "and report each delta against eager. The honest way to compare them: a ratio taken across "
+        "two processes is a ratio across two clock states",
+    )
+    parser.add_argument(
+        "--check-numerics",
+        action="store_true",
+        help="with --compare-arm, also compare each arm's output tensors against the control's. "
+        "Only meaningful where the arms share weights, which they do when they differ only in "
+        "compile mode; the check says so rather than reporting a number when they do not",
+    )
+    parser.add_argument(
+        "--compare-arm",
+        action="append",
+        default=None,
+        metavar="LABEL=ATTENTION@MODE",
+        help="an arm for a full comparison, repeatable. ATTENTION is an arms/ file or `default` for "
+        "the platform default; MODE is `eager` or a torch.compile mode. The first arm given is the "
+        "control every other is reported against. Separator is `@` because a path contains `/`. "
+        "Use this rather than --compare-compile when the arms differ in more than the compile mode: "
+        "vLLM-Omni compiles the DiT's repeated blocks by default (`enforce_eager=False`, "
+        "`diffusion_compile_granularity=regional`), so `default@default` -- not `default@eager` -- "
+        "is what upstream actually serves, and a baseline has to say which one it is",
     )
     parser.add_argument("--text-len", type=int, default=None, help="override the prompt's embedding count")
     parser.add_argument("--repeats", type=int, default=5, help="timed forwards")
@@ -548,27 +667,55 @@ def main() -> int:
         stack.enter_context(single_process_parallel())
         module = maybe_compile(
             build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
-            args.compile_mode,
+            (args.compile_modes or [None])[0],
         )
         inputs = make_inputs(args.target, cfg, shapes, device, dtype)
-        if args.compile_mode and args.warmups < 1:
+        if args.compile_modes and args.warmups < 1:
             parser.error("--compile needs --warmups >= 1, or the first timed forward pays for compilation")
 
         torch.accelerator.reset_peak_memory_stats()
-        if args.compare_compile:
+        if args.compare_arm:
+            arms = {}
+            modules_by_attention: dict[str, object] = {}
+            for spec in args.compare_arm:
+                try:
+                    label, attention_path, mode = parse_arm_spec(spec)
+                except ValueError as exc:
+                    parser.error(f"--compare-arm {exc}")
+                if attention_path is not None and not attention_path.is_file():
+                    parser.error(f"--compare-arm {spec!r}: no such attention config {attention_path}")
+                # One module per attention config, shared between that
+                # config's eager and compiled arms, so `--check-numerics` can
+                # compare their outputs rather than comparing two random
+                # initializations.
+                key = str(attention_path)
+                if key not in modules_by_attention:
+                    modules_by_attention[key] = build_target(
+                        args.target, cfg, None, device, dtype, attention_path
+                    )
+                built = modules_by_attention[key]
+                arms[label] = built if mode == "eager" else maybe_compile(built, mode)
+            numerics = output_deltas(arms, inputs) if args.check_numerics else None
             compare = compare_arms(
-                {"eager": build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
-                 f"compile={args.compile_mode or 'default'}": maybe_compile(
-                     build_target(args.target, cfg, args.backend, device, dtype, args.attention_config),
-                     args.compile_mode or "default",
-                 )},
-                inputs,
-                repeats=args.repeats,
-                warmups=max(args.warmups, 1),
-                rounds=args.rounds,
+                arms, inputs, repeats=args.repeats, warmups=max(args.warmups, 1), rounds=args.rounds
+            )
+        elif args.compare_compile:
+            # A fresh module per arm: torch.compile mutates what it wraps
+            # enough that reusing one module across modes would measure the
+            # last mode's cached artifacts. The weights are random anyway, so
+            # separate modules cost nothing but memory.
+            arms = {"eager": build_target(args.target, cfg, args.backend, device, dtype, args.attention_config)}
+            for mode in args.compile_modes or ["default"]:
+                arms[f"compile={mode}"] = maybe_compile(
+                    build_target(args.target, cfg, args.backend, device, dtype, args.attention_config), mode
+                )
+            numerics = None
+            compare = compare_arms(
+                arms, inputs, repeats=args.repeats, warmups=max(args.warmups, 1), rounds=args.rounds
             )
         else:
             compare = None
+            numerics = None
         timing = time_forward(module, inputs, args.repeats, args.warmups)
         peak_gib = torch.accelerator.max_memory_allocated() / 2**30
         profile_result = profile_forward(module, inputs, args.profile_iters) if args.profile_iters else None
@@ -579,7 +726,7 @@ def main() -> int:
             "target": args.target,
             "backend": args.backend or "platform-default",
             "attention_config_file": str(args.attention_config) if args.attention_config else None,
-            "compile_mode": args.compile_mode,
+            "compile_modes": args.compile_modes,
             "shapes": asdict(shapes),
             "dtype": str(dtype),
             "torch": torch.__version__,
@@ -589,11 +736,12 @@ def main() -> int:
             "peak_allocated_gib": round(peak_gib, 3),
             "timing": timing.summary(),
             "compare_compile": compare,
+            "output_deltas": numerics,
             "profile": profile_result,
         }
 
-    print(f"{args.config}/{args.target}/{args.backend or 'platform-default'}"
-          f"{'/compile=' + args.compile_mode if args.compile_mode else ''} at {args.geometry}: "
+    modes = "/compile=" + ",".join(args.compile_modes) if args.compile_modes else ""
+    print(f"{args.config}/{args.target}/{args.backend or 'platform-default'}{modes} at {args.geometry}: "
           f"{shapes.visual_tokens} visual tokens, {shapes.audio_len} audio, {shapes.text_len} text")
     s = timing.summary()
     print(f"  one block: {s['median_ms']:.2f} ms median ({s['min_ms']:.2f}-{s['max_ms']:.2f}, "
@@ -602,15 +750,25 @@ def main() -> int:
         whole_backbone_s = s["median_ms"] * cfg.num_visual_blocks / 1e3
         print(f"  x{cfg.num_visual_blocks} visual blocks: {whole_backbone_s:.2f} s a forward")
     if compare:
-        print("  eager vs compiled, ABBA in one process:")
+        control = next(iter(compare))
+        print(f"  ABBA in one process, against {control}:")
         for label, row in compare.items():
-            delta = row.get("delta_pct_vs_eager")
+            delta = row.get(f"delta_pct_vs_{control}")
             tail = "" if delta is None else (
                 f"  {delta:+.2f}%" + ("  (inside the control's spread: null)" if row["inside_control_spread"] else "")
             )
             print(f"    {label:<22} {row['median_ms']:8.2f} ms  "
                   f"({row['min_ms']:.2f}-{row['max_ms']:.2f}, spread {row['spread_pct']:.2f}%, "
                   f"n={row['samples']}){tail}")
+    if numerics:
+        print("  output vs the control, same weights:")
+        for label, row in numerics.items():
+            if not row["comparable"]:
+                print(f"    {label:<22} not comparable: {row['why']}")
+                continue
+            for out in row["outputs"]:
+                print(f"    {label:<22} output {out['output']}: rel L2 {out['rel_l2']:.3e}, "
+                      f"max abs {out['max_abs']:.3e} (control RMS {out['control_rms']:.4f})")
     if profile_result:
         print(f"  device {profile_result['device_ms_per_forward']:.2f} ms, "
               f"launch gap {profile_result['launch_gap_ms_per_forward']:.2f} ms")
