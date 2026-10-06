@@ -20,7 +20,13 @@
 #
 # Smoke first (two prompts, no warm-up) because it may not load at all: online
 # quantization has to happen tensor by tensor as the checkpoint streams, and the
-# loader has restrictions on combining it with offload. Then the full set.
+# loader has restrictions on combining it with offload.
+#
+# With the platform's own attention, not Sage2. Two reasons. On exact BF16
+# weights Sage2 just failed the gate -- a3 at max LPIPS 0.3277 against a 0.25
+# limit, the same shape of failure the Lite screen showed -- so it cannot be in
+# a candidate stack as it stands. And with it out, the two prompts this smoke
+# scores are attributable to the weights alone, which is the question.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${K6_PYTHON:-/data/jooman/k6/venv/bin/python}"
@@ -36,7 +42,7 @@ run() {
 # Does it load, and from pinned host memory (the fast path: 30 GB of FP8 fits
 # where 60 GB of BF16 does not)?
 run perchan-pinned-smoke "$PY" "$HERE/gate_pro.py" \
-    --arm "$HERE/arms/tuned.json" --name perchan-pinned-smoke \
+    --arm shipped --name perchan-pinned-smoke \
     --quantization fp8_per_channel --offload layerwise \
     --limit 2 --no-warmup --no-locks --out-dir "$OUT/perchan-pinned-smoke"
 
@@ -44,7 +50,7 @@ run perchan-pinned-smoke "$PY" "$HERE/gate_pro.py" \
 # the mmapped BF16 checkpoint instead; slower to load, same arithmetic.
 if [ "$failures" -ne 0 ]; then
     run perchan-mmap-smoke "$PY" "$HERE/gate_pro.py" \
-        --arm "$HERE/arms/tuned.json" --name perchan-mmap-smoke \
+        --arm shipped --name perchan-mmap-smoke \
         --quantization fp8_per_channel --offload dlo-mmap \
         --limit 2 --no-warmup --no-locks --out-dir "$OUT/perchan-mmap-smoke"
 fi
