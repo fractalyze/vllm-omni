@@ -179,6 +179,63 @@ own ABBA. Its stage breakdown was not measured: the profiled run died of CUDA
 OOM at load, because another team's job held the GPU, and the GPU went to the
 headline comparisons after that.
 
+### Where the headline arm's time goes (one profiled request, bs2)
+
+One W1 request on the headline arm (BF16 sage2-mid + exact step 1, a1, seed 42)
+after a warm-up, with the stage profiler on and Nsight Systems capturing the
+worker (`nsys launch`/`start`/`stop` around that request, every GPU lock
+held). The stage profiler synchronizes around each stage, so this request's
+192.6 s wall is above the session's 188.9 s. The split is what matters.
+
+**The non-denoise tail is the VAE decode.**
+
+| stage | seconds |
+|---|---:|
+| `diffuse` (10 denoise steps) | 173.1 |
+| `vae.decode` (tiled spatial decode, 121 frames) | **18.9** |
+| `encode_prompt` (x2: prompt and negative) | 0.2 |
+| `audio_vae.wrapped_decode` | 0.05 |
+| rest of `forward`, then mux and HTTP | ~0.3 |
+
+Text encoding, audio and muxing are under 1 s together. Almost all of the
+~20 s tail is the video VAE decode. Its 256-px tiles overlap by 64 px (a
+192-px stride), so roughly a third of that decode is recomputed overlap.
+
+**The denoise step is compute-bound, and mostly GEMM** (GPU kernel time in the
+173.0 s denoise window, from the first attention kernel to the last):
+
+| class | seconds / step | share |
+|---|---:|---:|
+| GEMM (BF16, CUTLASS `s16816gemm`) | 9.40 | 54% |
+| exact attention (cuDNN SDPA): step 1 on all 60 blocks + blocks 0-5, 54-59 on steps 2-10 | 3.43 | 20% |
+| Sage2 attention (blocks 6-53, steps 2-10), with its quantization | 3.06 | 18% |
+| other kernels (norms, RoPE, elementwise, Triton) | 0.55 | 3% |
+| **GPU idle** (no kernel running) | **0.86** | 5% |
+
+The weights stream at 56.0 GiB per step host-to-device, 50.6 GiB/s while
+copying, about 1.1 s of copy time per step. The copies overlap compute. The
+whole cost of streaming the BF16 checkpoint through a 40 GB page cache from
+NVMe is bounded by the 0.86 s/step the GPU sits idle.
+
+A cuDNN exact attention call takes 181 ms; a Sage2 call takes 70.7 ms. The 168
+exact calls cost 30.4 s per request: 10.9 s for step 1 and 19.5 s for the
+twelve edge blocks over steps 2-10.
+
+**What that says about the next lever** (none of it measured as an arm):
+
+1. **GEMMs, 94 s per request.** Only a format change moves this, and every
+   one-byte format tried so far costs quality the gate does not allow (FP8 on
+   everything, INT8 weights on b6, an FP8 FFN band). A band confined to the
+   blocks and steps that Sage2 already approximates is the untested variant.
+2. **Exact attention, 30.4 s per request.** A faster *exact* kernel for the
+   edge blocks and step 1 changes no numerics the gate depends on, so it is
+   the lever that cannot fail the gate. Halving the cuDNN call time would save
+   about 15 s (-8%).
+3. **VAE decode, 18.9 s per request.** Decoding untiled, or with less tile
+   overlap, removes up to a third of it. It is post-denoise, so it cannot move
+   the trajectory, only the decode's own rounding.
+4. **Streaming, at most 8.6 s per request.** Already overlapped. Little is left.
+
 ### Reference reproducibility on this host
 
 `ref/setA` (compiled BF16) was regenerated for a5 under the pinned Inductor

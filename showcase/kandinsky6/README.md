@@ -143,6 +143,24 @@ than the FP8 baseline that fails every gate. The INT8 arm is the only one
 faster than the baseline that passes a working gate, and it does so on set A
 alone: on b6 its weight rounding changes the scene from the first frame.
 
+## What remains
+
+Measured on the headline arm (one profiled request on build-server-2; details
+in measurements.md, "Where the headline arm's time goes"):
+
+| where one request goes (192.6 s profiled; 188.9 s unprofiled) | per request | next lever |
+|---|---:|---|
+| BF16 GEMMs | 94 s (54% of denoise) | a narrower one-byte band; every wider format tried fails the gate |
+| exact cuDNN attention (step 1 + 12 edge blocks) | 30.4 s | a faster **exact** kernel, which cannot fail the gate; 2x would save ~15 s |
+| Sage2 attention (blocks 6-53) | 30.6 s | already the fast kernel |
+| video VAE decode (tiled, ~1/3 overlap) | 18.9 s | untiled or less overlap: up to ~6 s, post-denoise |
+| other kernels (norms, RoPE, elementwise) | 5.5 s | -- |
+| GPU idle while weights stream from NVMe | 8.6 s | already overlapped |
+| text encoders, audio decode, mux | < 1 s | none |
+
+The denoise step is compute-bound: the GPU is busy 95% of the time, and the
+56 GiB/step of BF16 weights is copied at 50.6 GiB/s, overlapped with compute.
+
 ## What this workload turned out to be
 
 Four things decided every arm in [measurements.md](measurements.md), and they
