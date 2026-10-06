@@ -10,6 +10,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # memory and frees the original: without a fixed threshold that free is kept
 # and host RSS grows by the size of the DiT during hook installation.
 export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-131072}
+# One Inductor cache for every arm and reference on this host. Compiled runs are
+# bit-identical only when they reuse the same autotune choices, and the gate
+# compares an arm against a compiled BF16 reference, so both must read it.
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/data/jooman/k6/inductor-cache}
 export VLLM_OMNI_K6_PIFLOW_DEBUG=${VLLM_OMNI_K6_PIFLOW_DEBUG:-0}
 exec /data/jooman/k6/venv/bin/vllm serve ${K6_CKPT:?set K6_CKPT to the FP8 model root} \
   --omni --host 127.0.0.1 --port 8091 \
