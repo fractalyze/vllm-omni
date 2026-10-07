@@ -1,0 +1,19 @@
+{
+  "name": "final-B-cache8",
+  "command": [
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/run_capped.sh",
+    "/data/jooman/k6/vllm-omni/showcase/kandinsky6/serve/serve_pro_bf16_ref.sh",
+    "--diffusion-attention-config",
+    "@showcase/kandinsky6/compute/arms/sage2.json"
+  ],
+  "env": {
+    "K6_MEMMAX": "40G",
+    "K6_PORT": "8094",
+    "VLLM_OMNI_K6_EXACT_ATTN_STEPS": "1",
+    "VLLM_OMNI_K6_EXACT_ATTN_BLOCKS": "6",
+    "VLLM_OMNI_DLO_STAGE_AHEAD": "1",
+    "VLLM_OMNI_K6_PIFLOW_CACHE_STEPS": "8",
+    "VLLM_OMNI_K6_PIFLOW_CACHE_MODE": "reuse"
+  },
+  "port": 8094
+}
