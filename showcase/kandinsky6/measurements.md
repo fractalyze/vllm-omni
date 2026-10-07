@@ -553,15 +553,31 @@ already in the port, and the W1 placement (distributed layerwise offload with
 rank-local mmap, BF16 streamed from NVMe) carries over unchanged.
 `serve/serve_pro5s_bf16.sh`.
 
-| | request | per step | peak board |
-|---|---:|---:|---:|
-| **this 5090, BF16 streamed, platform attention** | **2587.4 s** | **51.75 s** | 26.6 GB |
-| upstream recipe, 1x H100 80 GB, FA3, CPU offload | 751.7 s | 14.4 s | — |
-| ratio | **3.44x** | **3.59x** | |
+| | request | per step | peak board | vs the H100 recipe |
+|---|---:|---:|---:|---:|
+| this 5090, BF16 streamed, platform attention | 2587.4 s | 51.75 s | 26.6 GB | 3.44x |
+| **this 5090, `sage2-mid` + exact step 1** | **1610.8 s** | **32.22 s** | 26.6 GB | **2.14x** |
+| upstream recipe, 1x H100 80 GB, FA3, CPU offload | 751.7 s | 14.4 s | — | — |
 
-**The 3.44x is placement, not compute.** The H100 has 80 GB and holds the 60.3 GB
-DiT resident; this board has 32 GB and streams all of it every step. Comparing
-like attention to like on this host decomposes it exactly:
+**The headline attention arm transfers to W2 and pays nearly twice as well
+there: -37.7%, against -21.2% at W1.** Part of that is structural --
+`VLLM_OMNI_K6_EXACT_ATTN_STEPS=1` makes one step exact, which is 10% of W1's ten
+steps and 2% of W2's fifty, so the arm runs the fast kernel on 98% of W2 steps
+against 90% of W1's. But backing the exact step out of both still leaves W2 ahead
+(about -38.5% against -23.6%), so **attention is a larger share of the W2 step
+than of the W1 step, and W2 has not been profiled to say why.** Stated as
+measured rather than explained.
+
+**That takes a 32 GB consumer board from 3.44x to 2.14x the upstream H100 80 GB
+recipe, on a workload where the board cannot hold the model at all.** The
+remaining 2.14x is placement, and the two levers against it are named below.
+
+Quality at W2 is **not** gated: one prompt, no W2 reference set, so these are
+timings only. Both MP4s are kept for a human look.
+
+**The platform-attention 3.44x is placement, not compute.** The H100 has 80 GB
+and holds the 60.3 GB DiT resident; this board has 32 GB and streams all of it
+every step. Comparing like attention to like on this host decomposes it exactly:
 
 | | per step | |
 |---|---:|---|
