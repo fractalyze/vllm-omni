@@ -18,10 +18,12 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import chain
 from typing import Any
 
@@ -80,6 +82,53 @@ logger = init_logger(__name__)
 # retry removes the pair before closing the lease.
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
+
+# Rank-local mmap: pack the block after next on a background thread.
+#
+# Packing a block's host staging slot copies its weights out of file-backed
+# checkpoint pages. On the forward thread that copy runs just before the block's
+# kernels are launched, so it has one block of queued GPU work to hide behind.
+# A page that is not mapped (first touch, or evicted from a capped page cache)
+# turns the copy into page faults and NVMe reads, the GPU drains its queue, and
+# idles. With this on, one worker thread packs block i+2 while the forward thread
+# launches blocks i and i+1, so a pack can hide behind two blocks. What is copied,
+# and from where to where, is unchanged; only which thread does it moves.
+DLO_STAGE_AHEAD_ENV = "VLLM_OMNI_DLO_STAGE_AHEAD"
+
+
+def stage_ahead_enabled() -> bool:
+    return os.environ.get(DLO_STAGE_AHEAD_ENV, "0") == "1"
+
+
+class StagingAhead:
+    """At most one background staging pack in flight for a set of shared host slots.
+
+    The slots and their H2D events are shared by every rank-local mmap hook, so a
+    pack must never run concurrently with another pack into the same slot.
+    ``take`` is called by every foreground stage before it touches a slot: it
+    always waits for the pending pack, and hands its result over only when it was
+    staged for that hook and slot.
+    """
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlo-stage-ahead")
+        self._pending: tuple[Any, int, Future] | None = None
+
+    def submit(self, hook: Any, slot: int) -> None:
+        self.take(None, -1)
+        self._pending = (hook, slot, self._executor.submit(hook._stage_mmap_sources, slot))
+
+    def take(self, hook: Any, slot: int) -> dict[torch.dtype, torch.Tensor] | None:
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return None
+        owner, owner_slot, future = pending
+        staged = future.result()
+        return staged if owner is hook and owner_slot == slot else None
+
+    def shutdown(self) -> None:
+        self.take(None, -1)
+        self._executor.shutdown(wait=True)
 
 
 def _retain_active_hwr_registration(
@@ -195,6 +244,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         # Backward link to previous hook for fallback (cache-dit skip)
         self._prev_hook: DistributedLayerwiseOffloadHook | None = None
+
+        # Background staging (DLO_STAGE_AHEAD_ENV): the shared pack queue, and the
+        # hook whose block this hook's prefetch queues next.
+        self._staging_ahead: StagingAhead | None = None
+        self._next_hook: DistributedLayerwiseOffloadHook | None = None
 
         # Marks the first hook in a shared-buffer group.  When multiple DiT
         # groups share the same 2 GPU buffers, another group may have
@@ -551,7 +605,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     )
                     evt.record(self.copy_stream)
             else:
-                cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
+                ahead = self._staging_ahead if self.rank_local_mmap else None
+                staged = ahead.take(self, slot) if ahead is not None else None
+                if staged is not None:
+                    cpu_weights = staged
+                else:
+                    cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
                 with current_omni_platform.stream(self.copy_stream):
                     for dtype, cpu_shard in cpu_weights.items():
                         gw = gpu_weights[dtype]
@@ -562,6 +621,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     # The CPU slot may be overwritten only after this H2D copy has
                     # finished.  The shared event protects reuse by another hook.
                     self.cpu_staging_events[slot] = evt
+                if ahead is not None and self._next_hook is not None:
+                    # The next prefetch alternates to the other slot; its pack
+                    # waits for that slot's previous H2D event before writing.
+                    ahead.submit(self._next_hook, 1 - slot)
         else:
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
@@ -1027,6 +1090,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
+        self._staging_ahead: StagingAhead | None = None
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
         self._host_registration: HostRegistration | None = None
@@ -1477,6 +1541,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # keep a prefetch from overwriting the current block for any ring size.
         for index, hook in enumerate(hooks):
             hook._prev_hook = hooks[index - 1]
+            hook._next_hook = hooks[(index + 1) % len(hooks)]
             hook.current_slot = index % 2
         hooks[1]._is_group_first = True
         return hooks
@@ -1777,12 +1842,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         unified_shard_buffers = self._allocate_shared_shard_buffers(allgather_hooks) if allgather_hooks else None
         unified_cpu_staging = None
         cpu_staging_events = None
+        staging_ahead: StagingAhead | None = None
         if self._using_rank_local_mmap and not self._using_registered_mmap:
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
                 mmap_hooks,
                 self._resident_layer_group,
             )
             cpu_staging_events = [None, None]
+            # The resident-layer group packs into the same slots from its own
+            # load path, outside prefetch_layer, so background staging stays off
+            # whenever it exists.
+            if stage_ahead_enabled() and self._resident_layer_group is None:
+                staging_ahead = StagingAhead()
+                self._staging_ahead = staging_ahead
+                logger.info("DLO rank-local mmap: staging packs run one block ahead on a background thread")
             if self._resident_layer_group is not None:
                 # Resident and streamed layers execute in the same stage and
                 # reuse the same host slots. Events serialize slot reuse.
@@ -1805,6 +1878,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 if hook.rank_local_mmap and unified_cpu_staging is not None and cpu_staging_events is not None:
                     hook.cpu_staging_buffers = unified_cpu_staging
                     hook.cpu_staging_events = cpu_staging_events
+                    hook._staging_ahead = staging_ahead
                 hook._group_id = group_idx
                 hook._shared_slot_group = shared_slot_group
 
@@ -1899,6 +1973,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # A hook can leave the circular tail prefetch queued after the final
         # forward. Drain every transport before releasing hook-owned host or
         # device buffers, including the ordinary rank-local path.
+        # A background staging pack reads the checkpoint mappings released below.
+        staging_error = None
+        if self._staging_ahead is not None:
+            staging_error = run_cleanup_steps([("stopping background DLO staging", self._staging_ahead.shutdown)])
+            self._staging_ahead = None
         sync_error = run_cleanup_steps([("synchronizing pending DLO transfers", current_omni_platform.synchronize)])
 
         unique_hooks: list[DistributedLayerwiseOffloadHook] = []
@@ -1960,6 +2039,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             (
                 error
                 for error in (
+                    staging_error,
                     sync_error,
                     collective_error,
                     rank_local_error,
