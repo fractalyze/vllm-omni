@@ -90,6 +90,19 @@ marked contaminated rather than reported.
 
 ## Result
 
+### Round 5 / R1: H1's lost gain (build-server-2, 2026-10-07 19:05-21:20 KST)
+
+Per-call dispatch was not where H1's gain went: 2.8 µs a launch, the host ~360 ms ahead of the GPU. FP16 cast traffic on
+the compute stream was, and part of it was avoidable. The kernel's unused bias pointer made Inductor write every
+bias-free call's FP16 input twice. One mirrored session, A B B A, n=4 timed requests per arm, valid, identical output:
+
+| configuration | W1 request (median, min-max) | change |
+|---|---:|---:|
+| round-4 head behaviour | 152.70 s (152.08-153.30) | -- |
+| **+ placeholder bias pointer (PR #66, default)** | **151.05 s** (150.64-151.60) | **-1.08%** |
+
+Moving the weight casts onto the offload copy stream (PR #64, opt-in) measured -0.02%. See measurements.md, "Round 5 / R1".
+
 ### Round 4: hybrid FP16-accumulate GEMMs (build-server-2, 2026-10-07 15:36-16:11 KST)
 
 One mirrored session, A B B A, n=4 timed requests per arm, every GPU lock held, valid:
