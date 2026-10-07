@@ -13,6 +13,9 @@ process adds (0.0272 mean on this pipeline, compiled).
     python step_probe.py drive --ids a3-sprint-start b6-... a1-portrait-speech
     # LPIPS of every saved branch against its base, one JSON row per (prompt, branch).
     python step_probe.py score --out-dir /home/jooman/k6/probe/out
+    # One branch's frames as <prompt id>.mp4, encoded the way the server encodes
+    # (H.264, CRF 18, 24 fps), so the gate scorers take it like any arm's output.
+    python step_probe.py encode --out-dir /home/jooman/k6/probe/out --branch reuse-8 --mp4-dir runs/reuse-8
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ sys.path.insert(0, str(BENCH))
 
 W1 = dict(width=864, height=480, num_frames=121, num_inference_steps=10, guidance_scale=1.0)
 SEED = 42
+W1_FPS = 24.0
 
 
 def load_prompts() -> dict[str, str]:
@@ -95,6 +99,20 @@ def score(args: argparse.Namespace) -> None:
             )
 
 
+def encode(args: argparse.Namespace) -> None:
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
+
+    names = {probe_dir_name(text, SEED): pid for pid, text in load_prompts().items()}
+    args.mp4_dir.mkdir(parents=True, exist_ok=True)
+    for request_dir in sorted(p for p in args.out_dir.iterdir() if p.is_dir()):
+        frames_path = request_dir / f"{args.branch}.npy"
+        if request_dir.name not in names or not frames_path.exists():
+            continue
+        target = args.mp4_dir / f"{names[request_dir.name]}.mp4"
+        target.write_bytes(mux_video_audio_bytes(np.load(frames_path), fps=W1_FPS))
+        print(target, flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -104,8 +122,12 @@ def main() -> None:
     d.add_argument("--mp4-dir", type=Path, default=Path("/home/jooman/k6/probe/mp4"))
     s = sub.add_parser("score")
     s.add_argument("--out-dir", type=Path, required=True)
+    e = sub.add_parser("encode")
+    e.add_argument("--out-dir", type=Path, required=True)
+    e.add_argument("--branch", required=True)
+    e.add_argument("--mp4-dir", type=Path, required=True)
     args = parser.parse_args()
-    {"drive": drive, "score": score}[args.cmd](args)
+    {"drive": drive, "score": score, "encode": encode}[args.cmd](args)
 
 
 if __name__ == "__main__":
