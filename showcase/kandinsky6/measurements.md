@@ -9,6 +9,58 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Round 3 / attribution: the final stack's G1 rise is PR #38's reassociation, not the cache
+
+The final stack (showcase head + pi-Flow cache on step 8) scored set A **0.1393 / 0.4675** on bs3,
+against 0.1117 / 0.3446 for the old headline arm. Two hypotheses
+(`/data/jooman/k6/ATTRIBUTION.md`):
+- **H38**: PR #38 adds the GEMM bias after the GEMM instead of in its epilogue, a reassociation
+  that changes every configuration, the reference included. A head arm scored against a pre-#38
+  reference therefore measures the reassociation too.
+- **Hc**: the cache degrades quality more on head than the screens showed.
+
+Set A, all 9 prompts, seed 42, pinned Inductor cache, every GPU lock held:
+
+| host | run | reference | set mean / worst frame |
+|---|---|---|---|
+| bs3 (Track C) | X0: pre-#38 arm, no cache | pre-#38 compiled | 0.1117 / 0.3446 |
+| bs3 (Track C) | X1: head arm, no cache | pre-#38 compiled | 0.1384 / 0.4680 |
+| bs3 (Track C) | X3: head arm + cache step 8 | pre-#38 compiled | 0.1393 / 0.4675 |
+| bs1 (Track S) | pre-#38 arm, no cache | pre-#38 compiled | 0.1142 / 0.2818 |
+| bs1 (Track S) | X1: head arm, no cache | pre-#38 compiled | 0.1296 / 0.4320 |
+| bs1 (Track S) | X3: head arm + cache step 8 | pre-#38 compiled | 0.1309 / 0.4284 |
+| **bs2 (Track M)** | **X3: head arm + cache step 8** | **head compiled (regenerated)** | **0.1128 / 0.3675** |
+| bs2 (Track M) | X3: head arm + cache step 8 | pre-#38 compiled | 0.1422 / 0.4348 |
+| bs2 (Track M) | the head reference itself | pre-#38 compiled | 0.1473 / 0.4229 |
+
+**Verdict: H38.**
+- Against a pre-#38 reference, the rise appears **without the cache** on two hosts:
+  - bs3: X0 to X1 is +0.0267.
+  - bs1: +0.0154.
+- The cache adds only +0.0009 (bs3) and +0.0013 (bs1) on top. Its same-process cost is unchanged by
+  #38: 0.0108 / 0.0293 on head vs 0.0106 / 0.0259 pre-#38 (bs1).
+- Against a reference regenerated on the same code (bs2), the final stack scores
+  **0.1128 / 0.3675**. That is inside H38's predicted 0.112-0.115 and within 0.001 of the old
+  headline's 0.1117.
+- #38 alone moves the compiled BF16 reference by 0.1473 / 0.4229: about one compile-vs-eager floor
+  (0.1455 / 0.416). The reassociation is a whole-trajectory change of that size, applied to every
+  configuration alike.
+
+**#40 is not involved.** Its claim of bit-exactness holds on head. a1 with background staging on and
+off produced byte-identical MP4s (bs2, 13:56-14:04). So the X0 to X1 change is #38's.
+
+**What the final stack's quality is.** Against a same-code reference, its set-A G1 mean is
+**0.1128**, inside 0.15; its worst frame, 0.3675, is over 0.25. That is the same standing as the
+shipped arm, so the 0.1393 should be read as scored against a stale reference.
+
+Checks on the bs2 runs:
+- All four used the same VAE decode plan, (1, 17, 256, 448) tiles, so no memory-dependent decode
+  difference enters the comparison.
+- One sample shows another user's GPU process during the reference run (13:11:32, 5.8 GB). Their
+  processes ignored the GPU lease on bs2 and caused two failed first attempts at 12:54-12:56, which
+  were rerun. The decode plan did not change, so pixels are unaffected; that request's timing is
+  not used.
+
 ## Round 3 / final session: base vs base + step-8 cache (Track M, build-server-2)
 
 One mirrored session on build-server-2, 2026-10-07 11:17-11:58 KST, showcase
