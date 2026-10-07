@@ -33,6 +33,18 @@ class SwitchTest(absltest.TestCase):
             os.environ.pop("VLLM_OMNI_K6_HYBRID_GEMM", None)
             self.assertFalse(hybrid_enabled())
 
+    def test_release_scratch_only_when_enabled(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_linear
+
+        with mock.patch.object(hybrid_linear, "current_omni_platform") as platform:
+            platform.is_available.return_value = True
+            with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "1"}):
+                self.assertTrue(hybrid_linear.release_hybrid_scratch())
+            platform.empty_cache.assert_called_once()
+            with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "0"}):
+                self.assertFalse(hybrid_linear.release_hybrid_scratch())
+            platform.empty_cache.assert_called_once()
+
     def test_on(self) -> None:
         with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "1"}):
             self.assertTrue(hybrid_enabled())
@@ -114,20 +126,6 @@ class KernelTest(absltest.TestCase):
         x = torch.randn(2, 300, 512, device="cuda").to(torch.bfloat16)
         bias = torch.randn(256, device="cuda").to(torch.bfloat16)
         self._check(layer.quant_method.apply(layer, x, bias), x, layer, bias)
-
-    def test_no_fp16_copy_of_bf16_operands(self) -> None:
-        """The kernel converts in registers: peak memory is the inputs plus the output, no FP16 copy of x."""
-        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
-
-        x = torch.randn(4096, 2048, device="cuda").to(torch.bfloat16)
-        w = (torch.randn(1024, 2048, device="cuda") * 0.05).to(torch.bfloat16)
-        hybrid_matmul(x, w, out_dtype=torch.bfloat16)
-        torch.accelerator.synchronize()
-        torch.accelerator.reset_peak_memory_stats()
-        before = torch.accelerator.memory_allocated()
-        out = hybrid_matmul(x, w, out_dtype=torch.bfloat16)
-        torch.accelerator.synchronize()
-        self.assertLessEqual(torch.accelerator.max_memory_allocated() - before, out.numel() * out.element_size())
 
     def test_compiled_without_graph_break(self) -> None:
         layer = self._layer()

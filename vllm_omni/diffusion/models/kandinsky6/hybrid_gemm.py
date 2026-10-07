@@ -5,9 +5,12 @@
 
 The serving copy of ``showcase/kandinsky6/compute/hybrid_gemm.py`` (kernel and
 ``hybrid_matmul``; that file also carries the measurement tooling and the
-``hybrid_linear`` drop-in). One difference: operands are converted to FP16
-inside the kernel rather than on the host, which is bit-identical and avoids an
-FP16 copy of every activation.
+``hybrid_linear`` drop-in). Operands are cast to FP16 on the host, as there.
+Converting them in the kernel instead is bit-identical and saves the copies, but
+the conversions sit in the MMA loop: at W1's FF shapes it ran 1.01-1.03x against
+the served bias-free cuBLAS GEMM, where the host cast runs 1.12-1.21x. The FP16
+copies the allocator keeps are released before the VAE decode instead
+(``hybrid_linear.release_hybrid_scratch``).
 
 On consumer Blackwell an FP16-input MMA accumulating in FP16 runs faster than
 the same MMA accumulating in FP32. Measured on this RTX 5090 at W1's FF1 shape
@@ -102,11 +105,8 @@ def _hybrid_mm(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         k_mask = rk[None, :] + k < K
-        # Operands arrive in their stored dtype (BF16 in the served path) and are
-        # rounded to FP16 here, in registers: the same round-to-nearest a host
-        # `.to(torch.float16)` would do, without materialising an FP16 copy.
-        x = tl.load(a_ptr, mask=(rm[:, None] < M) & k_mask, other=0.0).to(tl.float16)
-        y = tl.load(b_ptr, mask=(rk[:, None] + k < K) & (rn[None, :] < N), other=0.0).to(tl.float16)
+        x = tl.load(a_ptr, mask=(rm[:, None] < M) & k_mask, other=0.0)
+        y = tl.load(b_ptr, mask=(rk[:, None] + k < K) & (rn[None, :] < N), other=0.0)
         acc += tl.dot(x, y, out_dtype=tl.float16).to(tl.float32)
         a_ptr += BLOCK_K * sak
         b_ptr += BLOCK_K * sbk
@@ -156,14 +156,10 @@ def hybrid_matmul(
     if w.shape[1] != K:
         raise ValueError(f"weight {tuple(w.shape)} does not match input feature size {K}")
 
-    # FP16 and BF16 operands go in as they are and are converted in the kernel.
-    # A host-side cast would write a full FP16 copy of every activation (1.6 GB
-    # for FF2 at W1) that the caching allocator then keeps, which shrinks the
-    # free memory the VAE decoder plans its tiles from. Only FP32 is cast here.
-    xh = x2.to(torch.float16) if x2.dtype == torch.float32 else x2
+    xh = x2 if x2.dtype == torch.float16 else x2.to(torch.float16)
     # The kernel reads B as (K, N); `w.t()` is a view, and a non-contiguous B is
     # fine here because the strides are passed explicitly.
-    wh = (w.to(torch.float16) if w.dtype == torch.float32 else w).t()
+    wh = (w if w.dtype == torch.float16 else w.to(torch.float16)).t()
     want = out_dtype or x.dtype
     c = torch.empty((M, N), device=x.device, dtype=torch.float16 if want == torch.float16 else torch.bfloat16)
     bias_h = None if bias is None else bias.to(torch.float32)
