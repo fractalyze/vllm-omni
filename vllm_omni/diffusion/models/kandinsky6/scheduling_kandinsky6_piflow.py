@@ -73,13 +73,20 @@ class DXPolicy:
 
     def __init__(
         self,
-        denoising_output: torch.Tensor,
+        denoising_output: torch.Tensor | None,
         x_t_src: torch.Tensor,
         sigma_t_src: torch.Tensor,
         segment_size: float | torch.Tensor = 1.0,
         shift: float = 1.0,
         eps: float = 1e-6,
+        *,
+        x_0_grid: torch.Tensor | None = None,
     ) -> None:
+        """Pass the DiT's ``denoising_output``, or -- for a step served from a
+        cache rather than the network -- a ready ``x_0_grid`` (grid on axis 1,
+        any number of points; one point means a constant ``x_0``)."""
+        if (denoising_output is None) == (x_0_grid is None):
+            raise ValueError("DXPolicy takes exactly one of denoising_output and x_0_grid")
         self.x_t_src = x_t_src
         self.ndim = x_t_src.dim()
         self.shift = shift
@@ -94,7 +101,10 @@ class DXPolicy:
             segment = segment.reshape(*segment.size(), *((self.raw_t_src.dim() - segment.dim()) * [1]))
         self.raw_t_dst = (self.raw_t_src - segment).clamp(min=0)
         self.segment_size = (self.raw_t_src - self.raw_t_dst).clamp(min=eps)
-        self.denoising_output_x_0 = self._u_to_x_0(denoising_output, self.x_t_src, self.sigma_t_src)
+        if x_0_grid is not None:
+            self.denoising_output_x_0 = x_0_grid
+        else:
+            self.denoising_output_x_0 = self._u_to_x_0(denoising_output, self.x_t_src, self.sigma_t_src)
 
     def _unwarp_t(self, sigma_t: torch.Tensor) -> torch.Tensor:
         """Inverse of :func:`shift_timesteps`."""
@@ -124,6 +134,42 @@ class DXPolicy:
         raw_t = self._unwarp_t(sigma_t)
         x_0 = self._interpolate(self.denoising_output_x_0, (raw_t - self.raw_t_dst) / self.segment_size)
         return (x_t - x_0) / sigma_t.clamp(min=self.eps)
+
+
+CACHE_MODES = ("reuse", "extrapolate")
+
+
+def cached_x_0_grid(previous: DXPolicy, raw_t_src: torch.Tensor, raw_t_dst: torch.Tensor, mode: str) -> torch.Tensor:
+    """The ``x_0`` grid for a step that skips the DiT, from the step before it.
+
+    pi-Flow's DiT predicts ``x_0`` across its segment, and late in the schedule
+    that prediction has nearly stopped moving. A skipped step therefore does not
+    need a new policy, only the previous one carried across the next segment:
+
+    - ``reuse``: hold the previous segment's last prediction (its grid point at
+      ``tau_dst``, which is this segment's ``tau_src``) constant. The rollout then
+      flows straight toward it.
+    - ``extrapolate``: continue that prediction to first order in raw time, with
+      the slope of the previous grid's last interval -- the derivative its own
+      linear interpolation used there (TaylorSeer / DPCache-style).
+
+    ``raw_t_src``/``raw_t_dst`` are this segment's raw times, shaped like
+    ``previous.raw_t_dst`` (one per token, trailing singleton dims).
+    """
+    if mode not in CACHE_MODES:
+        raise ValueError(f"unknown PiFlow cache mode {mode!r}; expected one of {CACHE_MODES}")
+    grid = previous.denoising_output_x_0
+    x_0_end = grid[:, :1]
+    if mode == "reuse" or grid.size(1) < _MIN_GRID_POINTS:
+        return x_0_end
+    n = grid.size(1)
+    spacing = previous.segment_size / (n - 1)
+    slope = (grid[:, 1:2] - x_0_end) / spacing.unsqueeze(1)
+    # Grid point j of this segment sits at raw_t_dst + j * (raw_t_src - raw_t_dst) / (n - 1).
+    steps = torch.arange(n, device=grid.device, dtype=torch.float32)
+    steps = steps.reshape(1, n, *((grid.dim() - 2) * [1]))
+    times = raw_t_dst.unsqueeze(1) + steps * ((raw_t_src - raw_t_dst) / (n - 1)).unsqueeze(1)
+    return x_0_end + slope * (times - previous.raw_t_dst.unsqueeze(1))
 
 
 def policy_rollout_fm(

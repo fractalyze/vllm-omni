@@ -15,6 +15,7 @@ imports, exactly like vLLM-Omni's other native pipelines (e.g.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -56,8 +57,10 @@ from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
 from .scheduling_kandinsky6_piflow import (
+    CACHE_MODES,
     DXPolicy,
     KandinskyPiflowScheduler,
+    cached_x_0_grid,
     policy_rollout_fm,
     shift_timesteps,
     split_grid_prediction,
@@ -786,7 +789,57 @@ def _is_piflow_scheduler(scheduler: object) -> bool:
     return hasattr(scheduler, "segments") and hasattr(scheduler, "n_grid")
 
 
-def piflow_denoise_loop(  # noqa: PLR0913
+# Late-step caching for pi-Flow. Each DiT call predicts x_0 across its whole
+# segment, and late in the schedule that prediction has nearly converged, so a
+# late step can be served from the step before it instead of the network:
+#
+#   VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=9,10    1-based sampler steps that skip the DiT
+#   VLLM_OMNI_K6_PIFLOW_CACHE_MODE=reuse    or ``extrapolate`` (see cached_x_0_grid)
+#
+# Unset (the default) changes nothing. Step 1 can never be cached: there is no
+# step before it.
+def piflow_cache_steps() -> frozenset[int]:
+    raw = os.environ.get("VLLM_OMNI_K6_PIFLOW_CACHE_STEPS", "")
+    steps = frozenset(int(tok) for tok in raw.replace(" ", "").split(",") if tok)
+    if any(step < 2 for step in steps):
+        raise ValueError(f"VLLM_OMNI_K6_PIFLOW_CACHE_STEPS={raw!r}: step 1 has no step before it to reuse")
+    return steps
+
+
+def piflow_cache_mode() -> str:
+    mode = os.environ.get("VLLM_OMNI_K6_PIFLOW_CACHE_MODE", "reuse") or "reuse"
+    if mode not in CACHE_MODES:
+        raise ValueError(f"VLLM_OMNI_K6_PIFLOW_CACHE_MODE={mode!r}; expected one of {CACHE_MODES}")
+    return mode
+
+
+# Step-sensitivity probe, a measurement tool and never a serving path. With
+# VLLM_OMNI_K6_STEP_PROBE=<file.json> each request runs its normal trajectory,
+# then replays the tail of it once per branch listed in the file -- re-read on
+# every request, so the branches can change without a restart -- and hands each
+# branch's final latents to the pipeline, which decodes and saves them. A branch
+# is {"name": str, "perturb_step": k, "eps": float} (add eps * rms noise to the
+# DiT output of step k) and/or {"cache_steps": [k, ...], "mode": "reuse"}. Branches
+# replay from the recorded state, so a late-step branch costs only its own steps
+# and every branch shares the base run's process and kernels: the comparison
+# is free of the run-to-run floor that a second process would add.
+def step_probe_config() -> dict | None:
+    path = os.environ.get("VLLM_OMNI_K6_STEP_PROBE", "")
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _perturb(x: Tensor, eps: float, seed: int) -> Tensor:
+    """``x`` plus Gaussian noise of ``eps`` times its RMS, from a fixed seed."""
+    gen = torch.Generator(device=x.device).manual_seed(seed)
+    noise = torch.randn(x.shape, generator=gen, device=x.device, dtype=torch.float32)
+    rms = x.float().pow(2).mean().sqrt()
+    return (x.float() + eps * rms * noise).to(x.dtype)
+
+
+def piflow_denoise_loop(  # noqa: PLR0913, PLR0915
     bundle: LatentBundle,
     dit: nn.Module,
     text_embeds: TextEmbeds,
@@ -804,6 +857,7 @@ def piflow_denoise_loop(  # noqa: PLR0913
     attention_mask: Tensor | None = None,
     visual_token_type_ids: Tensor | None = None,
     progress_callback=None,
+    step_probe_sink=None,
 ) -> LatentBundle:
     """pi-Flow denoising for a distilled K6 checkpoint.
 
@@ -817,6 +871,9 @@ def piflow_denoise_loop(  # noqa: PLR0913
     branch, so this loop takes none: a caller asking for guidance is asking for a
     trajectory these weights were not distilled for, and gets an error rather
     than a quietly different video.
+
+    ``step_probe_sink(name, bundle)``, when given and a probe file is set, receives
+    every probe branch's final latents (see :func:`step_probe_config`).
     """
     if abs(guidance_weight - 1.0) > 1e-6:
         raise ValueError(
@@ -844,15 +901,18 @@ def piflow_denoise_loop(  # noqa: PLR0913
 
     exact_steps = exact_attention_steps()
     fp8_from_step = fp8_after_step()
-    for segment in scheduler.segments(num_steps):
+    cache_steps = piflow_cache_steps()
+    cache_mode = piflow_cache_mode()
+    probe = step_probe_config() if step_probe_sink is not None else None
+    segments = scheduler.segments(num_steps)
+
+    def _dit_grids(segment, video, audio):
         if exact_steps:
             set_exact_attention_step(_raw_dit(dit), segment.step_index < exact_steps)
         if fp8_from_step:
             set_fp8_gemm_step(_raw_dit(dit), segment.step_index >= fp8_from_step)
         tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
-        tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
         sigma_src = shift_timesteps(tau_src, shift)
-
         model_input_v = _build_video_input(
             video,
             dit.visual_cond,
@@ -878,15 +938,15 @@ def piflow_denoise_loop(  # noqa: PLR0913
         if not isinstance(prediction, tuple):
             raise RuntimeError("Kandinsky 6 PiFlow requires the fused video/audio DiT forward")
         pred_video, pred_audio = prediction
-        grid_video = split_grid_prediction(pred_video, n_grid)
-        grid_audio = split_grid_prediction(pred_audio, n_grid)
+        return split_grid_prediction(pred_video, n_grid), split_grid_prediction(pred_audio, n_grid)
 
-        # The policy is defined on the latent's own channels; the DiT input may
-        # carry extra conditioning channels that the output head does not.
-        video_dim = grid_video.shape[-1]
-        audio_dim = grid_audio.shape[-1]
-        video_state = video[..., :video_dim]
-        audio_state = audio[..., :audio_dim]
+    def _step(segment, video, audio, grids=None, previous=None, mode=cache_mode):
+        """Advance one segment. ``grids`` is the DiT's output for it; without it the
+        step is cached from ``previous`` (the policies of the step before).
+        Returns the new state and this step's policies."""
+        tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
+        tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
+        sigma_src = shift_timesteps(tau_src, shift)
 
         # Packed layout: one scalar per request becomes one per token.
         video_sigma = sigma_src.repeat_interleave(video_lengths)
@@ -894,29 +954,57 @@ def piflow_denoise_loop(  # noqa: PLR0913
         video_segment = torch.full_like(video_sigma, segment.segment_size)
         audio_segment = torch.full_like(audio_sigma, segment.segment_size)
 
-        policy_video = DXPolicy(grid_video, video_state, video_sigma, video_segment, shift, eps)
-        policy_audio = DXPolicy(grid_audio, audio_state, audio_sigma, audio_segment, shift, eps)
+        policies = []
+        states = []
+        for k, (x, sigma, seg, lengths) in enumerate(
+            ((video, video_sigma, video_segment, video_lengths), (audio, audio_sigma, audio_segment, audio_lengths))
+        ):
+            if grids is not None:
+                # The policy is defined on the latent's own channels; the DiT input
+                # may carry extra conditioning channels that the output head does not.
+                state = x[..., : grids[k].shape[-1]]
+                policy = DXPolicy(grids[k], state, sigma, seg, shift, eps)
+            else:
+                state = x[..., : previous[k].denoising_output_x_0.shape[-1]]
+                tail = (state.dim() - 1) * [1]
+                raw_src = tau_src.repeat_interleave(lengths).reshape(-1, *tail)
+                raw_dst = tau_dst.repeat_interleave(lengths).reshape(-1, *tail)
+                x_0 = cached_x_0_grid(previous[k], raw_src, raw_dst, mode)
+                policy = DXPolicy(None, state, sigma, seg, shift, eps, x_0_grid=x_0)
+            policies.append(policy)
+            states.append(state)
 
         if sample_video:
             video = policy_rollout_fm(
-                video_state,
+                states[0],
                 video_sigma,
                 tau_src.repeat_interleave(video_lengths),
                 tau_dst.repeat_interleave(video_lengths),
                 substeps,
-                policy_video,
+                policies[0],
             )
             if visual_cond_scheme == "tail_cond_first_frame" and first_frames is not None:
                 video[video_cu[1:] - 1] = first_frames.to(device=device, dtype=video.dtype)
         if sample_audio:
             audio = policy_rollout_fm(
-                audio_state,
+                states[1],
                 audio_sigma,
                 tau_src.repeat_interleave(audio_lengths),
                 tau_dst.repeat_interleave(audio_lengths),
                 substeps,
-                policy_audio,
+                policies[1],
             )
+        return video, audio, policies
+
+    # Per step: the state entering it and the DiT's output (None when cached).
+    record: list[tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]] = []
+    policies = None
+    for segment in segments:
+        cached = segment.step_index + 1 in cache_steps and policies is not None
+        grids = None if cached else _dit_grids(segment, video, audio)
+        if probe is not None:
+            record.append((video, audio, grids))
+        video, audio, policies = _step(segment, video, audio, grids, policies)
 
         if _PIFLOW_DEBUG:
 
@@ -929,19 +1017,49 @@ def piflow_denoise_loop(  # noqa: PLR0913
                 )
 
             logger.warning(
-                "PiFlow step %d tau %.4f->%.4f sigma %.4f | %s | %s | %s | %s",
+                "PiFlow step %d tau %.4f->%.4f cached %s | %s | %s",
                 segment.step_index,
                 segment.tau_src,
                 segment.tau_dst,
-                float(sigma_src[0]),
-                _stat(grid_video, "pred_v"),
-                _stat(grid_audio, "pred_a"),
+                cached,
                 _stat(video, "video"),
                 _stat(audio, "audio"),
             )
 
         if progress_callback is not None:
             progress_callback()
+
+    if probe is not None:
+        for branch in probe.get("branches", []):
+            b_cache = frozenset(int(k) for k in branch.get("cache_steps", ()))
+            b_perturb = branch.get("perturb_step")
+            touched = sorted(b_cache | ({int(b_perturb)} if b_perturb is not None else set()))
+            if not touched or (b_cache and min(b_cache) < 2):
+                raise ValueError(f"step probe branch {branch!r} touches no step, or caches step 1")
+            first = touched[0] - 1  # 0-based segment index
+            b_video, b_audio, _ = record[first]
+            if b_perturb is not None and int(b_perturb) - 1 == first:
+                noise_eps = float(branch.get("eps", 0.01))
+                seed = int(branch.get("seed", 0))
+                b_video, b_audio = _perturb(b_video, noise_eps, seed), _perturb(b_audio, noise_eps, seed + 1)
+            b_policies = None
+            if first > 0:
+                p_video, p_audio, p_grids = record[first - 1]
+                if p_grids is None:
+                    raise ValueError("step probe needs the DiT to have run on the step before a branch")
+                _, _, b_policies = _step(segments[first - 1], p_video, p_audio, p_grids)
+            for segment in segments[first:]:
+                if segment.step_index + 1 in b_cache:
+                    grids = None
+                else:
+                    grids = _dit_grids(segment, b_video, b_audio)
+                b_video, b_audio, b_policies = _step(
+                    segment, b_video, b_audio, grids, b_policies, branch.get("mode", "reuse")
+                )
+            step_probe_sink(
+                branch["name"],
+                LatentBundle(video=b_video, audio=b_audio, video_cu_seqlens=video_cu, audio_cu_seqlens=audio_cu),
+            )
 
     if first_frames is not None:
         ff = first_frames.to(device=device, dtype=video.dtype)
@@ -1779,6 +1897,7 @@ class Kandinsky6TI2VAPipeline(
         sample_audio: bool,
         visual_token_type_ids: Tensor | None,
         device: torch.device,
+        step_probe_sink=None,
     ) -> LatentBundle:
         text_rope, negative_text_rope, resolved_audio_rope = self._text_ropes(
             self.transformer,
@@ -1826,6 +1945,7 @@ class Kandinsky6TI2VAPipeline(
                     attention_mask=positive_mask,
                     visual_token_type_ids=visual_token_type_ids,
                     progress_callback=progress_bar.update,
+                    step_probe_sink=step_probe_sink,
                 )
             return denoise_loop(
                 bundle=bundle,
@@ -1854,6 +1974,24 @@ class Kandinsky6TI2VAPipeline(
     # ------------------------------------------------------------------
     # Request entrypoint
     # ------------------------------------------------------------------
+
+    def _step_probe_sink(self, prompt: str, seed: int | None):
+        """Where :func:`piflow_denoise_loop`'s probe branches go: decoded to uint8
+        frames ``(T, H, W, 3)`` in ``<out_dir>/<prompt hash>-s<seed>/<name>.npy``.
+        None unless ``VLLM_OMNI_K6_STEP_PROBE`` is set."""
+        probe = step_probe_config()
+        if probe is None:
+            return None
+        out = os.path.join(probe["out_dir"], f"{hashlib.sha1(prompt.encode()).hexdigest()[:10]}-s{seed}")
+        os.makedirs(out, exist_ok=True)
+
+        def sink(name: str, bundle: LatentBundle | None = None, frames: np.ndarray | None = None) -> None:
+            if frames is None:
+                frames = postprocess_video(bundle, self.vae, bs=1)[0].permute(1, 2, 3, 0).cpu().numpy()
+            np.save(os.path.join(out, f"{name}.npy"), frames)
+            logger.info("step probe: saved %s/%s", out, name)
+
+        return sink
 
     def __call__(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         return self.forward(req)
@@ -2284,6 +2422,7 @@ class Kandinsky6TI2VAPipeline(
             sample_audio=sample_audio,
             visual_token_type_ids=visual_token_type_ids,
             device=device,
+            step_probe_sink=self._step_probe_sink(prompt, sampling.seed),
         )
 
         if generated_visual_mask is not None and result.video is not None:
@@ -2306,6 +2445,9 @@ class Kandinsky6TI2VAPipeline(
             if _PIFLOW_DEBUG:
                 _log_tensor_stats("vae decoded", video=decoded)
             video_out = decoded.permute(0, 2, 3, 4, 1).cpu().numpy()
+            probe_sink = self._step_probe_sink(prompt, sampling.seed)
+            if probe_sink is not None:
+                probe_sink("base", frames=video_out[0])
 
         audio_out = (
             postprocess_audio(result, self.audio_vae, normalization_mode=audio_normalization) if sample_audio else None

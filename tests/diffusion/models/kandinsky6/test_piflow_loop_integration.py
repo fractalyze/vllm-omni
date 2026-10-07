@@ -24,7 +24,10 @@ is exactly the failure this port hit on first run.
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
+from unittest import mock
 
 import torch
 from absl.testing import absltest
@@ -236,6 +239,96 @@ class PiflowLoopIntegrationTest(absltest.TestCase):
                 scheduler=KandinskyPiflowScheduler(shift=5.0, n_grid=N_GRID),
                 guidance_weight=5.0,
             )
+
+
+class PiflowStepCacheIntegrationTest(PiflowLoopIntegrationTest):
+    """Late-step caching (``VLLM_OMNI_K6_PIFLOW_CACHE_STEPS``) and the step probe.
+
+    Inherits the tiny DiT; the inherited tests run again here, which is cheap.
+    """
+
+    def _run(self, num_steps: int = 4, **kwargs):
+        from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import piflow_denoise_loop
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import (
+            KandinskyPiflowScheduler,
+        )
+
+        torch.manual_seed(0)
+        bundle, text_embeds, visual_rope, audio_rope, text_rope = self._bundle_and_conditioning()
+        calls = []
+        handle = self.dit.register_forward_hook(lambda *_: calls.append(1))
+        try:
+            with torch.no_grad():
+                out = piflow_denoise_loop(
+                    bundle=bundle,
+                    dit=self.dit,
+                    text_embeds=text_embeds,
+                    visual_rope=visual_rope,
+                    audio_rope=audio_rope,
+                    text_rope=text_rope,
+                    num_steps=num_steps,
+                    scheduler=KandinskyPiflowScheduler(shift=5.0, n_grid=N_GRID, num_policy_substeps=16),
+                    **kwargs,
+                )
+        finally:
+            handle.remove()
+        return out, len(calls)
+
+    def test_cached_steps_skip_the_dit(self) -> None:
+        base, base_calls = self._run()
+        self.assertEqual(base_calls, 4)
+        for mode in ("reuse", "extrapolate"):
+            with mock.patch.dict(
+                os.environ,
+                {"VLLM_OMNI_K6_PIFLOW_CACHE_STEPS": "3,4", "VLLM_OMNI_K6_PIFLOW_CACHE_MODE": mode},
+            ):
+                cached, calls = self._run()
+            self.assertEqual(calls, 2, mode)
+            self.assertTrue(torch.isfinite(cached.video).all(), mode)
+            # How close a cached step lands is a property of trained weights (the
+            # step probe measures it); random ones only show the path was taken.
+            self.assertFalse(torch.equal(cached.video, base.video), mode)
+
+    def test_probe_branches_reproduce_the_switch(self) -> None:
+        """A probe's cache branch is the same computation as the serving switch,
+        and the probe leaves the request's own result untouched."""
+        base, _ = self._run()
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_PIFLOW_CACHE_STEPS": "3,4"}):
+            switched, _ = self._run()
+
+        sunk = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "probe.json")
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "out_dir": tmp,
+                        "branches": [
+                            {"name": "reuse-3-4", "cache_steps": [3, 4]},
+                            {"name": "perturb-4", "perturb_step": 4, "eps": 0.01},
+                        ],
+                    },
+                    f,
+                )
+            with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_STEP_PROBE": path}):
+                probed, calls = self._run(step_probe_sink=lambda name, bundle: sunk.update({name: bundle}))
+
+        # 4 base calls, none for the cache branch (its steps 3-4 are both cached),
+        # one for the perturbed step 4.
+        self.assertEqual(calls, 5)
+        torch.testing.assert_close(probed.video, base.video, rtol=0, atol=0)
+        torch.testing.assert_close(sunk["reuse-3-4"].video, switched.video, rtol=0, atol=0)
+        torch.testing.assert_close(sunk["reuse-3-4"].audio, switched.audio, rtol=0, atol=0)
+        self.assertFalse(torch.equal(sunk["perturb-4"].video, base.video))
+
+    def test_step_one_cannot_be_cached(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import piflow_cache_steps
+
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_PIFLOW_CACHE_STEPS": "1,10"}):
+            with self.assertRaisesRegex(ValueError, "step 1"):
+                piflow_cache_steps()
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_PIFLOW_CACHE_STEPS": " 9, 10"}):
+            self.assertEqual(piflow_cache_steps(), frozenset({9, 10}))
 
 
 if __name__ == "__main__":

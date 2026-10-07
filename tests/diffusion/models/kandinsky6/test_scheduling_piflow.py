@@ -316,5 +316,56 @@ class PolicyRolloutTest(parameterized.TestCase):
         torch.testing.assert_close(got, torch.from_numpy(expected), rtol=1e-9, atol=1e-9)
 
 
+class CachedGridTest(absltest.TestCase):
+    """The x_0 grid a cached step uses in place of the DiT's."""
+
+    def _previous(self, x_0_grid: torch.Tensor):
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import DXPolicy
+
+        tokens = x_0_grid.shape[0]
+        # Raw segment [0.5, 0.6] at shift 1 (raw == shifted time).
+        return DXPolicy(
+            None,
+            torch.zeros(tokens, 3),
+            torch.full((tokens,), 0.6),
+            torch.full((tokens,), 0.1),
+            shift=1.0,
+            x_0_grid=x_0_grid,
+        )
+
+    def test_reuse_holds_the_last_prediction(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import cached_x_0_grid
+
+        grid = torch.randn(2, 5, 3)
+        out = cached_x_0_grid(self._previous(grid), torch.full((2, 1), 0.5), torch.full((2, 1), 0.4), "reuse")
+        self.assertEqual(tuple(out.shape), (2, 1, 3))
+        torch.testing.assert_close(out[:, 0], grid[:, 0])
+
+    def test_extrapolate_continues_a_linear_trajectory_exactly(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import cached_x_0_grid
+
+        # x_0(tau) = a + b * tau, sampled on the previous segment's grid
+        # (index 0 at tau 0.5, index 4 at tau 0.6).
+        a, b = torch.randn(2, 1, 3), torch.randn(2, 1, 3)
+        prev_taus = torch.linspace(0.5, 0.6, 5).reshape(1, 5, 1)
+        out = cached_x_0_grid(
+            self._previous(a + b * prev_taus), torch.full((2, 1), 0.5), torch.full((2, 1), 0.4), "extrapolate"
+        )
+        taus = torch.linspace(0.4, 0.5, 5).reshape(1, 5, 1)
+        torch.testing.assert_close(out, a + b * taus, rtol=1e-4, atol=1e-5)
+
+    def test_rejects_unknown_mode(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import cached_x_0_grid
+
+        with self.assertRaisesRegex(ValueError, "cache mode"):
+            cached_x_0_grid(self._previous(torch.randn(2, 5, 3)), torch.ones(2, 1), torch.ones(2, 1), "magic")
+
+    def test_policy_takes_exactly_one_source(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.scheduling_kandinsky6_piflow import DXPolicy
+
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            DXPolicy(None, torch.zeros(2, 3), torch.full((2,), 0.5))
+
+
 if __name__ == "__main__":
     absltest.main()
