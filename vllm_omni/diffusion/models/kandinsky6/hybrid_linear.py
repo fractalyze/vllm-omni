@@ -45,6 +45,26 @@ DEFAULT_EXCLUDE = r"modulation|time_embeddings"
 DEFAULT_MIN_ROWS = 2048
 
 
+# The 12 linears per visual block whose rows are the 50,220 video tokens at W1
+# (the others see audio, text or one vector). Their weights are streamed by DLO
+# every step, so with VLLM_OMNI_K6_HYBRID_STAGE_FP16=1 the offload hook stages
+# them as FP16 on its copy stream (see DLO's ``dlo_stage_weight_dtype``) instead
+# of hybrid_matmul casting them on the compute stream at each call: 1.6 s of
+# standalone cast kernels a request in the round-4 profile. Same rounding, once
+# per weight per step either way, so the output is unchanged.
+LARGE_M_LINEARS = (
+    r"^visual_transformer_blocks\.\d+\.("
+    r"video_dec_block\.(self_attention\.(to_query|to_key|to_value|out_layer)"
+    r"|cross_attention\.(to_query|out_layer)|feed_forward\.(in_layer|out_layer))"
+    r"|va_cross_attention\.(to_query|out_layer)"
+    r"|av_cross_attention\.(to_key|to_value))$"
+)
+
+
+def stage_fp16_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_K6_HYBRID_STAGE_FP16", "") not in ("", "0", "false", "False")
+
+
 def hybrid_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_K6_HYBRID_GEMM", "") not in ("", "0", "false", "False")
 
@@ -82,7 +102,8 @@ class HybridFp16LinearMethod(UnquantizedLinearMethod):
         self.min_rows = min_rows
 
     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        if x.numel() // x.shape[-1] < self.min_rows:
+        # A weight staged as FP16 cannot go to the BF16 path, so it stays hybrid whatever M is.
+        if x.numel() // x.shape[-1] < self.min_rows and layer.weight.dtype != torch.float16:
             return self.inner.apply(layer, x, bias)
         matmul = self._matmul or _kernel()
         return matmul(x, layer.weight, bias, out_dtype=x.dtype)
@@ -105,5 +126,7 @@ def install_hybrid(dit: nn.Module, exclude: str | None = None, matmul=None) -> t
             excluded += 1
             continue
         module.quant_method = HybridFp16LinearMethod(module.quant_method, matmul)
+        if stage_fp16_enabled() and re.search(LARGE_M_LINEARS, name):
+            module.dlo_stage_weight_dtype = torch.float16
         wrapped += 1
     return wrapped, excluded
