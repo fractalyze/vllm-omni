@@ -115,6 +115,20 @@ class KernelTest(absltest.TestCase):
         bias = torch.randn(256, device="cuda").to(torch.bfloat16)
         self._check(layer.quant_method.apply(layer, x, bias), x, layer, bias)
 
+    def test_no_fp16_copy_of_bf16_operands(self) -> None:
+        """The kernel converts in registers: peak memory is the inputs plus the output, no FP16 copy of x."""
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+
+        x = torch.randn(4096, 2048, device="cuda").to(torch.bfloat16)
+        w = (torch.randn(1024, 2048, device="cuda") * 0.05).to(torch.bfloat16)
+        hybrid_matmul(x, w, out_dtype=torch.bfloat16)
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        before = torch.accelerator.memory_allocated()
+        out = hybrid_matmul(x, w, out_dtype=torch.bfloat16)
+        torch.accelerator.synchronize()
+        self.assertLessEqual(torch.accelerator.max_memory_allocated() - before, out.numel() * out.element_size())
+
     def test_compiled_without_graph_break(self) -> None:
         layer = self._layer()
         x = torch.randn(2, 300, 512, device="cuda").to(torch.bfloat16)
