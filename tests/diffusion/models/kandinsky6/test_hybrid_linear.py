@@ -90,6 +90,38 @@ class InstallTest(absltest.TestCase):
         model.visual.va_modulation = type(model.visual.ff)()
         self.assertEqual(install_hybrid(model, exclude="", matmul=_fake_matmul), (3, 0))
 
+    def test_stage_fp16_flags_only_large_m_linears(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_linear import LARGE_M_LINEARS
+
+        model = torch.nn.Module()
+        model.visual_transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+        block = model.visual_transformer_blocks[0]
+        block.video_dec_block = torch.nn.Module()
+        block.video_dec_block.feed_forward = torch.nn.Module()
+        block.video_dec_block.feed_forward.in_layer = type(self._model().visual.ff)()
+        block.av_cross_attention = torch.nn.Module()
+        block.av_cross_attention.to_query = type(self._model().visual.ff)()
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_STAGE_FP16": "1"}):
+            install_hybrid(model, exclude="", matmul=_fake_matmul)
+        self.assertEqual(block.video_dec_block.feed_forward.in_layer.dlo_stage_weight_dtype, torch.float16)
+        self.assertFalse(hasattr(block.av_cross_attention.to_query, "dlo_stage_weight_dtype"))
+        self.assertRegex("visual_transformer_blocks.59.av_cross_attention.to_value", LARGE_M_LINEARS)
+
+    def test_stage_fp16_off_by_default(self) -> None:
+        model = self._model()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_OMNI_K6_HYBRID_STAGE_FP16", None)
+            install_hybrid(model, exclude="", matmul=_fake_matmul)
+        self.assertFalse(hasattr(model.visual.ff, "dlo_stage_weight_dtype"))
+
+    def test_fp16_weight_stays_hybrid_at_small_m(self) -> None:
+        layer = self._model().visual.ff
+        layer.weight = torch.nn.Parameter(layer.weight.half(), requires_grad=False)
+        inner, matmul = mock.Mock(), mock.Mock()
+        HybridFp16LinearMethod(inner, matmul, min_rows=2048).apply(layer, torch.zeros(1, 10, 16))
+        matmul.assert_called_once()
+        inner.apply.assert_not_called()
+
     def test_small_m_takes_the_original_method(self) -> None:
         layer = self._model().visual.ff
         inner = mock.Mock()

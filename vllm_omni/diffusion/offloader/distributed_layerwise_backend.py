@@ -279,6 +279,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
 
         self._cached_repoint: tuple[tuple[Any, ...], ...] = ()
+        self._stage_casts: tuple[tuple[torch.dtype, int, int, torch.dtype], ...] = ()
 
     # ------------------------------------------------------------------ #
     #  DTensor helpers (shared with LayerwiseOffloadHook)                 #
@@ -327,9 +328,16 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 m["numel"],
                 m["shape"],
                 m["stride"],
+                stage_dtype_for(self.next_block, m["name"], dtype) if self.dp_size <= 1 else None,
             )
             for dtype, metas in self.metadata.items()
             for m in metas
+        )
+        # In-place conversions to run on the copy stream after each H2D copy.
+        self._stage_casts = tuple(
+            (dtype, offset, numel, stage)
+            for _, dtype, offset, numel, _, _, stage in self._cached_repoint
+            if stage is not None
         )
 
         # Pre-compute AG output sizes (avoid sum() per layer).
@@ -603,6 +611,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         gpu_weights,
                         non_blocking=non_blocking,
                     )
+                    apply_stage_casts(gpu_weights, self._stage_casts)
                     evt.record(self.copy_stream)
             else:
                 ahead = self._staging_ahead if self.rank_local_mmap else None
@@ -616,6 +625,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         gw = gpu_weights[dtype]
                         async_copy = non_blocking and cpu_shard.is_pinned()
                         gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
+                    apply_stage_casts(gpu_weights, self._stage_casts)
                     evt.record(self.copy_stream)
                 if self.rank_local_mmap:
                     # The CPU slot may be overwritten only after this H2D copy has
@@ -664,11 +674,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._shared_slot_group[slot] = self._group_id
 
         # Re-point using cached metadata (avoids per-layer dict lookups).
-        for target, dtype, offset, numel, shape, stride in self._cached_repoint:
+        for target, dtype, offset, numel, shape, stride, stage in self._cached_repoint:
+            storage = gpu_weights[dtype][offset : offset + numel]
             set_tensor_storage(
                 target,
                 torch.as_strided(
-                    gpu_weights[dtype][offset : offset + numel],
+                    storage if stage is None else storage.view(stage),
                     size=shape,
                     stride=stride,
                 ),
@@ -796,6 +807,45 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 # ---------------------------------------------------------------------- #
 #  Module-level helpers                                                   #
 # ---------------------------------------------------------------------- #
+
+# A module may ask for its ``weight`` to be staged in another dtype of the same
+# width by setting this attribute (e.g. ``torch.float16`` on a BF16 checkpoint).
+# The hook converts the slice in place on its copy stream right after the H2D
+# copy and re-points the parameter through a view in that dtype, so the
+# conversion overlaps compute instead of running on the compute stream at every
+# call. The host copy keeps the checkpoint dtype; ``restore`` puts it back.
+# Single-rank only (with DP sharding the cast would have to follow the gather).
+STAGE_WEIGHT_DTYPE_ATTR = "dlo_stage_weight_dtype"
+
+
+def stage_dtype_for(block: nn.Module, name: str, dtype: torch.dtype) -> torch.dtype | None:
+    """The dtype ``block``'s tensor ``name`` should be staged in, or None to keep ``dtype``."""
+    owner_name, _, leaf = name.rpartition(".")
+    if leaf != "weight":
+        return None
+    try:
+        owner = block.get_submodule(owner_name) if owner_name else block
+    except AttributeError:
+        return None
+    stage = getattr(owner, STAGE_WEIGHT_DTYPE_ATTR, None)
+    if stage is None or stage == dtype:
+        return None
+    if not (dtype.is_floating_point and stage.is_floating_point) or dtype.itemsize != stage.itemsize:
+        raise ValueError(f"{name}: cannot stage {dtype} as {stage}; the in-place cast needs equal widths")
+    return stage
+
+
+def apply_stage_casts(
+    buffers: dict[torch.dtype, torch.Tensor], casts: tuple[tuple[torch.dtype, int, int, torch.dtype], ...]
+) -> None:
+    """Convert each ``(dtype, offset, numel, stage)`` slice of ``buffers`` to ``stage`` in place.
+
+    Elementwise, same width, same index: every element is read before it is
+    written, so the conversion needs no scratch buffer.
+    """
+    for dtype, offset, numel, stage in casts:
+        segment = buffers[dtype][offset : offset + numel]
+        segment.view(stage).copy_(segment)
 
 
 def apply_distributed_block_hook(
