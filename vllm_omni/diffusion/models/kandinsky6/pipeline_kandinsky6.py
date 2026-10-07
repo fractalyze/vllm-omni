@@ -46,7 +46,6 @@ from vllm_omni.diffusion.offloader.config import offload_enabled, offload_stream
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.platforms import current_omni_platform
 
 from .kandinsky6_transformer import (
     Kandinsky6Transformer3DModel,
@@ -359,12 +358,6 @@ def postprocess_video(
     frames = (frames / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)
     # Hunyuan VAE loads as fp16; DiT latents are bf16 — match weight dtype.
     vae_dtype = next(vae.parameters()).dtype
-    if os.environ.get("VLLM_OMNI_K6_VAE_FREE_CACHE", "0") == "1":
-        # The decode plans its tiling from free device memory (the allocator's
-        # cache does not count), and after the DiT has run that cache holds most
-        # of the board: the planner then picks small spatial tiles. Returning the
-        # cache first lets it see the memory the decode can actually use.
-        current_omni_platform.empty_cache()
     frames = vae.decode(frames.to(dtype=vae_dtype)).sample
 
     return ((frames.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)

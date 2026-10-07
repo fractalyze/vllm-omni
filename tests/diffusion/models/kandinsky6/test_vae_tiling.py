@@ -67,25 +67,3 @@ class TiledDecodeShapeTest(parameterized.TestCase):
 
 if __name__ == "__main__":
     parameterized.absltest.main()
-
-
-class FreeCacheBeforeDecodeTest(parameterized.TestCase):
-    """VLLM_OMNI_K6_VAE_FREE_CACHE=1 returns the allocator cache before the decode plans its tiling."""
-
-    @parameterized.named_parameters(("off", "0", 0), ("on", "1", 1))
-    def test_switch(self, flag: str, expected_calls: int) -> None:
-        import os
-        from types import SimpleNamespace
-        from unittest import mock
-
-        from vllm_omni.diffusion.models.kandinsky6 import pipeline_kandinsky6 as pipe
-
-        vae = AutoencoderKLHunyuanVideo.from_config(TINY_VAE_CONFIG).eval()
-        vae.use_framewise_decoding = False
-        bundle = SimpleNamespace(video=torch.randn(1, 4, 4, TINY_VAE_CONFIG["latent_channels"]))
-        with (
-            mock.patch.dict(os.environ, {"VLLM_OMNI_K6_VAE_FREE_CACHE": flag}),
-            mock.patch.object(pipe.current_omni_platform, "empty_cache") as empty_cache,
-        ):
-            pipe.postprocess_video(bundle, vae, bs=1)
-        self.assertEqual(empty_cache.call_count, expected_calls)
