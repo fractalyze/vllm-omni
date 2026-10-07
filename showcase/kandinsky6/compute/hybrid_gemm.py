@@ -116,6 +116,63 @@ def fp16_safety(t: torch.Tensor) -> dict:
             "subnormal_frac": sub}
 
 
+# --------------------------------------------------------------------------
+# The FP16 operand cache.
+# --------------------------------------------------------------------------
+#
+# The MMA needs FP16 operands and the model holds BF16, so a conversion has to
+# happen somewhere. Three places were measured on this GPU at W1's shapes:
+#
+#   operands pre-converted to FP16        d->d  5487 us   ff1  22935 us
+#   BF16 passed straight to the kernel          7372 us        30561 us
+#   BF16 + cast in the kernel's registers       5971 us        26977 us
+#   BF16 + one host conversion (this)           5902 us        23657 us
+#
+# **Casting in the kernel is 8-14% WORSE on the FFN shapes**, which is worth
+# writing down because it looks like the obvious fix. The grid re-reads each A
+# element `ceil(N / BLOCK_N)` times -- 128 times for ff1 -- so an in-register
+# cast performs the conversion 128 times where a single streaming pass over
+# global memory does it once. Converting once and reusing is right.
+#
+# What *is* waste is converting the same tensor repeatedly. A fused block feeds
+# one visual stream to six different projections (`to_query`, `to_key`,
+# `to_value`, the text cross query, the va-cross query, and the av-cross
+# key/value), so the identical 411 MB activation was converted six times a
+# block. This caches the last conversion.
+#
+# The key includes `_version`, which PyTorch bumps on any in-place write, so a
+# mutated tensor cannot be served a stale copy. One entry only: the copy is the
+# size of the activation (411 MB at W1) and this runs on a board with a few GiB
+# spare, so holding two would cost more than it saves.
+_FP16_CACHE: dict[str, object] = {"key": None, "value": None}
+
+# Below this many elements the conversion is cheap enough that the bookkeeping
+# and the retained memory are not worth it.
+_CACHE_MIN_ELEMENTS = 1 << 22
+
+
+def _as_fp16(t: torch.Tensor) -> torch.Tensor:
+    """``t`` in FP16, reusing the last conversion when it is the same tensor."""
+    if t.dtype == torch.float16:
+        return t
+    if t.numel() < _CACHE_MIN_ELEMENTS:
+        return t.to(torch.float16)
+    key = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t._version)
+    if _FP16_CACHE["key"] == key:
+        return _FP16_CACHE["value"]
+    value = t.to(torch.float16)
+    _FP16_CACHE["key"] = key
+    _FP16_CACHE["value"] = value
+    return value
+
+
+def clear_fp16_cache() -> None:
+    """Drop the retained FP16 copy. For tests and for freeing memory between
+    requests; correctness never depends on calling it."""
+    _FP16_CACHE["key"] = None
+    _FP16_CACHE["value"] = None
+
+
 def hybrid_matmul(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None,
                   *, config: dict | None = None, out_dtype: torch.dtype | None = None) -> torch.Tensor:
     """``x @ w.T (+ bias)`` through the hybrid kernel.
@@ -131,9 +188,13 @@ def hybrid_matmul(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = 
     if w.shape[1] != K:
         raise ValueError(f"weight {tuple(w.shape)} does not match input feature size {K}")
 
-    xh = x2 if x2.dtype == torch.float16 else x2.to(torch.float16)
+    xh = _as_fp16(x2)
     # The kernel reads B as (K, N); `w.t()` is a view, and a non-contiguous B is
-    # fine here because the strides are passed explicitly.
+    # fine here because the strides are passed explicitly. The weight is not
+    # cached here: under distributed layerwise offload a block's weights are
+    # re-staged every step, so a cache would never hit. Moving that conversion
+    # onto the DLO copy stream is the right fix and belongs in the offload
+    # backend, not here.
     wh = (w if w.dtype == torch.float16 else w.to(torch.float16)).t()
     want = out_dtype or x.dtype
     c = torch.empty((M, N), device=x.device,
