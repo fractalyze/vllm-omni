@@ -48,6 +48,8 @@ from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
+from .fp16_audit import Fp16Audit, audit_path
+from .hybrid_linear import hybrid_enabled, install_hybrid
 from .kandinsky6_transformer import (
     Kandinsky6Transformer3DModel,
     exact_attention_steps,
@@ -1484,6 +1486,14 @@ class Kandinsky6TI2VAPipeline(
             raise ValueError("Kandinsky6TI2VAPipeline requires transformer, vae, text_encoder, and scheduler.")
 
         self.transformer = transformer
+        self._fp16_audit = None
+        if audit_path():
+            self._fp16_audit = Fp16Audit()
+            hooked = self._fp16_audit.install(transformer)
+            logger.warning("Kandinsky 6: FP16 range audit on %d DiT linears -> %s", hooked, audit_path())
+        if hybrid_enabled():
+            hybrid, kept = install_hybrid(transformer)
+            logger.info("Kandinsky 6: %d DiT linears on the hybrid FP16-accumulate GEMM, %d excluded", hybrid, kept)
         if fp8_after_step():
             wrapped = install_step_fp8(transformer)
             logger.info(
@@ -2456,6 +2466,8 @@ class Kandinsky6TI2VAPipeline(
         if _PIFLOW_DEBUG and audio_out is not None:
             _log_tensor_stats("audio decoded", audio=torch.as_tensor(audio_out))
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        if getattr(self, "_fp16_audit", None) is not None:
+            self._fp16_audit.write(audit_path())
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
 
