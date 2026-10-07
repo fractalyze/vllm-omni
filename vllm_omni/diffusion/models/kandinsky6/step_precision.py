@@ -41,6 +41,8 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod, dequantize_int8_rows
+
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
 GEMM_FORMATS = ("fp8", "nvfp4")
@@ -99,11 +101,22 @@ class StepFp8LinearMethod(UnquantizedLinearMethod):
         self.inner = inner
         self.gemm_format = gemm_format
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        # The loader post-processes through whatever method the layer holds; an
+        # INT8 layer must still get its own post-processing, not the BF16 one.
+        self.inner.process_weights_after_loading(layer)
+
+    def _bf16_weight(self, layer: nn.Module, dtype: torch.dtype) -> torch.Tensor:
+        """The weight the wrapped method computes with, in ``dtype``."""
+        if isinstance(self.inner, Int8WeightOnlyLinearMethod):
+            return dequantize_int8_rows(layer.weight, layer.weight_scale, dtype)
+        return layer.weight
+
     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if not getattr(layer, "fp8_step", False):
             return self.inner.apply(layer, x, bias)
         if self.gemm_format == "nvfp4":
-            return nvfp4_linear(x, layer.weight, bias)
+            return nvfp4_linear(x, self._bf16_weight(layer, x.dtype), bias)
         weight_fp8, weight_scale = quantize_weight_per_tensor(layer.weight)
         x_2d = x.reshape(-1, x.shape[-1])
         x_fp8, x_scale = ops.scaled_fp8_quant(x_2d, None)
@@ -127,7 +140,12 @@ def install_step_fp8(dit: nn.Module, layers: str | None = None) -> int:
         method = getattr(module, "quant_method", None)
         if not isinstance(module, LinearBase) or not pattern.search(name):
             continue
-        if type(method) is not UnquantizedLinearMethod:
+        # NVFP4 re-quantizes whatever BF16 weight the layer computes with, so it
+        # also takes an INT8 weight-only checkpoint (weights half the bytes to stream).
+        wrappable = type(method) is UnquantizedLinearMethod or (
+            gemm_format == "nvfp4" and isinstance(method, Int8WeightOnlyLinearMethod)
+        )
+        if not wrappable:
             continue
         module.quant_method = StepFp8LinearMethod(method, gemm_format)
         module.fp8_step = False

@@ -196,5 +196,28 @@ class FormatTest(absltest.TestCase):
         torch.testing.assert_close(nvfp4_global_scale(torch.zeros(2, 2, dtype=torch.bfloat16)), torch.tensor([1.0]))
 
 
+class Int8WrapTest(absltest.TestCase):
+    """NVFP4 steps also take an INT8 weight-only layer: dequantized, then re-quantized."""
+
+    def test_post_processing_goes_to_the_wrapped_method(self) -> None:
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
+
+        inner = mock.create_autospec(Int8WeightOnlyLinearMethod, instance=True)
+        layer = SimpleNamespace()
+        StepFp8LinearMethod(inner, "nvfp4").process_weights_after_loading(layer)
+        inner.process_weights_after_loading.assert_called_once_with(layer)
+
+    def test_int8_layer_computes_with_its_dequantized_weight(self) -> None:
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod, dequantize_int8_rows
+
+        inner = mock.create_autospec(Int8WeightOnlyLinearMethod, instance=True)
+        layer = SimpleNamespace(
+            weight=torch.randint(-127, 128, (8, 16), dtype=torch.int8),
+            weight_scale=torch.rand(8, 1, dtype=torch.float32),
+        )
+        got = StepFp8LinearMethod(inner, "nvfp4")._bf16_weight(layer, torch.bfloat16)
+        torch.testing.assert_close(got, dequantize_int8_rows(layer.weight, layer.weight_scale, torch.bfloat16))
+
+
 if __name__ == "__main__":
     absltest.main()
