@@ -168,3 +168,40 @@ against base's 159.8 s, -7.3 s (-4.6%)**, with the preregistration's -12.7 s
 noted as not met and the reason given. Three timed runs with the Triton cache
 warm; a fourth was still running at the time of writing and will not move the
 median materially.
+
+---
+
+# Correction (16:26): the fourth run did move the median
+
+The follow-up above was written from three timed runs and said a fourth "will
+not move the median materially". **It did, and in both directions that matter.**
+All four large-M-gated runs: 153.9, 148.7, 152.4, 148.4 s.
+
+| | base (4 runs) | large-M gated (4 runs) | change |
+|---|---:|---:|---:|
+| request | 159.8 s | **150.6 s** | **-9.2 s (-5.8%)** |
+| GPU busy | 154.3 s | 144.1 s | **-10.3 s** |
+| GPU idle | 5.2 s | 6.5 s | **+1.3 s** |
+
+Against the three-run figures (-7.3 s request, +2.5 s idle), the request saving
+is **26% larger** and the idle leak **half the size**. Both of my three-run
+numbers were pessimistic, and the claim that a fourth run would not matter was
+simply wrong -- with n=3 on a host whose request times span 148-154 s, one
+sample moves a median by more than the effect being argued about.
+
+**The conclusions survive and two of them sharpen:**
+
+- **The arm is not bytes-bound.** Now clearer, not less: only **1.3 s of the
+  10.3 s** of recovered compute leaks into idle -- **13%, not 24%**. Bytes per
+  step converts roughly 1 s of the next 8 s of compute saved, which makes it a
+  third-order lever here rather than a second-order one.
+- **The small-M gate is worth more than I said:** -9.2 s against -5.1 s for
+  wrapping everything, so **gating is worth 4.1 s of request time**, not 2.2.
+- **The kernel still keeps only ~38% of its own benchmark** (10.3 s realised of
+  23-31 s predicted). Unchanged as the first-order problem, and still pointing
+  at per-call dispatch rather than at bytes.
+
+**For the final table: 150.6 s against base's 159.8 s, -9.2 s (-5.8%)**, four
+timed runs each, Triton cache warm. The preregistration asked for -12.7 s, so
+this is short of it but within shouting distance -- and the gap is dispatch, not
+the hypothesis the preregistration rested on.
