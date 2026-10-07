@@ -90,9 +90,21 @@ class InstallTest(absltest.TestCase):
         model.visual.va_modulation = type(model.visual.ff)()
         self.assertEqual(install_hybrid(model, exclude="", matmul=_fake_matmul), (3, 0))
 
+    def test_small_m_takes_the_original_method(self) -> None:
+        layer = self._model().visual.ff
+        inner = mock.Mock()
+        matmul = mock.Mock()
+        method = HybridFp16LinearMethod(inner, matmul, min_rows=2048)
+        method.apply(layer, torch.zeros(1, 2047, 16))
+        inner.apply.assert_called_once()
+        matmul.assert_not_called()
+        method.apply(layer, torch.zeros(2, 1024, 16))
+        matmul.assert_called_once()
+
     def test_apply_is_a_linear(self) -> None:
         model = self._model()
-        install_hybrid(model, exclude="", matmul=_fake_matmul)
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM_MIN_ROWS": "0"}):
+            install_hybrid(model, exclude="", matmul=_fake_matmul)
         layer = model.visual.ff
         x = torch.randn(3, 5, 16).to(torch.bfloat16)
         bias = torch.randn(8)
@@ -112,7 +124,7 @@ class KernelTest(absltest.TestCase):
         layer.weight = torch.nn.Parameter(
             (torch.randn(256, 512) * 0.05).to("cuda", torch.bfloat16), requires_grad=False
         )
-        layer.quant_method = HybridFp16LinearMethod(layer.quant_method)
+        layer.quant_method = HybridFp16LinearMethod(layer.quant_method, min_rows=0)
         return layer
 
     def _check(self, out, x, layer, bias) -> None:

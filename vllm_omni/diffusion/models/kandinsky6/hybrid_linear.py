@@ -37,6 +37,13 @@ from vllm_omni.platforms import current_omni_platform
 
 DEFAULT_EXCLUDE = r"modulation|time_embeddings"
 
+# Below this many rows cuBLAS wins: at W1's audio (M=218) and text (M=256) shapes
+# the hybrid is 1.7-2.7x slower, 1024 is where it stops losing and 2048 where it
+# reliably wins (Track C's crossover, showcase/kandinsky6/compute/hybrid_gemm.py).
+# Such calls take the layer's original method. M is static per compiled graph,
+# so this costs no runtime branch. VLLM_OMNI_K6_HYBRID_GEMM_MIN_ROWS overrides it.
+DEFAULT_MIN_ROWS = 2048
+
 
 def hybrid_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_K6_HYBRID_GEMM", "") not in ("", "0", "false", "False")
@@ -66,12 +73,17 @@ def _kernel():
 class HybridFp16LinearMethod(UnquantizedLinearMethod):
     """A BF16 linear whose GEMM runs through the hybrid FP16-accumulate kernel."""
 
-    def __init__(self, inner: UnquantizedLinearMethod, matmul=None) -> None:
+    def __init__(self, inner: UnquantizedLinearMethod, matmul=None, min_rows: int | None = None) -> None:
         super().__init__()
         self.inner = inner
         self._matmul = matmul
+        if min_rows is None:
+            min_rows = int(os.environ.get("VLLM_OMNI_K6_HYBRID_GEMM_MIN_ROWS", DEFAULT_MIN_ROWS))
+        self.min_rows = min_rows
 
     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if x.numel() // x.shape[-1] < self.min_rows:
+            return self.inner.apply(layer, x, bias)
         matmul = self._matmul or _kernel()
         return matmul(x, layer.weight, bias, out_dtype=x.dtype)
 
