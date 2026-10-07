@@ -108,3 +108,63 @@ predicts while idle stays flat.
 numbers were a compile artefact that looked like a performance result, so for the
 final table please quote hybrid numbers only from a server whose Triton cache was
 already warm, and say which.
+
+---
+
+# Follow-up (16:25): the small-M gate nearly doubles the saving, and *then* a little idle appears
+
+The experiment promised above. Same harness, Triton cache warm,
+`VLLM_OMNI_K6_HYBRID_GEMM_EXCLUDE` set so that **exactly the 12 large-M linears
+a fused block issues stay on the kernel** and the 20 small-M ones go back to
+cuBLAS. Validated against the module names `gemm_insitu.py` recorded before
+running: 12/12 kept, 0/20 leaked. The server confirms it:
+
+```
+Kandinsky 6: 728 DiT linears on the hybrid FP16-accumulate GEMM, 1262 excluded
+```
+
+| arm | request | GPU busy | GPU idle |
+|---|---:|---:|---:|
+| base | 159.8 s | 154.3 s | 5.2 s |
+| hybrid, all 1736 linears | 154.6 s | 149.4 s | 5.2 s |
+| **hybrid, 728 large-M only** | **152.4 s** | **143.5 s** | **7.8 s** |
+
+| arm | request | busy | idle |
+|---|---:|---:|---:|
+| hybrid, all | **-5.1 s** | -4.9 s | **+0.0 s** |
+| **hybrid, large-M only** | **-7.3 s** | **-10.8 s** | **+2.5 s** |
+
+**Gating on M is worth 2.2 s of request time and 5.9 s of GPU busy time on its
+own** -- the small-M linears were not merely failing to help, they were giving
+back a fifth of the win. That is the gate `hybrid_linear` already implements and
+that the serving `apply()` bypasses; **one `EXCLUDE` string captures it with no
+code change.**
+
+**And now the bytes question gets a real, if smaller, yes.** With the small-M
+regression out of the way, **10.8 s of compute comes out and only 7.3 s of it
+reaches the request: 2.5 s, about 24%, leaks into GPU idle.** So the stream does
+begin to bind once enough compute is removed -- it simply was not binding at the
+first operating point I measured, where the small-M regression was masking the
+saving.
+
+**The honest summary of the three readings:**
+
+1. **The arm is not bytes-bound today.** Even at its best it runs 94% GPU-busy,
+   and 5-8 s of idle in a 152 s request is not where 20 s is hiding.
+2. **Roughly a quarter of any further compute saving will leak into idle.** So
+   bytes per step is a real lever but a second-order one: it converts about 1 s
+   of the next 4 s of compute saved.
+3. **The first-order problem is still that the kernel keeps only ~40% of its own
+   benchmark** (10.8 s realised of 23-31 s predicted) even with the right layers
+   wrapped. That is not bytes and not the small-M regression; the remaining
+   suspect is per-call dispatch -- 728 wrapped linears is still **~7,300 Triton
+   launches a request**, each preceded by Python-level reshape, transpose,
+   allocation and grid arithmetic. Timing `hybrid_matmul` against `F.linear` with
+   the GEMM time subtracted out would settle it, and the fix would be one launch
+   per block or a CUDA-graph capture rather than one per linear.
+
+**Recommended for the final table:** the large-M-gated hybrid at **152.4 s
+against base's 159.8 s, -7.3 s (-4.6%)**, with the preregistration's -12.7 s
+noted as not met and the reason given. Three timed runs with the Triton cache
+warm; a fourth was still running at the time of writing and will not move the
+median materially.
