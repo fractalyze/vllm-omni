@@ -90,6 +90,38 @@ class InstallTest(absltest.TestCase):
         model.visual.va_modulation = type(model.visual.ff)()
         self.assertEqual(install_hybrid(model, exclude="", matmul=_fake_matmul), (3, 0))
 
+    def test_stage_fp16_flags_only_large_m_linears(self) -> None:
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_linear import LARGE_M_LINEARS
+
+        model = torch.nn.Module()
+        model.visual_transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+        block = model.visual_transformer_blocks[0]
+        block.video_dec_block = torch.nn.Module()
+        block.video_dec_block.feed_forward = torch.nn.Module()
+        block.video_dec_block.feed_forward.in_layer = type(self._model().visual.ff)()
+        block.av_cross_attention = torch.nn.Module()
+        block.av_cross_attention.to_query = type(self._model().visual.ff)()
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_STAGE_FP16": "1"}):
+            install_hybrid(model, exclude="", matmul=_fake_matmul)
+        self.assertEqual(block.video_dec_block.feed_forward.in_layer.dlo_stage_weight_dtype, torch.float16)
+        self.assertFalse(hasattr(block.av_cross_attention.to_query, "dlo_stage_weight_dtype"))
+        self.assertRegex("visual_transformer_blocks.59.av_cross_attention.to_value", LARGE_M_LINEARS)
+
+    def test_stage_fp16_off_by_default(self) -> None:
+        model = self._model()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_OMNI_K6_HYBRID_STAGE_FP16", None)
+            install_hybrid(model, exclude="", matmul=_fake_matmul)
+        self.assertFalse(hasattr(model.visual.ff, "dlo_stage_weight_dtype"))
+
+    def test_fp16_weight_stays_hybrid_at_small_m(self) -> None:
+        layer = self._model().visual.ff
+        layer.weight = torch.nn.Parameter(layer.weight.half(), requires_grad=False)
+        inner, matmul = mock.Mock(), mock.Mock()
+        HybridFp16LinearMethod(inner, matmul, min_rows=2048).apply(layer, torch.zeros(1, 10, 16))
+        matmul.assert_called_once()
+        inner.apply.assert_not_called()
+
     def test_small_m_takes_the_original_method(self) -> None:
         layer = self._model().visual.ff
         inner = mock.Mock()
@@ -139,6 +171,29 @@ class KernelTest(absltest.TestCase):
         bias = torch.randn(256, device="cuda").to(torch.bfloat16)
         self._check(layer.quant_method.apply(layer, x, bias), x, layer, bias)
 
+    def test_compiled_producer_writes_the_fp16_input_once_per_call(self) -> None:
+        """Bias-free calls must not get a second FP16 copy of x for the unused Bias pointer."""
+        import re
+
+        from torch._inductor.utils import run_and_get_code
+
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+
+        x = torch.randn(256, 512, device="cuda").to(torch.bfloat16)
+        w = (torch.randn(256, 512, device="cuda") * 0.05).to(torch.bfloat16)
+
+        def project(t):
+            return hybrid_matmul(torch.relu(t), w, out_dtype=torch.bfloat16)
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            _, codes = run_and_get_code(torch.compile(project, fullgraph=True), x)
+        # Kernel bodies only (each ends at its closing triple quote); the ReLU producer is the one with `maximum`.
+        bodies = [k.split("'''")[0] for k in re.split(r"\ndef ", "\n".join(codes))[1:]]
+        producer = [k for k in bodies if "triton_helpers.maximum" in k]
+        self.assertLen(producer, 1)
+        self.assertEqual(len(re.findall(r"tl\.store", producer[0])), 1)
+
     def test_compiled_without_graph_break(self) -> None:
         layer = self._layer()
         x = torch.randn(2, 300, 512, device="cuda").to(torch.bfloat16)
@@ -149,3 +204,66 @@ class KernelTest(absltest.TestCase):
 
 if __name__ == "__main__":
     absltest.main()
+
+
+class HybridUnderDynamicCompileTest(absltest.TestCase):
+    """`hybrid_matmul` must survive `torch.compile(dynamic=True)`.
+
+    This exists because a change that passed every eager test broke the served
+    arm on its first request. The model runner compiles the DiT regionally with
+    `dynamic=True`, so inside `hybrid_matmul` the input's `numel()` and `shape`
+    are SymInts. A Python-level operand cache keyed on them raised
+    `InternalTorchDynamoError: 'SymNodeVariable' object has no attribute
+    'value'` -- and no eager test could see it.
+
+    Anything added to this function has to be traceable, so this test compiles
+    it the way the runner does.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not torch.cuda.is_available():
+            raise absltest.SkipTest("needs a GPU")
+
+    def test_compiles_with_dynamic_shapes_and_matches_eager(self):
+        import torch._dynamo
+
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+
+        torch._dynamo.reset()
+        compiled = torch.compile(hybrid_matmul, dynamic=True, fullgraph=False)
+        torch.manual_seed(0)
+        w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+        b = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+        # Two different M, so dynamic shapes are actually exercised rather than
+        # specialised away on the first trace.
+        for m in (2048, 4096):
+            x = torch.randn(1, m, 512, device="cuda", dtype=torch.bfloat16)
+            got = compiled(x, w, b, out_dtype=x.dtype)
+            want = hybrid_matmul(x, w, b, out_dtype=x.dtype)
+            self.assertEqual(got.shape, want.shape)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_the_wrapped_linear_method_compiles(self):
+        """The real call path: a LinearBase whose quant_method is the hybrid,
+        compiled dynamically."""
+        import torch._dynamo
+
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_linear import HybridFp16LinearMethod
+
+        torch._dynamo.reset()
+        method = HybridFp16LinearMethod(inner=None, matmul=hybrid_matmul)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.02, requires_grad=False
+        )
+
+        def call(x):
+            return method.apply(layer, x, None)
+
+        compiled = torch.compile(call, dynamic=True, fullgraph=False)
+        for m in (2048, 4096):
+            x = torch.randn(1, m, 512, device="cuda", dtype=torch.bfloat16)
+            torch.testing.assert_close(compiled(x), call(x), rtol=0, atol=0)

@@ -333,6 +333,15 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # The H5 lossy fast mode's attention: SageAttention3 on the visual
+        # self-attention, same two audio roles on SDPA. Judged by G3 and contact
+        # sheets only and never presented as passing G1, so it is listed here
+        # for coverage rather than as a gate candidate.
+        "h5-sage3.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN_3",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
         # The same roles, with Sage's accuracy knobs on: FP16 PV with FP32
         # accumulation and per-thread INT8 granularity.
         "sage2-accurate.json": {
