@@ -438,6 +438,155 @@ python compute/block_profile.py --config pro --geometry w1 --target fused \
   --compile default --json /tmp/block.json
 ```
 
+## Round 3 / L3: the unexplained GEMM gap was a census that missed three GEMMs
+
+The Round 2 section above reports a gap between the census of W1's GEMMs and the
+profiled GEMM bucket, attributes 48% of it to the bias, and leaves ~0.85 s/step
+"unresolved". **There was nothing unresolved.** The census was incomplete, twice.
+
+`compute/gemm_insitu.py` registers a pre-hook on every parallel linear in one
+fused block at W1 and records the operand metadata a cuBLAS kernel choice can
+depend on: shape, stride, contiguity, dtype, leading-dimension byte alignment,
+pointer alignment, and whether the input is a view.
+
+**The operands are clean.** Of the 12 large-M calls, **zero** have a
+non-contiguous input, a leading dimension that is not 16-byte aligned, or a
+non-BF16 dtype. Nothing falls back to a narrower load, so the obvious hypothesis
+for a kernel running below its benchmark is eliminated outright.
+
+**What it found instead is that the block issues 12 large-M GEMMs where the
+census listed 7.** Enumerating `named_modules()` rather than reading the forward
+turned up three more full 50220x4096x4096 projections:
+
+| missed | why |
+|---|---|
+| `va_cross_attention.out_layer` | every cross-attention has an output projection on its *query* side |
+| `video_dec_block.cross_attention.to_query` | the decoder block runs a **text** cross-attention, not counted at all |
+| `video_dec_block.cross_attention.out_layer` | same |
+
+| census revision | total | apparent gap vs the 8.630 s/step bucket |
+|---|---:|---:|
+| 7 GEMMs | 6.512 s/step | 2.12 s/step |
+| 8 GEMMs | 6.979 s/step | 1.65 s/step |
+| **12, from the module tree** | **7.981 + 0.939 bias = 8.920** | **none; census over by 3.4%** |
+
+Over-shooting by 3.4% is the direction a sum of isolated microbenchmarks should
+err: in situ, consecutive GEMMs pipeline and reach L2 warm from the previous
+kernel, while the census times each one alone against a cold cache.
+
+**So K1 is closed.** The GEMMs run at 98-99% of a measured peak, the bias was a
+real 0.80 s/step and is fixed, and the bucket contains nothing else.
+
+### The lesson, which cost two wrong numbers before it was learned
+
+**A census that misses a GEMM inflates exactly the quantity it was built to
+measure -- and inflates it in the direction that looks like a discovery.** A
+phantom 2.1 s/step in a bucket whose kernels are at 98% of peak reads as a deep
+finding about the hardware; it was a reading error in a Python list.
+
+`compute/test_gemm_census.py` therefore asserts the row list against the block's
+own module tree rather than against any number, and separately that each row's
+`bias` flag matches the block -- the bias is worth ~21% of a large GEMM here, so
+a wrong flag is a wrong number and not a cosmetic slip. Writing that test found
+one more row to add (`text_cross.kv`) and corrected an error in the test itself:
+a cross-attention's key/value side reads the *other* stream, so the text
+cross-attention's `to_key`/`to_value` run at M=256, not M=50,220. The measured
+list of 12 large-M calls is what settled it.
+
+## Round 3 / L7: the exact band is not redundant, even with an exact first step
+
+Round 1 found two levers that both protect the start of the trajectory: twelve
+exact attention blocks at each end of the stack, and one exact sampler step. The
+second beat the first at half the cost. The obvious question is whether they buy
+the same thing -- if so, the band is now ~12 s a request of pure cost.
+
+Three band points, step 1 exact in all three, `sage2-edge0.json` identical to
+`sage2-mid.json` except the `layers` key is removed so only the band changes.
+First the three-prompt screen, against the same-host compiled reference:
+
+| exact edge blocks | screen mean | screen max | warm request |
+|---:|---:|---:|---:|
+| 12 (`sage2-mid`, shipped) | 0.2255 | 0.3780 | 182.3 s |
+| 6 (`sage2-wide`) | 0.2564 | 0.4294 | 167.6 s |
+| 0 (`sage2-edge0`) | 0.2338 | 0.3786 | 163.7 s |
+
+**The screen cannot order the band: 6 exact blocks scores worse than 0 on both
+axes**, which cannot be a property of a monotone dial. All three lie inside the
+measurement's resolution, as in the band curve above. What is outside it is
+speed, and on the screen alone `edge0` looked free -- same max as 12 blocks,
+18.6 s faster.
+
+Then the full set A, against the same reference the shipped arm's primary verdict
+used:
+
+| arm | exact edge blocks | set mean | set max | over the 0.25 max | request |
+|---|---:|---:|---:|---:|---:|
+| **`sage2-mid` + exact1 (shipped)** | 12 | **0.1117** | **0.3446** | **1** (a3) | 182.3 s |
+| `sage2-edge0` + exact1 | 0 | 0.1402 | 0.3877 | **4** (a2, a3, a8, a9) | **162.1 s** |
+
+**The band is not redundant.** Dropping it is 11.1% faster and costs 26% of the
+set mean, but the number that decides is the count: prompts over the user's 0.25
+max go from **one to four**. a2, a8 and a9 all cross a limit they were inside.
+
+**A set mean would have called this free.** 0.1402 is still under the user's 0.15
+mean limit, so an arm judged on its mean looks like an 11% win; the per-prompt max
+says otherwise. That is the same lesson as a3's framing shift arriving from the
+other direction -- **the mean and the max fail for different reasons, and an arm
+needs both reported.**
+
+`sage2-edge0` is kept as a Pareto point: it is the fastest arm measured in this
+study that still passes G2 (0.97x mean, 0.90x max) and G3 (-0.16%). It is not the
+headline, because the user asked for the fastest method that passes *their* gate,
+and 4-of-9 over the max is further from that than 1-of-9.
+
+**And it is the fourth time in this study that a screen disagreed with its own
+full set.** On this model and metric, differences below roughly 0.03 of set mean
+are not resolvable from one sample per prompt, and every dial measured here has
+been inside that. Screens choose what to run next; they cannot decide a gate.
+
+## Round 3 / W2: Kandinsky 6 Pro-5s at 50 steps and CFG 5.0 on one 5090
+
+W2 is the non-distilled **Pro-5s** checkpoint: 864x480, **125 frames, 50 steps,
+CFG 5.0**, audio on. It runs through vLLM-Omni on this board with **no code
+change** -- `Kandinsky6TI2VAPipeline` and `visual_token_type_num_embeddings` are
+already in the port, and the W1 placement (distributed layerwise offload with
+rank-local mmap, BF16 streamed from NVMe) carries over unchanged.
+`serve/serve_pro5s_bf16.sh`.
+
+| | request | per step | peak board |
+|---|---:|---:|---:|
+| **this 5090, BF16 streamed, platform attention** | **2587.4 s** | **51.75 s** | 26.6 GB |
+| upstream recipe, 1x H100 80 GB, FA3, CPU offload | 751.7 s | 14.4 s | — |
+| ratio | **3.44x** | **3.59x** | |
+
+**The 3.44x is placement, not compute.** The H100 has 80 GB and holds the 60.3 GB
+DiT resident; this board has 32 GB and streams all of it every step. Comparing
+like attention to like on this host decomposes it exactly:
+
+| | per step | |
+|---|---:|---|
+| W1, platform attention | 23.18 s | 10 steps, guidance 1.0, 50,220 tokens |
+| W2, platform attention | 51.75 s | 50 steps, CFG 5.0, 51,840 tokens |
+| ratio | **2.23x** | of which **CFG 5.0 is 2.00x** (two forwards a step) |
+
+That leaves **1.12x for +3.2% more tokens**, so nothing about W2's per-step cost
+is anomalous: it is steps times forwards, plus a little sequence length.
+
+### The two W2 levers, measured rather than guessed
+
+**The checkpoint is mixed dtype.** 18.9 GB of its 69.7 GB on disk is FP32 (1267
+tensors, 4.73B of 30.1B parameters); all-BF16 would be 60.3 GB, the same as the
+distill's DiT. On an arm whose step is dominated by streaming weights, that is
+**15% more bytes a step than necessary**, and it is a loader change rather than a
+kernel one -- the cheapest W2 win available.
+
+**CFG 5.0 is exactly 2.00x of the per-step cost.** Batching the conditional and
+unconditional passes into one forward would halve the *weight* traffic a step,
+because both passes read the same weights. On a stream-bound arm that is close to
+a 2x on the dominant term, and it is the single largest W2 lever.
+
+Neither is attempted here; both are stated because they are measured.
+
 ## The block schedule: speed is linear in the band, quality is not resolvable by a screen
 
 `AttentionSpec.layers` turns "which attention kernel" into "which blocks get the
