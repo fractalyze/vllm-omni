@@ -119,6 +119,24 @@ vllm serve cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit --omni --port 8091 \
   audio of every later request while the text stays the same, so two arms
   compare byte for byte only when they load the same compiled talker.
 
+## Deterministic Marlin MoE
+
+vLLM's Marlin MoE always gives the same bits across identical requests on
+this branch, so `control_marlin.yaml`'s thinker repeats its text. Upstream,
+`moe_align_block_size` orders each expert's rows with atomics, and Marlin's
+split-K sums follow that order (vLLM issue 52525). The branch carries vLLM
+PR 48032's deterministic alignment kernels
+(`vllm_omni/model_executor/layers/marlin_moe_align/`) as a patch of
+`marlin_moe.moe_align_block_size`, since it pins upstream `vllm==0.30.0`.
+
+- The kernels replace vLLM's alignment rather than adding to it: in one
+  session, the Marlin deploy's TTFT (16 ms) and TTFA (39 ms) medians were
+  the same with and without them. The earlier fix, a sort after the
+  alignment, cost about 5 ms of TTFT.
+- They are built with the venv's CUDA toolkit on the first Marlin MoE
+  alignment. The kernel arm runs its thinker on triton, so it never builds
+  them.
+
 ## Serving switches
 
 These switches shorten the path from a request to its first audio around
@@ -127,7 +145,6 @@ call sites it names). Each is off unless set to `1`.
 
 | Switch | Effect |
 | --- | --- |
-| `VLLM_OMNI_DETERMINISTIC_MARLIN` | vLLM's Marlin MoE gives the same bits across identical requests: each expert's rows are sorted by row before a prefill's grouped GEMM (`vllm_omni/patch.py`) |
 | `VLLM_OMNI_CODE2WAV_STREAM_GRAPHS` | code2wav captures CUDA graphs only at the frame counts a streaming decode uses |
 | `VLLM_OMNI_CODE2WAV_COMPILE` | code2wav decodes a one-frame first chunk on `torch.compile` |
 | `VLLM_OMNI_FRAME0` | The talker's first audio frame ships with its prefill step, one step sooner |
@@ -139,11 +156,6 @@ call sites it names). Each is off unless set to `1`.
 | `VLLM_OMNI_TALKER_PREPREFILL` | With `VLLM_OMNI_EARLY_CHUNK`, the talker prefills all but its last prompt position while the thinker prefills |
 | `VLLM_OMNI_QWEN3_OMNI_RUN_DIR` | The directory a server's stages and API share for `VLLM_OMNI_FRAME0_AUDIO` and `VLLM_OMNI_THINKER_YIELD`; unset is one per user under the system temp directory, so servers sharing a host need one each |
 
-- `VLLM_OMNI_DETERMINISTIC_MARLIN` serves `control_marlin.yaml`'s Marlin
-  thinker; with the kernels the thinker runs on triton and the sort is
-  idle. The sort adds a few kernels to each prefill layer; decode steps skip
-  it. The fix belongs in vLLM: the branch pins upstream `vllm==0.30.0`, so it
-  is carried as a patch of `marlin_moe.moe_align_block_size`.
 - Prompts with audio, image or video keep the stock path under
   `VLLM_OMNI_EARLY_CHUNK`, `VLLM_OMNI_TALKER_PREP` and
   `VLLM_OMNI_TALKER_PREPREFILL`.
@@ -168,7 +180,6 @@ VLLM_OMNI_THINKER_MEGAKERNEL=1 VLLM_OMNI_THINKER_MEGAKERNEL_CTAS=64 \
 VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL=1 VLLM_OMNI_THINKER_MEGAKERNEL_PREFILL_CTAS=128 \
 VLLM_OMNI_TALKER_MEGAKERNEL=1 \
 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL=1 VLLM_OMNI_CODE_PREDICTOR_MEGAKERNEL_CTAS=96 \
-VLLM_OMNI_DETERMINISTIC_MARLIN=1 \
 VLLM_OMNI_CODE2WAV_STREAM_GRAPHS=1 VLLM_OMNI_CODE2WAV_COMPILE=1 \
 VLLM_OMNI_FRAME0=1 VLLM_OMNI_EARLY_CHUNK=1 VLLM_OMNI_FRAME0_AUDIO=1 \
 VLLM_OMNI_TALKER_PREP=1 VLLM_OMNI_FAST_POLL=1 \
