@@ -359,3 +359,98 @@ class HybridRoutingTest(absltest.TestCase):
         w = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16) * 0.02
         ok, why = should_use_hybrid(x, w)
         self.assertTrue(ok, f"a W1 visual projection should take the hybrid, got: {why}")
+
+
+class Fp16OperandCacheTest(absltest.TestCase):
+    """The FP16 operand cache. Correctness first: a stale copy is a wrong answer.
+
+    A fused block feeds one visual stream to six projections, so the same 411 MB
+    activation was being converted to FP16 six times. The cache collapses that
+    (-1.1 s a request). It keys on `_version`, which PyTorch bumps on any
+    in-place write, because serving an activation that has since been mutated
+    would be silently wrong rather than slow.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not _cuda():
+            raise absltest.SkipTest("needs a GPU")
+
+    def setUp(self):
+        super().setUp()
+        from hybrid_gemm import clear_fp16_cache
+
+        clear_fp16_cache()
+        self.addCleanup(clear_fp16_cache)
+
+    def test_the_same_tensor_is_converted_once(self):
+        from hybrid_gemm import _as_fp16, _CACHE_MIN_ELEMENTS
+
+        t = torch.randn(_CACHE_MIN_ELEMENTS, device="cuda", dtype=torch.bfloat16)
+        a = _as_fp16(t)
+        b = _as_fp16(t)
+        self.assertIs(a, b, "the second call should reuse the first conversion")
+        self.assertEqual(a.dtype, torch.float16)
+
+    def test_an_in_place_write_invalidates_the_copy(self):
+        """The failure this exists for: a cached FP16 copy served after the
+        source has been overwritten would be a wrong answer, not a slow one."""
+        from hybrid_gemm import _as_fp16, _CACHE_MIN_ELEMENTS
+
+        t = torch.zeros(_CACHE_MIN_ELEMENTS, device="cuda", dtype=torch.bfloat16)
+        first = _as_fp16(t)
+        self.assertEqual(first[0].item(), 0.0)
+        t.fill_(3.0)  # bumps t._version
+        second = _as_fp16(t)
+        self.assertIsNot(second, first, "a mutated tensor must not get the cached copy")
+        self.assertEqual(second[0].item(), 3.0)
+
+    def test_a_different_tensor_is_not_served_the_cached_copy(self):
+        from hybrid_gemm import _as_fp16, _CACHE_MIN_ELEMENTS
+
+        a = torch.full((_CACHE_MIN_ELEMENTS,), 1.0, device="cuda", dtype=torch.bfloat16)
+        b = torch.full((_CACHE_MIN_ELEMENTS,), 2.0, device="cuda", dtype=torch.bfloat16)
+        _as_fp16(a)
+        got = _as_fp16(b)
+        self.assertEqual(got[0].item(), 2.0)
+
+    def test_small_tensors_are_not_cached(self):
+        """Below the threshold the conversion is cheap and retaining a copy
+        costs more than it saves, so those must not take a cache slot and
+        evict a large one."""
+        from hybrid_gemm import _as_fp16, _CACHE_MIN_ELEMENTS
+
+        big = torch.randn(_CACHE_MIN_ELEMENTS, device="cuda", dtype=torch.bfloat16)
+        cached = _as_fp16(big)
+        small = torch.randn(16, device="cuda", dtype=torch.bfloat16)
+        s1 = _as_fp16(small)
+        s2 = _as_fp16(small)
+        self.assertIsNot(s1, s2, "small tensors should not be cached")
+        self.assertIs(_as_fp16(big), cached, "a small tensor must not evict the big one")
+
+    def test_an_fp16_input_is_passed_through_untouched(self):
+        from hybrid_gemm import _as_fp16
+
+        t = torch.randn(1024, device="cuda", dtype=torch.float16)
+        self.assertIs(_as_fp16(t), t)
+
+    def test_the_cache_does_not_change_results(self):
+        """The whole point: a faster path that returns something else is not a
+        faster path."""
+        from hybrid_gemm import clear_fp16_cache, hybrid_matmul
+
+        torch.manual_seed(0)
+        x = torch.randn(4096, 1024, device="cuda", dtype=torch.bfloat16)
+        w1 = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16) * 0.02
+        w2 = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16) * 0.02
+
+        clear_fp16_cache()
+        cold1 = hybrid_matmul(x, w1)
+        clear_fp16_cache()
+        cold2 = hybrid_matmul(x, w2)
+        clear_fp16_cache()
+        warm1 = hybrid_matmul(x, w1)   # fills the cache
+        warm2 = hybrid_matmul(x, w2)   # hits it
+        torch.testing.assert_close(warm1, cold1, rtol=0, atol=0)
+        torch.testing.assert_close(warm2, cold2, rtol=0, atol=0)

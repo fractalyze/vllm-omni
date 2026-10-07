@@ -201,6 +201,61 @@ class KernelTest(absltest.TestCase):
         compiled = torch.compile(lambda t: layer.quant_method.apply(layer, t, bias) * 2, fullgraph=True)
         self._check(compiled(x) / 2, x, layer, bias)
 
+    def test_compiled_above_the_fp16_cache_threshold(self) -> None:
+        """The served blocks are compiled: the FP16 operand cache must not break the graph at full size."""
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_gemm
+
+        x = torch.randn(hybrid_gemm._CACHE_MIN_ELEMENTS // 512 + 8, 512, device="cuda").to(torch.bfloat16)
+        ws = [(torch.randn(256, 512, device="cuda") * 0.05).to(torch.bfloat16) for _ in range(3)]
+        torch._dynamo.reset()
+        with torch.no_grad():
+            compiled = torch.compile(
+                lambda t: [hybrid_gemm.hybrid_matmul(t, w, out_dtype=torch.bfloat16) for w in ws], fullgraph=True
+            )
+            for out, w in zip(compiled(x), ws):
+                reference = torch.nn.functional.linear(x.double(), w.double())
+                self.assertLess(float((out.double() - reference).norm() / reference.norm()), 5e-3)
+
 
 if __name__ == "__main__":
     absltest.main()
+
+
+class ReleaseClearsTheOperandCacheTest(absltest.TestCase):
+    """`release_hybrid_scratch` must drop the FP16 operand cache, not just call
+    `empty_cache()`.
+
+    The cache keeps a live reference to the last FP16 activation -- 411 MB at W1
+    -- and a live block cannot be returned to the device. Leaving it would mean
+    the VAE decoder still plans its tiles from a reduced free-memory figure,
+    which is the "different pixels and a slower decode" this function exists to
+    prevent. Tested without a GPU: it is a bookkeeping contract, not a kernel.
+    """
+
+    def test_release_drops_the_cached_copy(self):
+        import os
+
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_gemm, hybrid_linear
+
+        hybrid_gemm._FP16_CACHE["key"] = ("sentinel",)
+        hybrid_gemm._FP16_CACHE["value"] = object()
+        self.addCleanup(hybrid_gemm.clear_fp16_cache)
+
+        with (
+            absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "1"}),
+            absltest.mock.patch.object(hybrid_linear, "current_omni_platform") as plat,
+        ):
+            plat.is_available.return_value = True
+            self.assertTrue(hybrid_linear.release_hybrid_scratch())
+            plat.empty_cache.assert_called_once()
+
+        self.assertIsNone(hybrid_gemm._FP16_CACHE["key"], "release_hybrid_scratch must clear the operand cache")
+        self.assertIsNone(hybrid_gemm._FP16_CACHE["value"])
+
+    def test_release_is_a_no_op_with_the_switch_off(self):
+        import os
+
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_linear
+
+        with absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "0"}):
+            self.assertFalse(hybrid_linear.release_hybrid_scratch())

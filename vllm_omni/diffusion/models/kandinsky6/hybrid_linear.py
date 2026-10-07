@@ -80,6 +80,13 @@ def release_hybrid_scratch() -> bool:
     """
     if not hybrid_enabled() or not current_omni_platform.is_available():
         return False
+    # The operand cache holds a LIVE reference to the last FP16 activation (411
+    # MB at W1), and `empty_cache()` cannot return a live block to the device.
+    # Without dropping it first, this function would leave exactly the shortfall
+    # it exists to remove and the decoder would still pick smaller tiles.
+    from .hybrid_gemm import clear_fp16_cache
+
+    clear_fp16_cache()
     current_omni_platform.empty_cache()
     return True
 
