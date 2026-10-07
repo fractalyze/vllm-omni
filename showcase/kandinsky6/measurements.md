@@ -293,6 +293,151 @@ the video decode. Its tiling plan is chosen per call from free GPU memory
 (previous section), so two processes in different memory states decode the same
 latents differently. Every G1 number above carries that ~0.02.
 
+## Round 2 / K1: the BF16 GEMMs are at the hardware, and the bias was the lever
+
+Round 2 is kernel rewrites only -- no caching and no further attention
+approximation. K1 was "the BF16 GEMMs, 54% of denoise, running on CUTLASS
+`s16816gemm`", which on a Blackwell part reads like an obvious rewrite target:
+`s16816gemm` is Ampere's `mma.sync.m16n8k16`. It is not a target, and the reason
+it is not took one benchmark.
+
+### There is no kernel win: the GEMMs run at 98-99% of peak
+
+`compute/gemm_census.py` enumerates every GEMM one fused block issues at W1 from
+the checkpoint's own `transformer/config.json`, times each at its real shape, and
+divides by a BF16 peak measured on the same GPU **while it is busy**:
+
+| gemm | M | K | N | TFLOP/s | % of peak | s/step |
+|---|---:|---:|---:|---:|---:|---:|
+| `visual.ff1` | 50220 | 4096 | 16384 | 217.5 | **98%** | 1.860 |
+| `visual.ff2` | 50220 | 16384 | 4096 | 219.6 | **99%** | 1.842 |
+| `visual.qkv` | 50220 | 4096 | 12288 | 217.6 | **98%** | 1.394 |
+| `visual.attn_out` | 50220 | 4096 | 4096 | 216.8 | **98%** | 0.466 |
+| `cross.q_from_visual` | 50220 | 4096 | 4096 | 216.7 | **98%** | 0.467 |
+| `cross.kv_from_visual` | 50220 | 4096 | 4096 | 216.9 | **98%** | 0.466 |
+| `cross.out_from_visual` | 50220 | 4096 | 4096 | 216.7 | **98%** | 0.467 |
+| the audio branch (M=218), 7 GEMMs | | | | 85-133 | 38-60% | 0.018 |
+| the text tower (M=256), 2 GEMMs | | | | 169-175 | 76-79% | 0.002 |
+| **total** | | | | | | **6.979** |
+
+`cross.out_from_visual` is a correction. The first version of this census listed
+the two cross-attentions' query and key/value projections and **missed their
+output projections**: each `Kandinsky6Attention` has an `out_layer` on the side
+its query came from, so `va_cross_attention.out_layer` is another full-size
+4096 -> 4096 GEMM at M=50,220. Omitting it understated the census by 0.47
+s/step, which made the unexplained remainder below look a third larger than it
+is. **A census that silently misses a GEMM inflates exactly the gap it was built
+to measure**, which is the failure mode to watch for in this kind of tool.
+
+Peak is **221.4 TFLOP/s at 2617 MHz and 575 W**. Measuring it correctly matters
+more than it sounds: the first version of this tool sampled clocks *after*
+`torch.cuda.synchronize()`, read an idle board (1087 MHz, 18.76 W) and reported
+230 TFLOP/s -- a peak that made every kernel look further from the machine than
+it was. `board_under_load()` samples while the benchmark is running.
+
+**Two findings worth more than the 1-2% left in the kernel.** First, cuBLASLt is
+**18.9% slower** than the default path for BF16 on these shapes (7.974 against
+6.466 s/step), the opposite of the FP8 result on this GPU where a sibling track
+measured cuBLASLt 1.42-1.50x faster. That gap is a *capability* difference --
+cuBLASLt emits block-scaled QMMA paths CUTLASS does not -- and BF16 has no
+equivalent, so nothing remains but tile selection, where the default heuristics
+win. **A library advantage resting on a capability does not transfer to a format
+that lacks it.** Second, distance from peak is only interesting weighted by
+share: the audio branch runs at 38-60% of peak and is 0.017 s of 6.512.
+
+### What was left was the gap between the bucket and the GEMMs
+
+Compiled, the profile's GEMM bucket is **143.83 ms a block = 8.63 s/step** where
+the census of those same GEMMs totals **6.98 s/step**. A **1.65 s/step** gap, on
+a step whose kernels are at 98% of the machine. Of it, the bias below accounts
+for a measured **0.80 s/step -- 48%**; the remaining ~0.85 s/step is unresolved
+and is not claimed here. Three explanations were eliminated by measurement, and
+they are listed because each is the obvious guess:
+
+- **Profiler misattribution** -- the bucket being named after the biggest kernel
+  in a region. No: 130.34 of its 130.45 ms are genuine
+  `cutlass_80_tensorop_bf16_s16816gemm` kernels, with every elementwise, norm and
+  copy kernel in its own category.
+- **Operand layout** -- the model's `nn.Linear` issues `x @ W.t()` (TN) where the
+  census issued `x @ B` (NN). Within **±0.3%**; not a lever.
+- **Cold weights** -- the census reuses one weight per shape, so a 33 MB
+  `attn_out` weight could sit in L2 across iterations where the served block
+  streams a cold one. Rotating six weight buffers costs **0.017 s/step**.
+
+### The lever: cuBLAS dispatches a worse kernel when a bias is present
+
+`nn.Linear` with a bias is `addmm`, and on sm_120 that is not the same kernel:
+
+| form | `50220x4096x12288` | `50220x4096x4096` |
+|---|---:|---:|
+| `F.linear(x, W)` | 23057 us | 7759 us |
+| `F.linear(x, W, bias)` -- what the port issued | **+21.8%** | **+21.3%** |
+| `F.linear(x, W).add_(bias)` -- same arithmetic, own kernel | **+7.5%** | **+7.2%** |
+
+A bias is N values against an M*N output and cannot cost 21% of a GEMM. **The
+third row is what makes this conclusive**: the identical arithmetic as a separate
+elementwise kernel costs a third as much, so the remaining 14% has nowhere to
+live but kernel selection.
+
+Only large M pays. The same model's audio projections (M=218) and text
+projections (M=256) come in at +0.1% to +0.8%, and two are *faster* with the
+bias -- the penalty scales with the output the worse tile has to cover.
+
+### Unfusing it: -8.03 s a request, and under compile the add is free
+
+The four projections in `Kandinsky6Attention` are now `skip_bias_add=True`, with
+`_add_bias` applying the bias the layer hands back. ABBA on one fused block
+(patched, baseline, baseline, patched; baseline taken from the parent commit), no
+foreign GPU process in any run, under 0.7 ms spread within each arm:
+
+| | bias in the GEMM | bias unfused | change |
+|---|---:|---:|---:|
+| GEMM bucket | 143.83 ms | 130.44 ms | **-9.3%** |
+| elementwise | 3.125 ms | 3.128 ms | **free** |
+| norm | 3.404 ms | 3.375 ms | -0.9% |
+| block total | 337.30 ms | 323.92 ms | **-3.97%** |
+
+Over 60 visual blocks and 10 sampler steps, **-8.03 s of a 182.6 s request**,
+against a preregistered -4.0 s.
+
+**The compiled saving is larger than the eager one, which is the part worth
+keeping.** Run eager, unfusing moves 0.287 s/step into new elementwise kernels
+against 0.790 s/step saved -- a 2.8:1 trade. Run compiled, the elementwise side
+does not move at all, because Inductor folds the bias add into a Triton epilogue
+already streaming that tensor. So the rule is narrower than either piece of
+standard advice: **unfuse a library epilogue when the library's fused form costs
+a worse tile and a fusing compiler has an adjacent kernel to absorb the work.**
+
+### Two things this says about the compiler
+
+**Inductor never touches these matmuls.** Compiled and eager issue the identical
+`s16816gemm` kernels at identical tiles (73.08 / 28.40 / 28.09 ms a block) -- it
+fuses only around them. A GEMM-level problem here is therefore not fixable by
+compiling, which is why the bias had to be a model change, and `torch.compile`
+being on is not evidence the matmul path has been examined.
+
+**The other half of K1 was already spent before Round 2 started.** The brief asks
+for the epilogues on the critical path -- `gate * out + residual`, the GELU on
+FF1, the modulation -- to be fused into the GEMM. The default compile already
+does it: the fp32 AdaLN/RoPE/gate chain the port applies to the whole residual
+stream is **66.8 ms a block of elementwise + copy + norm eager, and 7.2 ms
+compiled**. At 50,220 x 4096 one fp32 upcast is an 823 MB tensor and
+`apply_rotary`'s broadcast intermediate is 1.65 GB, and eager fuses none of them;
+Inductor fuses all of them. There is no second win there.
+
+### Reproduce
+
+```bash
+cd showcase/kandinsky6
+# The census and the measured peak. --backends default,cublaslt for the race.
+python compute/gemm_census.py --backends default --json /tmp/census.json
+# What stands between a matmul benchmark and a matmul in the model.
+python compute/gemm_operands.py --json /tmp/operands.json
+# The ABBA. Compiled is the served path; eager understates the win.
+python compute/block_profile.py --config pro --geometry w1 --target fused \
+  --compile default --json /tmp/block.json
+```
+
 ## The block schedule: speed is linear in the band, quality is not resolvable by a screen
 
 `AttentionSpec.layers` turns "which attention kernel" into "which blocks get the
