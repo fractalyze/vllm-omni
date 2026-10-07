@@ -94,3 +94,63 @@ fusion question, not a CSE and not a model change, and it is worth about
   kernel definitions matching `to_copy`.
 - (4): `nsys stats --report cuda_gpu_trace` on a served request's trace, grouped
   by kernel name and `GrdX`.
+
+---
+
+# Follow-up (21:07): neither standalone cast can be removed by an exact change
+
+Timeboxed attempt on the ~2.4 s named above. **Both producers identified; neither
+can emit FP16, and the permute copy is structurally required.** No change
+shipped.
+
+## `to_copy_t_view_0` — 2.898 ms a block (~1.57 s a request)
+
+Two call sites, two different inputs, and neither has a producer Inductor could
+fuse a cast into:
+
+| input | what it is | can the producer emit FP16? |
+|---|---|---|
+| `arg6_1` | a **graph input** — the block's incoming hidden states, BF16 from outside the compiled region | **No.** There is no producer in the graph. Casting in the caller moves the same work outside the region. |
+| `buf15 = buf14[0]`, `(1, 32, s23, 128)`, carrying an `aten::_scaled_dot_product_*` alignment assert | the **extern attention kernel's output** | **No.** cuDNN / SageAttention fix their output dtype, and Inductor cannot fuse into an extern call. |
+
+## `to_copy_permute_t_view_4` — 1.622 ms a block (~0.88 s a request)
+
+This one casts **and** permutes, because the attention output is `(1, H, S, D)`
+and `out_layer` consumes `(S, H*D)`. The suggestion was to hand the kernel the
+permuted view instead and let its strided loads absorb the layout. **It cannot,
+for a structural reason:**
+
+```
+permuted view contiguous: False
+reshape to (M, K) without a copy: not possible
+```
+
+After `permute(0, 2, 1, 3)` the H and D axes are **not adjacent in memory**, so
+there is no pair of strides `(sam, sak)` that describes `(M, H*D)` — and
+`_hybrid_mm` takes exactly two strides for A. The copy is not an oversight; it is
+what makes the operand addressable by a 2-D-strided kernel.
+
+Measured at W1's self-attention shape (M=50,220, H=32, D=128, N=4096):
+
+| | time |
+|---|---:|
+| permute + copy + flatten alone | 575 us |
+| the GEMM on the contiguous copy | 5523 us |
+| both together | 5707 us |
+
+So the copy is ~10% on top of that GEMM, and it buys addressability.
+
+## What would actually remove it, and why I did not do it
+
+A **3-D-A variant of the kernel**: take `(M, H, D)` with three strides and
+reconstruct `k = h*D + d` inside the loop. The loads would plausibly coalesce
+well — D=128 BF16 is 256 contiguous bytes — so this is not obviously a loss. But
+it is a **new kernel**, not an exact change, and it is bounded by the 0.88 s a
+request that this one cast costs. Against a remaining budget of half an hour and
+having broken the arm once today by shipping a serving-path change on a
+plausible theory (#65), the trade is not worth it.
+
+**Recommendation: close this lever.** The ~2.4 s is real but 1.57 s of it has no
+fusable producer at all, and the other 0.88 s needs a new kernel variant. If
+someone does want it, the 3-D-A kernel is the only route and it should be
+microbenched against `575 us + 5523 us` before any integration.
