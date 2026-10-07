@@ -40,7 +40,18 @@ host, same process, same Inductor cache, all 9 set-A prompts.
 | the pipeline's own run-to-run floor (fresh compiled process) | 0.0272 | 0.0636 |
 
 Reusing step 8 moves the output 0.39x / 0.41x as far as simply re-running the uncached arm in a
-new process does. B inherits A's gate standing: G2 and G3 on both sets as reported for the headline
+new process does.
+
+**Screen on set B, not in the mirrored session** (12:02-12:24, informational): B + FP8 GEMMs from
+step 3, so steps 1-2 are exact BF16 (`VLLM_OMNI_K6_FP8_GEMM_AFTER_STEP=2`). One server on bs2, every
+GPU lock held, all 9 set-B prompts.
+
+| | W1 request (gate run) | set B vs eager (G2) | set B vs compiled (G1) | CLIP ratio |
+|---|---:|---|---|---:|
+| B + FP8 GEMMs from step 3 | 135.5-138.4 s steady (b1 187.3 s with compile) | 0.1408 / 0.348: **passes** (limits 0.1809 / 0.4245) | 0.1423 / 0.359: mean inside 0.15, worst frame fails | 0.997 |
+
+The walls come from a gate run, not a session. Set A was not run, so this arm is **not gated**. It is
+the first thing to measure next: set A, then a mirrored session against B. B inherits A's gate standing: G2 and G3 on both sets as reported for the headline
 arm, and G1 failing on the worst frame. B was not re-gated end to end on both sets; its quality
 claim rests on this same-process delta.
 
