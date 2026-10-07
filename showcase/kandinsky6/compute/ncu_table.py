@@ -21,6 +21,7 @@ import sys
 
 NCU = "/usr/local/cuda/bin/ncu"
 SOL = "GPU Speed Of Light Throughput"
+SOL_KEYS = {"Compute (SM) Throughput": "sm", "Memory Throughput": "mem", "DRAM Throughput": "dram"}
 STALL = re.compile(r"^smsp__average_warps_issue_stalled_(.+)_per_issue_active\.ratio$")
 
 
@@ -40,8 +41,8 @@ def kernels(rep: str) -> list[dict]:
         sec, metric, unit, value = r["Section Name"], r["Metric Name"], r["Metric Unit"], r["Metric Value"]
         if sec == SOL and metric == "Duration":
             k["us"] = _num(value) * {"ns": 1e-3, "us": 1.0, "ms": 1e3}[unit]
-        elif sec == SOL and metric in ("Compute (SM) Throughput", "Memory Throughput", "DRAM Throughput"):
-            k[{"Compute (SM) Throughput": "sm", "Memory Throughput": "mem", "DRAM Throughput": "dram"}[metric]] = _num(value)
+        elif sec == SOL and metric in SOL_KEYS:
+            k[SOL_KEYS[metric]] = _num(value)
         elif metric == "Achieved Occupancy":
             k["occ"] = _num(value)
         elif metric in ("Grid Size", "Block Size"):
@@ -81,7 +82,8 @@ def main() -> None:
         for k in kernels(rep):
             stalls = ", ".join(f"{n} {v:.1f}" for n, v in k.get("stalls", []))
             cells = [f"{k.get(c, float('nan')):.1f}" for c in ("us", "sm", "mem", "dram", "tensor", "occ")]
-            print(f"| {short(k['name'])} | {' | '.join(cells)} | {k.get('Grid Size', '')} x {k.get('Block Size', '')} | {stalls} |")
+            launch = f"{k.get('Grid Size', '')} x {k.get('Block Size', '')}"
+            print(f"| {short(k['name'])} | {' | '.join(cells)} | {launch} | {stalls} |")
 
 
 if __name__ == "__main__":

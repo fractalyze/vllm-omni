@@ -69,7 +69,7 @@ def main() -> None:
         for _, unit in units:
             for _ in range(3):
                 unit()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         if args.time:
             for name, unit in units:
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -77,13 +77,13 @@ def main() -> None:
                 for _ in range(10):
                     unit()
                 end.record()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 print(f"{name}: {start.elapsed_time(end) / 10:.3f} ms per unit", flush=True)
             return
         torch.cuda.profiler.start()
         for _, unit in units:
             unit()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.cuda.profiler.stop()
 
 
