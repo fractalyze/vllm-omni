@@ -9,6 +9,121 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Round 5 / R1: where H1's lost gain went (Track M, build-server-2)
+
+**Question.** The hybrid GEMM wins 1.12-1.28x per call against the served
+bias-free cuBLAS GEMM, worth about -13 s a request, but H1 measured -6.7 s on
+bs2. The brief's suspects, in order: per-call dispatch, an unfused bias
+epilogue, unfused FP16 casts. Base = round-4 head (`arms/h1-hybrid.json`: final
+stack + H1 with the 2048-row gate).
+
+### Measured first: one nsys-profiled a1 request in the served worker
+
+bs2, all locks, round-4 head.
+
+| | final stack (round 4) | round-4 head (H1) |
+|---|---:|---:|
+| GEMM kernels (large M) | ~72 s cuBLAS | 61.65 s `_hybrid_mm` (6,498 calls) |
+| non-GEMM kernels | 11.66 s | **16.35 s (+4.7 s)** |
+| GPU idle | 10.4 s | 11.0 s |
+
+- **Dispatch is not the loss.** `hybrid_matmul`'s launch takes 2.8 µs a call
+  (0.02 s a request). The host runs a median ~360 ms ahead of the GPU. The GPU
+  gap before hybrid kernels sums to 0.00 s. CUDA graphs or a custom op have
+  nothing to recover here. (Track C, bs3, separately: 22 µs of host time per
+  call, also hidden behind execution.)
+- **The bias epilogue is not a lever.** The kernel already fuses bias and output
+  cast (Track C, #65). The projections that run bias-free since #38 get their
+  bias add fused by Inductor into the next kernel (+0.40 / -0.39 s).
+- **The loss is FP16 cast traffic on the compute stream (+4.7 s).**
+  - A standalone activation cast: 924 calls, 1.44 s. 540 of them are the q/k/v
+    input after the layer norm, 384 the `out_layer` input after Sage.
+  - Norm and GELU producers that now also write FP16 copies: about +2-3 s.
+  - Per-call weight casts: about 0.2 s.
+- **In situ the kernel itself runs about the microbench time including the
+  casts**: 4096² 6253 µs, ff1 26647 µs, 4096→2048 3282 µs. That is 4-8% over
+  its kernel-only microbench.
+
+### k6m-16: weight casts onto the DLO copy stream (falsified)
+
+PR #64 lets a module ask DLO to stage its streamed weight in a dtype of the same
+width. The hook converts it in place on its copy stream right after the H2D
+copy. `VLLM_OMNI_K6_HYBRID_STAGE_FP16=1` asks for this on the 720 large-M
+linears. Output identical (decoded video and audio). ABBA bs2 19:27-20:02, A B B
+A, n=4 per arm, valid:
+
+| arm | W1 request (median, min-max) |
+|---|---:|
+| round-4 head | 154.63 s (152.82-156.46) |
+| + weight staging (`arms/h1-stage16.json`) | 154.59 s (153.87-155.23) |
+
+**-0.02%, null.** The prediction (-1%) rested on a misattribution: the
+1.6 s "weight cast" bucket was mostly the activation cast above. Inductor's own
+weight casts were ~0.2 s. The switch stays available (opt-in, off).
+
+### k6m-17: the unused bias pointer cost a full activation copy
+
+Reading Inductor's code for a layer norm feeding three bias-free hybrid calls:
+the producer **stored the FP16 activation six times**. That is two per call:
+one for A and one for the Bias argument. Without a bias, `hybrid_matmul` passed
+the activation itself as the (never-read) Bias pointer, and Inductor gave that
+argument its own buffer. With a one-element placeholder, three stores (PR #66).
+It is not mutation analysis, which reports only C as written; registering the
+kernel as a `triton_op` changes nothing. In serving, 8 of 12 large-M linears
+per block are bias-free (`skip_bias_add`), so this removes about 4,320 extra
+411 MB writes a request.
+
+ABBA bs2 20:12-20:46, showcase 794693892, A B B A, n=4 per arm, valid. The
+control is the same code with the activation passed as the pointer again
+(`VLLM_OMNI_K6_HYBRID_LEGACY_BIAS_PTR=1`, an A/B-only switch since removed):
+
+| arm | W1 request (median, min-max) |
+|---|---:|
+| round-4 behaviour (activation as the bias pointer) | 152.70 s (152.08-153.30) |
+| **placeholder (PR #66, now the default)** | **151.05 s (150.64-151.60)** |
+
+**-1.08% (-1.65 s).** The ranges are disjoint and the delta is outside the
+control's 0.8% spread. Preregistered at -0.7%, so k6m-17 holds. The decoded
+video and audio are identical across both arms and all four timed requests: an
+exact change.
+
+**Quality: set A against the same-code compiled reference.** The BF16 reference
+was rechecked on the current code: a1 decodes identically to `ref-head/setA`'s,
+same VAE plan. The current head is gated H1 plus the placeholder. The
+placeholder alone is exact, so this is also the round-4 head's score, which
+round 4 had measured only for the all-linears configuration. Seed 42, 9
+prompts, bs2 20:51-21:15:
+
+| arm | vs same-code compiled reference: mean / worst frame |
+|---|---|
+| final stack (no H1), round 4 | 0.1128 / 0.3675 |
+| H1 all linears, round 4 | 0.1126 / 0.4597 |
+| **H1 gated + placeholder (current head)** | **0.1114 / 0.3492** (a9) |
+
+Per prompt: a1 .023, a2 .067, a3 .164, a4 .108, a5 .032, a6 .077, a7 .169,
+a8 .172, a9 .190. The mean is inside 0.15. The worst frame is over 0.25, the
+same standing as every arm since round 3. The request walls in this run
+(150.6-151.8 s after the first) match the ABBA.
+
+**Where H1 stands.** Final stack 160.5 s, then H1 at 153.8 s (round 4), then
+151.05 s now (bs2): **-5.9% against the final stack** with unchanged G1. The
+rest of the gap to the per-call prediction is FP16 activation traffic that
+the FP16 operands require. On these numbers it is about 3 s, and only a
+model-level change could remove it (the residual stream or norms emitting FP16).
+
+### Not pursued, with the reason
+
+- **Converting A in the kernel's registers**: microbench no better than the host
+  cast at 4096² (6374 vs 6428 µs) and worse on ff1 (27346 vs 26039 µs). The grid
+  re-reads each A element once per N tile, so the conversion repeats up to 128
+  times (Track C measured the same: 8-14% worse on the FFN shapes).
+- **One FP16 conversion shared by q/k/v**: Inductor still stores the converted
+  input once per call, even with the cast outside the op. Track C's eager cache
+  (#65) keyed on `data_ptr()`, which graph-broke every large hybrid call inside
+  the compiled blocks (`fullgraph=True` fails). Reverted from the serving path
+  in #67. A compile-visible dedup would need the model to cast once before the
+  three projections. That is about 0.8 s at most (540 casts × ~1 ms × 2 of 3).
+
 ## Round 4 / H1: hybrid FP16-accumulate GEMMs on the final stack
 
 **Question.** On sm_120 an FP16 MMA that accumulates in FP16 runs at about 1.5x
