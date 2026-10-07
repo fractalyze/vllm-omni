@@ -7,6 +7,14 @@ Benchmarking against cuBLAS-on-FP16 would flatter the kernel: FP16 and BF16 move
 the same bytes and issue the same MMA shape, but quoting the wrong one makes a
 library-versus-library difference look like the kernel's doing.
 
+**The baseline is re-timed next to every config, not once per shape.** The first
+version of this tool timed it once at the start and then swept ~100 configs, so
+the baseline ran on a cool GPU and the arm on a hot one. Both are pinned at this
+card's 575 W cap, which makes clock the free variable -- cuBLAS measured at 2152
+MHz against the hybrid at 2077 -- and that gradient alone understated the
+speedup by 10-20% (ff1 read 1.32x where interleaved timing gives 1.56x). A ratio
+has to be measured as a ratio.
+
 Only the large-M visual shapes are tuned. At W1 the audio branch runs 218 rows
 and the text tower 256, together 0.02 s of a 7.98 s/step census, and a Triton
 kernel's launch and tail behaviour at M=218 is not where this lever lives --
@@ -56,6 +64,32 @@ def _median(run, warmup: int = 3, iters: int = 10) -> float:
     return statistics.median(s)
 
 
+def _interleaved(arm, base, *, warmup: int = 2, rounds: int = 6) -> tuple[float, float]:
+    """Median seconds for `arm` and `base`, timed alternately in one loop.
+
+    Alternating is the whole point: on a power-capped card the clock a kernel
+    gets depends on what ran just before it, so timing one arm to completion and
+    then the other measures the thermal gradient as much as the kernels.
+    """
+    import torch
+
+    for _ in range(warmup):
+        arm()
+        base()
+    torch.cuda.synchronize()
+    a_s: list[float] = []
+    b_s: list[float] = []
+    for _ in range(rounds):
+        for store, fn in ((a_s, arm), (b_s, base)):
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            fn()
+            e1.record()
+            torch.cuda.synchronize()
+            store.append(e0.elapsed_time(e1) / 1e3)
+    return statistics.median(a_s), statistics.median(b_s)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", type=Path, default=None)
@@ -85,9 +119,8 @@ def main() -> int:
             flop = 2 * M * K * N
             xb = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
             wb = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02)
-            # The served baseline: cuBLAS, BF16 operands, no bias (PR #38).
-            base = _median(lambda: torch.nn.functional.linear(xb, wb))
-            base_tf = flop / base / 1e12
+            def cublas():
+                return torch.nn.functional.linear(xb, wb)
 
             xh = xb.to(torch.float16)
             wh = wb.to(torch.float16).t()
@@ -95,9 +128,9 @@ def main() -> int:
             bias = torch.randn(N, device="cuda", dtype=torch.float32)
 
             print(f"\n=== {label}  M={M} K={K} N={N}")
-            print(f"    cuBLAS BF16 baseline: {base*1e6:9.0f} us  {base_tf:7.1f} TF")
 
             rows, best = [], None
+            base_samples = []
             for BM, BN, BK, w, st in itertools.product(bm_s, bn_s, bk_s, warp_s, stage_s):
                 def run(BM=BM, BN=BN, BK=BK, w=w, st=st):
                     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
@@ -108,14 +141,18 @@ def main() -> int:
                                      HAS_BIAS=True, OUT_FP16=False,
                                      num_warps=w, num_stages=st)
                 try:
-                    t = _median(run)
+                    # Interleaved: this config and the baseline, alternating, so
+                    # both see the same clock and thermal state.
+                    t, tb = _interleaved(run, cublas)
                 except Exception as exc:  # noqa: BLE001 - OOM on shared memory is expected and common
                     rows.append({"BM": BM, "BN": BN, "BK": BK, "warps": w, "stages": st,
                                  "skipped": type(exc).__name__})
                     continue
+                base_samples.append(tb)
                 tf = flop / t / 1e12
                 row = {"BM": BM, "BN": BN, "BK": BK, "warps": w, "stages": st,
-                       "seconds": t, "tflops": tf, "speedup_vs_cublas_bf16": base / t}
+                       "seconds": t, "tflops": tf, "cublas_seconds": tb,
+                       "speedup_vs_cublas_bf16": tb / t}
                 rows.append(row)
                 if best is None or tf > best["tflops"]:
                     best = row
@@ -127,8 +164,13 @@ def main() -> int:
                       f"{r['seconds']*1e6:9.0f} us  {r['tflops']:7.1f} TF  "
                       f"{r['speedup_vs_cublas_bf16']:.2f}x vs cuBLAS BF16")
             print(f"    ({len(rows) - len(viable)} of {len(rows)} configs did not fit)")
+            base = statistics.median(base_samples) if base_samples else float("nan")
+            print(f"    cuBLAS BF16, median of {len(base_samples)} interleaved samples: "
+                  f"{base*1e6:9.0f} us  {flop / base / 1e12:7.1f} TF")
             report["shapes"].append({"label": label, "K": K, "N": N,
-                                     "cublas_bf16_seconds": base, "cublas_bf16_tflops": base_tf,
+                                     "cublas_bf16_seconds": base,
+                                     "cublas_bf16_tflops": flop / base / 1e12,
+                                     "cublas_samples": len(base_samples),
                                      "best": best, "rows": rows})
 
         print("\n=== per-shape best, against the served cuBLAS BF16 path ===")
