@@ -250,7 +250,8 @@ class ParallelLinearInitTest(absltest.TestCase):
 
         module = self._tiny_attention()
         randomize_parallel_linears(module)
-        out = module.to_query(torch.randn(1024, 64))
+        # `to_query` is `skip_bias_add=True`, so it returns (output, bias).
+        out = module._add_bias(module.to_query(torch.randn(1024, 64)))
         self.assertAlmostEqual(float(out.square().mean().sqrt()), 1.0, delta=0.15)
 
     def test_finding_nothing_is_reported_as_zero(self):
