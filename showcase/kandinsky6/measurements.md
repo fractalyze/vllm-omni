@@ -588,6 +588,48 @@ every step. Comparing like attention to like on this host decomposes it exactly:
 That leaves **1.12x for +3.2% more tokens**, so nothing about W2's per-step cost
 is anomalous: it is steps times forwards, plus a little sequence length.
 
+### Quality at W2: the approximation transfers, on one prompt
+
+An attention approximation validated at 10 PiFlow steps has not been shown to
+behave the same at 50 Euler steps with CFG 5.0 -- the schedule is where the
+step-sensitivity mechanism lives, and the first exact step is 1/50 of this one
+rather than 1/10. Both W2 MP4s existed, so this cost no GPU time.
+
+| W2, a1-portrait-speech, arm vs platform attention | | user's gate |
+|---|---:|---|
+| LPIPS mean | **0.0543** | <= 0.15 |
+| LPIPS max | **0.0920** | <= 0.25 |
+| PSNR / SSIM | 31.3 dB / 0.909 | — |
+
+Inside the gate on both axes -- **and that figure means nothing on its own**,
+because a1 is the easiest prompt in set A for every arm measured here. The
+control is the same arm on the same prompt at W1, scored the same way against a
+same-session reference:
+
+| workload | LPIPS mean | max | PSNR | SSIM |
+|---|---:|---:|---:|---:|
+| W1 (10 steps, guidance 1.0) | 0.0489 | 0.0976 | 29.0 dB | 0.875 |
+| W2 (50 steps, CFG 5.0) | 0.0543 | 0.0920 | 31.3 dB | 0.909 |
+
+**Unchanged within one sample**: the mean is 11% higher, the max slightly
+*lower*, and PSNR and SSIM both better. So fifty Euler steps with CFG 5.0 do not
+amplify what SageAttention2 on blocks 6-53 plus one exact step does to this
+model.
+
+**This is a screen and not a gate, and the distinction has teeth here.** The
+prompts where this arm fails the user's max at W1 -- a3 at 0.2047, a8 at 0.2504,
+a9 at 0.1815 -- have not been run at W2, and at 2587 s a request the nine-prompt
+set is a 6.5-hour proposition. Four screens in this study have already disagreed
+with their own full set, so the claim is "a1 transfers" and nothing wider.
+
+**And one number that should not be buried:** the audio SI-SDR between the two
+W2 runs is **-16.2 dB** (log-mel L1 0.4953), a large waveform difference. That is
+expected in kind -- a different attention kernel makes the model generate a
+*different* audio sample rather than a degraded one, and the same is true at W1
+where the video gate passed -- but **no gate in this study has ever scored audio
+against a threshold**, so there is no basis here for calling it fine. It needs a
+listen.
+
 ### The two W2 levers, measured rather than guessed
 
 **The checkpoint is mixed dtype.** 18.9 GB of its 69.7 GB on disk is FP32 (1267
