@@ -400,6 +400,92 @@ not an ABBA.
 
 The obvious next step, k=2 (two exact GEMM steps, about -16%), was not measured. Its driver failed
 to start, and the freeze came first. It is the first thing to run after this round.
+## Round 3 / L2: skip the DiT on sampler step 8 and reuse step 7's x_0 (Track S)
+
+Track S, build-server (bs1), 2026-10-07. W1, seed 42. Switch:
+`VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8` (PR #41). A cached pi-Flow step does not call the DiT. It reuses the previous
+step's policy: `reuse` holds that policy's last x_0 prediction (its grid point at this segment's start) constant
+across the segment. A skipped step therefore costs neither the DiT compute nor its 56 GiB BF16 weight stream.
+
+**Result: on set A, caching step 8 moves the headline arm by LPIPS 0.0106 mean / 0.0259 worst frame. That is
+0.39x / 0.41x of the pipeline's own run-to-run floor (0.0272 / 0.0636), and it removes one of the ten DiT calls.**
+On bs1 a DiT call is 16.6-17.3 s (median 16.77 s over 13 requests), so a skipped step saves about 17 s of a
+request of about 197 s (-8.5%). Served, it is **-8.37%** (173.42 s to 158.90 s, n=4 each) in Track M's
+mirrored session on build-server-2 ("Round 3 / final session", above).
+
+### How it was measured: an in-process step probe, so no run-to-run floor
+
+Two compiled server processes differ by about LPIPS 0.027, which is more than most single-step effects here. So
+the comparison is made inside one request instead. With `VLLM_OMNI_K6_STEP_PROBE=<file.json>`, each request
+first runs its normal trajectory and records the state entering every step and every DiT output. It then replays
+the trajectory's tail once per branch in the file, and the pipeline decodes and saves each branch's frames next
+to the request's own (`base`). A branch shares the base run's process and kernels, so its LPIPS against `base`
+measures the branch alone. A cache branch is the same computation as the serving switch: the GPU test checks the
+two are bit-identical. With bs1's pinned Inductor cache, separate processes also reproduced to five digits
+(a1 reuse-8: 0.00546 / 0.00848 from two servers). `bench/step_probe.py` drives and scores the probe.
+
+### Which step is cheapest to skip: step 8, not the last one
+
+Skipping one step with `reuse` (in-process LPIPS mean / max against the uncached run, headline arm):
+
+| skipped step | a3 | b6 | a1 |
+|---|---|---|---|
+| 5 | 0.0515 / 0.0879 | 0.0333 / 0.0731 | |
+| 6 | 0.0240 / 0.0479 | 0.0184 / 0.0297 | |
+| 7 | 0.0159 / 0.0260 | 0.0105 / 0.0166 | |
+| **8** | **0.0125 / 0.0225** | **0.0101 / 0.0141** | **0.0055 / 0.0085** |
+| 9 | 0.0179 / 0.0249 | 0.0138 / 0.0198 | 0.0121 / 0.0136 |
+| 10 (final, half-length) | 0.0361 / 0.0515 | 0.0192 / 0.0290 | 0.0177 / 0.0199 |
+| 7 + 9 | 0.0303 / 0.0461 | 0.0245 / 0.0399 | |
+| 6 + 8 | 0.0311 / 0.0541 | 0.0247 / 0.0381 | |
+| 9 + 10 | 0.0841 / 0.1188 | 0.0526 / 0.0788 | 0.0569 / 0.0616 |
+| 8 + 9 + 10 | 0.1376 / 0.1957 | 0.0983 / 0.1370 | 0.1019 / 0.1095 |
+
+- The cost is U-shaped. Early steps still shape the scene. The final step is the most expensive one in the tail
+  because nothing after it corrects its error. Step 8 is the minimum on all three prompts, with 7 close behind.
+- Costs roughly add for non-adjacent pairs (7 + 9 is about cost(7) + cost(9)). Adjacent skips compound: in 9 + 10,
+  step 10 reuses a prediction that was itself reused.
+- First-order extrapolation in raw time (`extrapolate`, the TaylorSeer / DPCache form) is worse than `reuse` at
+  every step except 8 (a3: 0.0177 against 0.0125). For two consecutive skips it diverges (9 + 10: 0.307 on a3).
+  pi-Flow's x_0 grid is not smooth enough across a segment boundary to extrapolate from its last interval.
+
+Not measured: the 1%-latent-noise sensitivity curve over k = 1..10 that the plan called for. Its decision-relevant
+form, the cost of actually skipping each step, is the table above. Steps 1-4 were not probed; on the evidence
+of step 5 they would cost more.
+
+### Set A: all nine prompts, step 8 and steps 7 + 9
+
+| prompt | skip 8: mean / max | skip 7 + 9: mean / max |
+|---|---|---|
+| a1-portrait-speech | 0.0055 / 0.0085 | 0.0173 / 0.0202 |
+| a2-neon-signage | 0.0180 / 0.0233 | 0.0407 / 0.0563 |
+| a3-sprint-start | 0.0122 / 0.0202 | 0.0302 / 0.0461 |
+| a4-chalkboard | 0.0064 / 0.0070 | 0.0159 / 0.0177 |
+| a5-waterfall-drone | 0.0149 / 0.0174 | 0.0551 / 0.0682 |
+| a6-blacksmith | 0.0095 / 0.0174 | 0.0218 / 0.0302 |
+| a7-cafe-menu | 0.0072 / 0.0082 | 0.0169 / 0.0204 |
+| a8-skateboard-crash | 0.0152 / 0.0259 | 0.0377 / 0.0610 |
+| a9-violinist | 0.0062 / 0.0087 | 0.0147 / 0.0178 |
+| **set** | **0.0106 / 0.0259** | **0.0278 / 0.0682** |
+
+Skipping step 8 stays at less than half the floor on every prompt; the worst is a8 (0.0259 worst frame).
+Skipping steps 7 + 9 (-17%) is about one run-to-run floor (1.02x / 1.07x): it would roughly double the arm's
+distance from a re-run of itself.
+
+### The user's gate (G1): step 8 inherits the headline arm's verdict
+
+Scored against a same-host reference: BF16, platform attention, compiled, on bs1 with the same Inductor cache,
+seed 42, generated 11:34-12:11. The arm's three variants come from the one set-A probe pass and are encoded
+identically (H.264, CRF 18, from raw frames), so the codec treats them alike.
+
+| arm | set A mean | worst frame |
+|---|---:|---:|
+| headline arm (BF16 + sage2-mid + exact step 1) | 0.1142 | 0.2818 (a3) |
+| + `VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8` | 0.1152 | 0.2822 (a3) |
+| + `VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=7,9` | 0.1210 | 0.2771 (a3) |
+
+Skipping step 8 moves G1 by +0.0010 on the mean and +0.0004 on the worst frame. The mean stays inside 0.15 and
+the worst frame stays over 0.25 on a3, exactly where the headline arm already is. Set B was not run on bs1.
 
 ## Round 2 / K1: the BF16 GEMMs are at the hardware, and the bias was the lever
 
