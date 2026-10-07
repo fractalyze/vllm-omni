@@ -62,6 +62,7 @@ from .scheduling_kandinsky6_piflow import (
     shift_timesteps,
     split_grid_prediction,
 )
+from .step_precision import fp8_after_step, install_step_fp8, set_fp8_gemm_step
 
 logger = init_logger(__name__)
 
@@ -842,9 +843,12 @@ def piflow_denoise_loop(  # noqa: PLR0913
     scheduler.set_timesteps(num_steps, device=device)
 
     exact_steps = exact_attention_steps()
+    fp8_from_step = fp8_after_step()
     for segment in scheduler.segments(num_steps):
         if exact_steps:
             set_exact_attention_step(_raw_dit(dit), segment.step_index < exact_steps)
+        if fp8_from_step:
+            set_fp8_gemm_step(_raw_dit(dit), segment.step_index >= fp8_from_step)
         tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
         tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
         sigma_src = shift_timesteps(tau_src, shift)
@@ -1362,6 +1366,13 @@ class Kandinsky6TI2VAPipeline(
             raise ValueError("Kandinsky6TI2VAPipeline requires transformer, vae, text_encoder, and scheduler.")
 
         self.transformer = transformer
+        if fp8_after_step():
+            wrapped = install_step_fp8(transformer)
+            logger.info(
+                "Kandinsky 6: %d DiT linears run FP8 GEMMs from sampler step %d on (exact BF16 before)",
+                wrapped,
+                fp8_after_step(),
+            )
         self.vae = vae
         self.text_encoder = text_encoder
         self.audio_vae = audio_vae

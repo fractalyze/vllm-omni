@@ -30,6 +30,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDis
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils.accelerate_utils import apply_forward_hook
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
@@ -38,6 +39,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 
 def prepare_causal_attention_mask(f: int, s: int, dtype: torch.dtype, device: torch.device, b: int) -> torch.Tensor:
@@ -848,6 +851,12 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
         """
         tile_size, tile_stride = self.get_dec_optimal_tiling(z.shape, device=z.device)
         if tile_size != self.tile_size:
+            logger.info(
+                "Kandinsky 6 VAE decode plan for latents %s: tile %s, stride %s",
+                tuple(z.shape),
+                tile_size,
+                tile_stride,
+            )
             self.tile_size = tile_size
             self.apply_tiling(tile_size, tile_stride)
 
