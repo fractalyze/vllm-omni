@@ -16,8 +16,10 @@ from vllm_omni.diffusion.models.kandinsky6.step_precision import (
     StepFp8LinearMethod,
     fp8_after_step,
     install_step_fp8,
+    nvfp4_global_scale,
     quantize_weight_per_tensor,
     set_fp8_gemm_step,
+    step_gemm_format,
 )
 
 _MASTER_PORT = "29589"
@@ -142,6 +144,79 @@ class InstallTest(absltest.TestCase):
         relative = (fp8.float() - reference.float()).norm() / reference.float().norm()
         self.assertLess(float(relative), 0.08)
         self.assertFalse(torch.equal(fp8, reference))
+
+    def test_nvfp4_step_is_close_and_keeps_the_bias(self) -> None:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest("needs a Blackwell CUDA device for the NVFP4 kernel")
+        from vllm.model_executor.layers.linear import ReplicatedLinear
+
+        torch.manual_seed(0)
+        layer = ReplicatedLinear(
+            256, 128, bias=True, params_dtype=torch.bfloat16, prefix="visual_transformer_blocks.0.x"
+        )
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(128, 256) * 0.05)
+            layer.bias.copy_(torch.randn(128) * 0.1)
+        layer = layer.cuda()
+        x = torch.randn(4, 64, 256, device="cuda", dtype=torch.bfloat16)
+        bias = layer.bias.detach().clone()
+        with torch.no_grad():
+            reference = layer(x)[0]
+            layer.quant_method = StepFp8LinearMethod(layer.quant_method, "nvfp4")
+            layer.fp8_step = False
+            exact = layer(x)[0]
+            layer.fp8_step = True
+            fp4 = layer(x)[0]
+            layer.bias.zero_()
+            fp4_no_bias = layer(x)[0]
+        self.assertTrue(torch.equal(exact, reference))
+        self.assertEqual(fp4.shape, reference.shape)
+        self.assertEqual(fp4.dtype, reference.dtype)
+        # E2M1 on both operands: ~0.13 relative error per GEMM, an order above FP8's.
+        relative = (fp4.float() - reference.float()).norm() / reference.float().norm()
+        self.assertLess(float(relative), 0.3)
+        # cutlass_scaled_fp4_mm has no bias epilogue; the bias is added after it.
+        torch.testing.assert_close((fp4 - fp4_no_bias).float(), bias.float().expand_as(fp4), atol=0.02, rtol=0.0)
+
+
+class FormatTest(absltest.TestCase):
+    def test_default_is_fp8_and_unknown_is_rejected(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_OMNI_K6_STEP_GEMM_FORMAT", None)
+            self.assertEqual(step_gemm_format(), "fp8")
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_STEP_GEMM_FORMAT": "nvfp4"}):
+            self.assertEqual(step_gemm_format(), "nvfp4")
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_STEP_GEMM_FORMAT": "int4"}):
+            with self.assertRaisesRegex(ValueError, "STEP_GEMM_FORMAT"):
+                step_gemm_format()
+
+    def test_global_scale_is_448_times_6_over_amax_and_zero_safe(self) -> None:
+        t = torch.tensor([[1.0, -4.0], [2.0, 0.5]], dtype=torch.bfloat16)
+        torch.testing.assert_close(nvfp4_global_scale(t), torch.tensor([448.0 * 6.0 / 4.0]))
+        torch.testing.assert_close(nvfp4_global_scale(torch.zeros(2, 2, dtype=torch.bfloat16)), torch.tensor([1.0]))
+
+
+class Int8WrapTest(absltest.TestCase):
+    """NVFP4 steps also take an INT8 weight-only layer: dequantized, then re-quantized."""
+
+    def test_post_processing_goes_to_the_wrapped_method(self) -> None:
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod
+
+        inner = mock.create_autospec(Int8WeightOnlyLinearMethod, instance=True)
+        layer = SimpleNamespace()
+        StepFp8LinearMethod(inner, "nvfp4").process_weights_after_loading(layer)
+        inner.process_weights_after_loading.assert_called_once_with(layer)
+
+    def test_int8_layer_computes_with_its_dequantized_weight(self) -> None:
+        from vllm_omni.quantization.int8_config import Int8WeightOnlyLinearMethod, dequantize_int8_rows
+
+        inner = mock.create_autospec(Int8WeightOnlyLinearMethod, instance=True)
+        layer = SimpleNamespace(
+            weight=torch.randint(-127, 128, (8, 16), dtype=torch.int8),
+            weight_scale=torch.rand(8, 1, dtype=torch.float32),
+        )
+        got = StepFp8LinearMethod(inner, "nvfp4")._bf16_weight(layer, torch.bfloat16)
+        torch.testing.assert_close(got, dequantize_int8_rows(layer.weight, layer.weight_scale, torch.bfloat16))
 
 
 if __name__ == "__main__":
