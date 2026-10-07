@@ -65,7 +65,7 @@ from .scheduling_kandinsky6_piflow import (
     shift_timesteps,
     split_grid_prediction,
 )
-from .step_precision import fp8_after_step, install_step_fp8, set_fp8_gemm_step
+from .step_precision import fp8_after_step, install_step_fp8, set_fp8_gemm_step, step_gemm_format
 
 logger = init_logger(__name__)
 
@@ -1487,9 +1487,10 @@ class Kandinsky6TI2VAPipeline(
         if fp8_after_step():
             wrapped = install_step_fp8(transformer)
             logger.info(
-                "Kandinsky 6: %d DiT linears run FP8 GEMMs from sampler step %d on (exact BF16 before)",
+                "Kandinsky 6: %d DiT linears run %s GEMMs from sampler step %d (1-based) on (exact BF16 before)",
                 wrapped,
-                fp8_after_step(),
+                step_gemm_format().upper(),
+                fp8_after_step() + 1,
             )
         self.vae = vae
         self.text_encoder = text_encoder
