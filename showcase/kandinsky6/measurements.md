@@ -9,6 +9,156 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Round 4 / H1: hybrid FP16-accumulate GEMMs on the final stack
+
+**Question.** On sm_120 an FP16 MMA that accumulates in FP16 runs at about 1.5x
+the FP32-accumulate rate. Track C's hybrid kernel (PR #54) accumulates each
+32-element K block in FP16 and sums the blocks in FP32. H1 routes every DiT
+linear through it (`VLLM_OMNI_K6_HYBRID_GEMM=1`). Arms:
+`arms/h1-hybrid-all.json` is the final stack + the switch; `arms/h1-hybrid.json`
+adds the large-M gate (PR #61). Preregistered as k6m-15: -12% per request. It is
+falsified if the ABBA delta is above -6%, or if set-A G1 against the same-code
+reference is above 0.13.
+
+### FP16 range audit (PR #53)
+
+`VLLM_OMNI_K6_FP16_AUDIT` hooked all 1990 DiT linears for three eager requests
+(a1, a3, b6; W1, all 10 steps; 53,634 calls).
+
+- **No layer is near FP16 overflow.** The largest output was 5024
+  (`video_text_embeddings.in_layer`) and the largest input 162
+  (`va_cross_attention.to_query`). The largest 64-term partial-sum bound
+  (|x|max x |w|max x 64) was 29,503, under 65,504. The kernel promotes every
+  32 terms, so the true margin is wider still.
+- **The risk is underflow**, and it is confined to layers that act on one vector
+  per step:
+
+  | layer family | what underflows |
+  |---|---|
+  | `va_modulation.out_layer` | 84% of weights FP16-subnormal, 32% flush to zero |
+  | `av_modulation.out_layer` | 58% of weights subnormal, 0.7% flush to zero |
+  | `video_time_embeddings.out_layer` | 82% of inputs subnormal, 9% flush to zero |
+
+  These are the default exclude, `modulation|time_embeddings` (254 linears).
+  With M = 1 they cost nothing to keep in BF16.
+- FF2 inputs are up to 35% subnormal: post-GELU values near zero. None are
+  flushed, and their absolute error is under 1e-7, so FF2 stays on the hybrid.
+
+1736 linears run hybrid.
+
+### Quality: set A against the same-code compiled reference
+
+Bit-identical DiT output across #54/#55/#58 (four shapes checked). Seed 42, all 9 prompts, bs2:
+
+| arm | vs head compiled reference: mean / worst frame |
+|---|---|
+| final stack (cache step 8), from the attribution round | 0.1128 / 0.3675 |
+| H1, first run (decoded with smaller tiles, see caveat) | 0.1146 / 0.4596 (a3) |
+| **H1, rerun with the scratch release (reference decode plan)** | **0.1126 / 0.4597** (a3) |
+
+Per prompt, H1 (rerun) / final stack:
+
+| a1 | a2 | a3 | a4 | a5 | a6 | a7 | a8 | a9 |
+|---|---|---|---|---|---|---|---|---|
+| .030 / .019 | .089 / .078 | .263 / .198 | .077 / .071 | .034 / .050 | .104 / .088 | .127 / .106 | .203 / .226 | .087 / .180 |
+
+- **The set mean does not move:** 0.1126 against 0.1128, inside the 0.13
+  falsifier. This fits Track C's kernel-level finding: the error is set by input
+  quantisation, and FP16's 10 mantissa bits beat BF16's 7.
+- **The worst frame rises** (a3, 0.37 to 0.46). Both arms are already over
+  0.25 there.
+- **The first run** used the host cast without the scratch release, so it
+  decoded with (1, 17, 176, 192) tiles. Its DiT output is bit-identical to the
+  rerun's, so the 0.002 between the two runs is the decode plan alone (a1: 0.044
+  / 0.058 between the two decodes).
+- **Both H1 runs are the all-linears configuration** (`arms/h1-hybrid-all.json`).
+  The 2048-row gate (PR #61) puts the audio and text linears back on BF16
+  cuBLAS. Its set A was not run.
+
+Set B was not run this round: the head set-B reference was displaced by the diagnosis below.
+
+### Speed
+
+One mirrored session on bs2, 15:36-16:11 KST, showcase 747ef44f8 (PR #58):
+A B B A, 1 warm-up + 2 timed a1 requests per visit, every GPU lock held, valid
+(no foreign GPU process sampled).
+
+| arm | W1 request (median, min-max, n=4) | vs final stack |
+|---|---:|---:|
+| final stack (`arms/final-B-cache8.json`) | 160.54 s (159.37-163.38) | -- |
+| **H1, all linears** (1736 wrapped; now `arms/h1-hybrid-all.json`) | **153.82 s** (153.26-155.70) | **-4.18%** |
+
+The delta is outside the control's 2.5% spread, so H1 is a real gain. It is
+smaller than preregistered: k6m-15 predicted -12% and set -6% as the falsifier,
+so **k6m-15 is falsified on speed.** The prediction was extrapolated from a
+GEMM baseline that the served path no longer runs (below). Both arms decoded
+with the reference's (1, 17, 256, 448) tiles.
+
+**Gating to large M.** At M = 218 (audio) and M = 256 (text) the hybrid is
+1.7-2.7x slower than cuBLAS. PR #61 sends calls under 2048 rows to the original
+method (`arms/h1-hybrid.json` now runs with the gate). Measured with the gate:
+
+| host, session | configuration | final stack | H1 | delta |
+|---|---|---:|---:|---:|
+| bs2, A B B A above | all linears | 160.54 s | 153.82 s | -4.18% (-6.7 s) |
+| bs3, Track C (PRs #59, #60), 4 timed runs per arm | all linears | 159.8 s | 154.7 s | -5.1 s |
+| bs3, Track C (PRs #59, #60), 4 timed runs per arm | large-M only (728 wrapped, exclude regex) | 159.8 s | **150.6 s** | **-5.8% (-9.2 s)** |
+| bs2, short A B B A 16:35-17:03 (1 warm-up + 1 timed per visit, valid) | large-M only (PR #61 row gate) | 160.51 s (160.35-160.66) | 153.69 s (153.45-153.93) | -4.25% (-6.8 s) |
+
+On bs2 the gate does not add the saving it shows on bs3: -4.25% gated against
+-4.18% with all linears. The two hosts' gates differ slightly. bs3 used an
+exclude regex (728 wrapped), and bs2 a row threshold at apply time, which
+also keeps any other call of 2048 rows or more on the hybrid. The difference
+is not attributed. **k6m-15 stays falsified either way:** no configuration on
+either host reaches -6%.
+
+### Why the first H1 run did not move the request
+
+The first set-A requests under H1 ran at 155.9-166.2 s (median ~158 s), against
+~160 s for the final stack. One nsys-profiled a1 request per arm in the served
+worker (bs2, all locks):
+
+| | final stack | H1 |
+|---|---:|---:|
+| DiT GEMM | 73.6 s (cuBLAS, bias-free) | 70.6 s (`_hybrid_mm` 69.2 s, 15,592 calls) |
+| attention (exact + Sage) | 60.0 s | 60.2 s |
+| GPU idle | 10.4 s (6%) | 11.5 s (7%) |
+| H2D | 504 GiB, 10.4 s copy time | 504 GiB, 10.7 s |
+
+- **The kernel is hot.** The trace shows `_hybrid_mm`. A Python call counter
+  would not prove it: inside the compiled blocks, `apply` runs only at trace time.
+- **The stream is not hiding it.** Idle stayed at 6-7%. A stream-bound step
+  would have turned the GEMM saving into idle.
+- **The baseline was the wrong one.** Since PR #38 the served GEMM is
+  bias-free. cuBLAS then picks a different tile, about 25% faster than the
+  `F.linear`-with-bias call the kernel was benchmarked against: in situ, ff1 is
+  31.3 ms (215 TFLOP/s) against 40 ms. Interleaved microbench, M = 50,220,
+  bs2:
+
+  | shape | bias-free cuBLAS | hybrid, host cast | hybrid, in-kernel cast |
+  |---|---:|---:|---:|
+  | 4096 → 4096 | 8013 µs | 1.28x | 1.18x |
+  | 4096 → 16384 (ff1) | 31736 µs | 1.21x | 1.03x |
+  | 16384 → 4096 (ff2) | 31539 µs | 1.12x | 1.01x |
+  | 4096 → 2048 | 4139 µs | 1.22x | 1.22x |
+
+  Weighted by the in-situ call counts, the host-cast kernel is worth about
+  -13 s a request (-8%), not the -31 s from the `F.linear` baseline. The
+  A/B measured -6.7 s. The remaining gap is not attributed. One candidate is
+  clocks: under a full request the card sits at its 575 W cap, and Track C
+  measured the FP16-accumulate MMA running at a lower clock than cuBLAS.
+  The host-cast arm was not profiled.
+- **The profiled H1 used the in-kernel cast** (PR #55). That version converts
+  BF16 to FP16 inside the MMA loop to avoid FP16 operand copies, and it gives
+  up most of the FF gain. PR #58 restores the host cast. The memory problem
+  #55 addressed is handled instead with one `empty_cache` before the VAE
+  decode on the hybrid path. Otherwise the allocator keeps the 1.6 GB FF2
+  copy, and the decoder plans smaller tiles from the reduced free memory.
+
+**What would move H1 further** is the kernel, not bytes. It runs at 1.12-1.28x
+against the served GEMM, and the FP16-accumulate ceiling measured on this
+card is 1.54x (Track C). Stream bytes are not limiting this arm on bs2.
+
 ## Round 3 / attribution: the final stack's G1 rise is PR #38's reassociation, not the cache
 
 The final stack (showcase head + pi-Flow cache on step 8) scored set A **0.1393 / 0.4675** on bs3,
