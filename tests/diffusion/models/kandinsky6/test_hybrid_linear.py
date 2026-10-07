@@ -183,40 +183,63 @@ if __name__ == "__main__":
     absltest.main()
 
 
-class ReleaseClearsTheOperandCacheTest(absltest.TestCase):
-    """`release_hybrid_scratch` must drop the FP16 operand cache, not just call
-    `empty_cache()`.
+class HybridUnderDynamicCompileTest(absltest.TestCase):
+    """`hybrid_matmul` must survive `torch.compile(dynamic=True)`.
 
-    The cache keeps a live reference to the last FP16 activation -- 411 MB at W1
-    -- and a live block cannot be returned to the device. Leaving it would mean
-    the VAE decoder still plans its tiles from a reduced free-memory figure,
-    which is the "different pixels and a slower decode" this function exists to
-    prevent. Tested without a GPU: it is a bookkeeping contract, not a kernel.
+    This exists because a change that passed every eager test broke the served
+    arm on its first request. The model runner compiles the DiT regionally with
+    `dynamic=True`, so inside `hybrid_matmul` the input's `numel()` and `shape`
+    are SymInts. A Python-level operand cache keyed on them raised
+    `InternalTorchDynamoError: 'SymNodeVariable' object has no attribute
+    'value'` -- and no eager test could see it.
+
+    Anything added to this function has to be traceable, so this test compiles
+    it the way the runner does.
     """
 
-    def test_release_drops_the_cached_copy(self):
-        import os
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not torch.cuda.is_available():
+            raise absltest.SkipTest("needs a GPU")
 
-        from vllm_omni.diffusion.models.kandinsky6 import hybrid_gemm, hybrid_linear
+    def test_compiles_with_dynamic_shapes_and_matches_eager(self):
+        import torch._dynamo
 
-        hybrid_gemm._FP16_CACHE["key"] = ("sentinel",)
-        hybrid_gemm._FP16_CACHE["value"] = object()
-        self.addCleanup(hybrid_gemm.clear_fp16_cache)
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
 
-        with absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "1"}), \
-             absltest.mock.patch.object(hybrid_linear, "current_omni_platform") as plat:
-            plat.is_available.return_value = True
-            self.assertTrue(hybrid_linear.release_hybrid_scratch())
-            plat.empty_cache.assert_called_once()
+        torch._dynamo.reset()
+        compiled = torch.compile(hybrid_matmul, dynamic=True, fullgraph=False)
+        torch.manual_seed(0)
+        w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+        b = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+        # Two different M, so dynamic shapes are actually exercised rather than
+        # specialised away on the first trace.
+        for m in (2048, 4096):
+            x = torch.randn(1, m, 512, device="cuda", dtype=torch.bfloat16)
+            got = compiled(x, w, b, out_dtype=x.dtype)
+            want = hybrid_matmul(x, w, b, out_dtype=x.dtype)
+            self.assertEqual(got.shape, want.shape)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
 
-        self.assertIsNone(hybrid_gemm._FP16_CACHE["key"],
-                          "release_hybrid_scratch must clear the operand cache")
-        self.assertIsNone(hybrid_gemm._FP16_CACHE["value"])
+    def test_the_wrapped_linear_method_compiles(self):
+        """The real call path: a LinearBase whose quant_method is the hybrid,
+        compiled dynamically."""
+        import torch._dynamo
 
-    def test_release_is_a_no_op_with_the_switch_off(self):
-        import os
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_linear import HybridFp16LinearMethod
 
-        from vllm_omni.diffusion.models.kandinsky6 import hybrid_linear
+        torch._dynamo.reset()
+        method = HybridFp16LinearMethod(inner=None, matmul=hybrid_matmul)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.02, requires_grad=False)
 
-        with absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "0"}):
-            self.assertFalse(hybrid_linear.release_hybrid_scratch())
+        def call(x):
+            return method.apply(layer, x, None)
+
+        compiled = torch.compile(call, dynamic=True, fullgraph=False)
+        for m in (2048, 4096):
+            x = torch.randn(1, m, 512, device="cuda", dtype=torch.bfloat16)
+            torch.testing.assert_close(compiled(x), call(x), rtol=0, atol=0)
