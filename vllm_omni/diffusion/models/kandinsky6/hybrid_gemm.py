@@ -135,6 +135,9 @@ def fp16_safety(t: torch.Tensor) -> dict:
     return {"absmax": absmax, "headroom": FP16_MAX / absmax if absmax > 0 else float("inf"), "subnormal_frac": sub}
 
 
+_LEGACY_BIAS_PTR = os.environ.get("VLLM_OMNI_K6_HYBRID_LEGACY_BIAS_PTR", "") == "1"
+
+
 def hybrid_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -162,13 +165,20 @@ def hybrid_matmul(
     wh = (w if w.dtype == torch.float16 else w.to(torch.float16)).t()
     want = out_dtype or x.dtype
     c = torch.empty((M, N), device=x.device, dtype=torch.float16 if want == torch.float16 else torch.bfloat16)
-    bias_h = None if bias is None else bias.to(torch.float32)
+    # Without a bias the kernel never reads Bias, but it still needs a pointer.
+    # Passing ``xh`` there makes Inductor materialise a second FP16 copy of the
+    # activation for that argument (one extra M*K write per call: ~1.2 s a W1
+    # request, where 8 of 12 large-M linears per block run bias-free since
+    # PR #38). A one-element placeholder costs nothing.
+    bias_h = torch.empty(1, device=x.device, dtype=torch.float32) if bias is None else bias.to(torch.float32)
+    if bias is None and _LEGACY_BIAS_PTR:
+        bias_h = xh  # A/B control for the change above (round 5); removed after the measurement.
 
     grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
     _hybrid_mm[grid](
         xh,
         wh,
-        bias_h if bias_h is not None else xh,
+        bias_h,
         c,
         M,
         N,

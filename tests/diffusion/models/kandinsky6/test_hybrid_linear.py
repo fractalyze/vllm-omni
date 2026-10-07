@@ -171,6 +171,29 @@ class KernelTest(absltest.TestCase):
         bias = torch.randn(256, device="cuda").to(torch.bfloat16)
         self._check(layer.quant_method.apply(layer, x, bias), x, layer, bias)
 
+    def test_compiled_producer_writes_the_fp16_input_once_per_call(self) -> None:
+        """Bias-free calls must not get a second FP16 copy of x for the unused Bias pointer."""
+        import re
+
+        from torch._inductor.utils import run_and_get_code
+
+        from vllm_omni.diffusion.models.kandinsky6.hybrid_gemm import hybrid_matmul
+
+        x = torch.randn(256, 512, device="cuda").to(torch.bfloat16)
+        w = (torch.randn(256, 512, device="cuda") * 0.05).to(torch.bfloat16)
+
+        def project(t):
+            return hybrid_matmul(torch.relu(t), w, out_dtype=torch.bfloat16)
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            _, codes = run_and_get_code(torch.compile(project, fullgraph=True), x)
+        # Kernel bodies only (each ends at its closing triple quote); the ReLU producer is the one with `maximum`.
+        bodies = [k.split("'''")[0] for k in re.split(r"\ndef ", "\n".join(codes))[1:]]
+        producer = [k for k in bodies if "triton_helpers.maximum" in k]
+        self.assertLen(producer, 1)
+        self.assertEqual(len(re.findall(r"tl\.store", producer[0])), 1)
+
     def test_compiled_without_graph_break(self) -> None:
         layer = self._layer()
         x = torch.randn(2, 300, 512, device="cuda").to(torch.bfloat16)
