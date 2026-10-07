@@ -49,7 +49,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .fp16_audit import Fp16Audit, audit_path
-from .hybrid_linear import hybrid_enabled, install_hybrid
+from .hybrid_linear import hybrid_enabled, install_hybrid, release_hybrid_scratch
 from .kandinsky6_transformer import (
     Kandinsky6Transformer3DModel,
     exact_attention_steps,
@@ -2451,6 +2451,7 @@ class Kandinsky6TI2VAPipeline(
         if sampling.output_type == "latent":
             video_out: Tensor | np.ndarray = result.video.unsqueeze(0)
         else:
+            release_hybrid_scratch()
             decoded = postprocess_video(result, self.vae, bs=1)
             if _PIFLOW_DEBUG:
                 _log_tensor_stats("vae decoded", video=decoded)

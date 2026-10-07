@@ -33,11 +33,28 @@ import torch
 from torch import nn
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+from vllm_omni.platforms import current_omni_platform
+
 DEFAULT_EXCLUDE = r"modulation|time_embeddings"
 
 
 def hybrid_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_K6_HYBRID_GEMM", "") not in ("", "0", "false", "False")
+
+
+def release_hybrid_scratch() -> bool:
+    """Return the hybrid GEMM's cached FP16 operand copies to the device; True if it did.
+
+    ``hybrid_matmul`` casts each activation to FP16 (up to 1.6 GB for FF2 at
+    W1), and the caching allocator keeps those blocks after the call. The VAE
+    decoder plans its tiles from the device's free memory, so without this the
+    hybrid arm decodes with smaller tiles than the BF16 path: different pixels
+    and a slower decode. Called once before the decode; a no-op with the switch off.
+    """
+    if not hybrid_enabled() or not current_omni_platform.is_available():
+        return False
+    current_omni_platform.empty_cache()
+    return True
 
 
 def _kernel():
