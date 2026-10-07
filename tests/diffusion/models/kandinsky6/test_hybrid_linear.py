@@ -149,3 +149,42 @@ class KernelTest(absltest.TestCase):
 
 if __name__ == "__main__":
     absltest.main()
+
+
+class ReleaseClearsTheOperandCacheTest(absltest.TestCase):
+    """`release_hybrid_scratch` must drop the FP16 operand cache, not just call
+    `empty_cache()`.
+
+    The cache keeps a live reference to the last FP16 activation -- 411 MB at W1
+    -- and a live block cannot be returned to the device. Leaving it would mean
+    the VAE decoder still plans its tiles from a reduced free-memory figure,
+    which is the "different pixels and a slower decode" this function exists to
+    prevent. Tested without a GPU: it is a bookkeeping contract, not a kernel.
+    """
+
+    def test_release_drops_the_cached_copy(self):
+        import os
+
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_gemm, hybrid_linear
+
+        hybrid_gemm._FP16_CACHE["key"] = ("sentinel",)
+        hybrid_gemm._FP16_CACHE["value"] = object()
+        self.addCleanup(hybrid_gemm.clear_fp16_cache)
+
+        with absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "1"}), \
+             absltest.mock.patch.object(hybrid_linear, "current_omni_platform") as plat:
+            plat.is_available.return_value = True
+            self.assertTrue(hybrid_linear.release_hybrid_scratch())
+            plat.empty_cache.assert_called_once()
+
+        self.assertIsNone(hybrid_gemm._FP16_CACHE["key"],
+                          "release_hybrid_scratch must clear the operand cache")
+        self.assertIsNone(hybrid_gemm._FP16_CACHE["value"])
+
+    def test_release_is_a_no_op_with_the_switch_off(self):
+        import os
+
+        from vllm_omni.diffusion.models.kandinsky6 import hybrid_linear
+
+        with absltest.mock.patch.dict(os.environ, {"VLLM_OMNI_K6_HYBRID_GEMM": "0"}):
+            self.assertFalse(hybrid_linear.release_hybrid_scratch())
