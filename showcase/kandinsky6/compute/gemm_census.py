@@ -76,6 +76,15 @@ def block_gemms(d: int = 4096, ff: int = 16384, d_a: int = 2048, ff_a: int = 716
         # name,                    M,  K,     N,         per step
         dict(name="visual.qkv", m=M, k=d, n=3 * d, count=VISUAL_BLOCKS, bias=True, branch="visual"),
         dict(name="visual.attn_out", m=M, k=d, n=d, count=VISUAL_BLOCKS, bias=True, branch="visual"),
+        # The decoder block also runs a *text* cross-attention (visual queries
+        # against the 256 text tokens), whose query and output projections are
+        # both full-size at M=50,220. Found by enumerating `named_modules()`
+        # rather than reading the forward -- `gemm_insitu.py` lists 12 large-M
+        # linears where this census first listed 7. Missing these two plus
+        # `cross.out_from_visual` was 1.40 s/step, and was the whole of what
+        # looked like an unexplained in-situ GEMM gap.
+        dict(name="visual.text_cross_q", m=M, k=d, n=d, count=VISUAL_BLOCKS, bias=True, branch="visual"),
+        dict(name="visual.text_cross_out", m=M, k=d, n=d, count=VISUAL_BLOCKS, bias=True, branch="visual"),
         dict(name="visual.ff1", m=M, k=d, n=ff, count=VISUAL_BLOCKS, bias=False, branch="visual"),
         dict(name="visual.ff2", m=M, k=ff, n=d, count=VISUAL_BLOCKS, bias=False, branch="visual"),
         # Cross-attention: the query comes from the visual stream, the key and
@@ -101,6 +110,12 @@ def block_gemms(d: int = 4096, ff: int = 16384, d_a: int = 2048, ff_a: int = 716
         # Text towers run four blocks, not sixty.
         dict(name="text.qkv", m=Mt, k=d, n=3 * d, count=4, bias=True, branch="text"),
         dict(name="text.ff1", m=Mt, k=d, n=ff, count=4, bias=False, branch="text"),
+        # The decoder block's text cross-attention reads the 256 text tokens on
+        # its key/value side, so these run 60 times at M=256 rather than 4 times.
+        # Listed for completeness rather than for the 0.001 s/step: this census is
+        # tested against the block's module tree, and a row missing here is the
+        # error that produced a phantom 1.4 s/step gap once already.
+        dict(name="text_cross.kv", m=Mt, k=d, n=2 * d, count=VISUAL_BLOCKS, bias=True, branch="text"),
     ]
 
 
