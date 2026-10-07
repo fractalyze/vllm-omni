@@ -9,6 +9,41 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Round 3 / final session: base vs base + step-8 cache (Track M, build-server-2)
+
+One mirrored session on build-server-2, 2026-10-07 11:17-11:58 KST, showcase
+`2c7b899dc` (PRs #38 bias unfused, #40 background staging, #41 step cache,
+#42, #43). Visits A B B A, 1 warm-up + 2 timed requests each, prompt a1, seed 42,
+every GPU lock held, and the guard sampled no foreign GPU process (`validity: valid`; run
+`ABBA-final-B-cache8-vs-final-A-base-20261007-021719-build-server-2-15c52e`).
+
+| arm | W1 request, median (min-max), n=4 | vs A | vs the 04:16 headline (188.93 s) |
+|---|---:|---:|---:|
+| A: headline (BF16 streamed, sage2-mid with 12 exact blocks, exact step 1) + background staging + bias unfused | **173.42 s** (172.29-173.71) | -- | **-8.2%** |
+| **B: A + pi-Flow cache on step 8** (`VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8`, reuse) | **158.90 s** (157.54-159.58) | **-8.37%** | **-15.9%** |
+
+The control's spread is 0.82%, so B's delta is far outside it.
+
+**Round 2-3 gains in A.** A's -8.2% against the 188.93 s headline of the 04:16 session is the
+kernel and staging work of rounds 2 and 3: background weight staging (-2.06% in its own ABBA,
+bit-identical) and the unfused GEMM bias (PR #38). It spans two sessions, so it is not a
+same-session ratio. The two arms are the same configuration otherwise, on the same host and the
+same pinned Inductor cache.
+
+**Quality of B** (Track S, build-server-1): the cached run against the same arm uncached, same
+host, same process, same Inductor cache, all 9 set-A prompts.
+
+| | set mean | worst frame |
+|---|---:|---:|
+| B (reuse at step 8) | **0.0106** | **0.0259** |
+| reuse at steps 7 and 9 (not chosen) | 0.0278 | 0.0682 |
+| the pipeline's own run-to-run floor (fresh compiled process) | 0.0272 | 0.0636 |
+
+Reusing step 8 moves the output 0.39x / 0.41x as far as simply re-running the uncached arm in a
+new process does. B inherits A's gate standing: G2 and G3 on both sets as reported for the headline
+arm, and G1 failing on the worst frame. B was not re-gated end to end on both sets; its quality
+claim rests on this same-process delta.
+
 ## Headline: the fastest W1 configuration on one RTX 5090 that passes the working gate (Track M)
 
 Track M, build-server-2, 2026-10-07. Kandinsky 6 Pro-distill 5s, W1 (864x480,
@@ -293,6 +328,78 @@ the video decode. Its tiling plan is chosen per call from free GPU memory
 (previous section), so two processes in different memory states decode the same
 latents differently. Every G1 number above carries that ~0.02.
 
+## Round 2-3 / K2, K3, L1: idle time, the VAE decode, and step-scheduled precision (Track M)
+
+Build-server-2, headline arm. Each verdict is in the vault (k6m-09 to k6m-14).
+
+### K2: the GPU idle was host-side weight staging, and moving it off the forward thread is -2.1%
+
+An Nsight profile of one headline request put the GPU idle at 8.6 s:
+- gaps under 5 us summed to 0.04 s;
+- **8.38 s was 107 stalls over 10 ms**, about 10 per step and 85 ms on average, almost all just before a
+  block's first kernel;
+- during those stalls the copy engine was idle and the host was in no CUDA call.
+
+The forward thread was packing the next block's host staging slot from the mmapped checkpoint.
+That copy waits on page faults, and on NVMe reads when the 40 GB cgroup has evicted the pages.
+
+| trial | change | ABBA vs headline (bs2) | output | verdict |
+|---|---|---:|---|---|
+| k6m-09 | `madvise(MADV_WILLNEED)` 4 blocks ahead | +1.9% (191.00 vs 187.45 s) | -- | retired |
+| **k6m-11** | **pack the block after next on a background thread (`VLLM_OMNI_DLO_STAGE_AHEAD=1`, PR #40)** | **-2.06% (182.57 vs 186.41 s)** | **bit-identical** | **kept** |
+
+Readahead failed because the pack's cost is mostly mapping the pages, not reading them: touching a
+0.9 GiB block of already-cached pages still took ~300 ms of page faults. Background staging uses
+the same two pinned slots and events, so nothing it computes changes.
+
+### K3: the VAE decode is 18.7-18.9 s because of its memory-planned tiling, and no cheap lever moved the plan
+
+Kernel time in the decode (17.3 s of a 19.15 s window):
+
+| class | seconds |
+|---|---:|
+| cuDNN conv3d (fp16) | 9.6 |
+| GroupNorm statistics | 3.1 |
+| elementwise | 1.6 |
+| `replication_pad` | 1.18 |
+| NCHW/NHWC transposes | 1.14 |
+
+The decode replans its tiling on every call from `cudaMemGetInfo`:
+- in the served state it picks (1, 17, 256, 448) spatial tiles with 16-frame chunks every 8 frames;
+- standalone with free memory, a full-frame plan decodes in 14.77 s against 18.86 s.
+
+| trial | change | served plan | `vae.decode` | verdict |
+|---|---|---|---:|---|
+| k6m-12 | plan from free + allocator reserve | unchanged (256x448) | 18.7 s | retired |
+| k6m-14 | `empty_cache()` before decode | unchanged (256x448) | 18.7 s | retired |
+| -- | `torch.compile` on the decoder (standalone) | -- | median 52 s, min 10.9 s | parked |
+
+The compiled decoder recompiles on every new tile shape. The resident text encoder and the DiT's
+streaming buffers keep free memory under the ~14.4 GB a full-frame plan needs. The levers left are
+moving the text encoder off the GPU for the decode, and compiling with fixed tile shapes.
+
+### L1: FP8 GEMMs after an exact first step are -18%, and miss set B by 0.0007
+
+`VLLM_OMNI_K6_FP8_GEMM_AFTER_STEP=k` (PR #43) works like this:
+- from sampler step k on, every visual-block linear quantizes its already-streamed BF16 weight per
+  tensor on the GPU and runs `torch._scaled_mm` (cuBLASLt);
+- earlier steps are bit-identical to the base;
+- it needs no extra memory, so step 1 costs nothing.
+
+Measured on full sets A and B. The walls come from the gate run on base + background staging,
+not an ABBA.
+
+| | k=1 (exact step 1, FP8 steps 2-10) |
+|---|---|
+| W1 request | 146.6-154.5 s (base + staging ~182.6 s): about **-18%** |
+| set A vs eager (G2, limits 0.1819 / 0.5200) | 0.1550 / 0.4164: pass |
+| set B vs eager (G2, limits 0.1809 / 0.4245) | **0.1816** / 0.3646: **fails the mean by 0.0007** |
+| set A vs compiled (G1) | 0.1345 / 0.3959: mean inside 0.15 |
+| set B vs compiled (G1) | 0.1419 / 0.2974: mean inside 0.15 |
+| CLIP ratio A / B | 1.009 / 0.998 |
+
+The obvious next step, k=2 (two exact GEMM steps, about -16%), was not measured. Its driver failed
+to start, and the freeze came first. It is the first thing to run after this round.
 ## Round 3 / L2: skip the DiT on sampler step 8 and reuse step 7's x_0 (Track S)
 
 Track S, build-server (bs1), 2026-10-07. W1, seed 42. Switch:
@@ -303,7 +410,8 @@ across the segment. A skipped step therefore costs neither the DiT compute nor i
 **Result: on set A, caching step 8 moves the headline arm by LPIPS 0.0106 mean / 0.0259 worst frame. That is
 0.39x / 0.41x of the pipeline's own run-to-run floor (0.0272 / 0.0636), and it removes one of the ten DiT calls.**
 On bs1 a DiT call is 16.6-17.3 s (median 16.77 s over 13 requests), so a skipped step saves about 17 s of a
-request of about 197 s (-8.5%). The served wall time is in the next subsection.
+request of about 197 s (-8.5%). Served, it is **-8.37%** (173.42 s to 158.90 s, n=4 each) in Track M's
+mirrored session on build-server-2 ("Round 3 / final session", above).
 
 ### How it was measured: an in-process step probe, so no run-to-run floor
 
@@ -639,15 +747,31 @@ already in the port, and the W1 placement (distributed layerwise offload with
 rank-local mmap, BF16 streamed from NVMe) carries over unchanged.
 `serve/serve_pro5s_bf16.sh`.
 
-| | request | per step | peak board |
-|---|---:|---:|---:|
-| **this 5090, BF16 streamed, platform attention** | **2587.4 s** | **51.75 s** | 26.6 GB |
-| upstream recipe, 1x H100 80 GB, FA3, CPU offload | 751.7 s | 14.4 s | — |
-| ratio | **3.44x** | **3.59x** | |
+| | request | per step | peak board | vs the H100 recipe |
+|---|---:|---:|---:|---:|
+| this 5090, BF16 streamed, platform attention | 2587.4 s | 51.75 s | 26.6 GB | 3.44x |
+| **this 5090, `sage2-mid` + exact step 1** | **1610.8 s** | **32.22 s** | 26.6 GB | **2.14x** |
+| upstream recipe, 1x H100 80 GB, FA3, CPU offload | 751.7 s | 14.4 s | — | — |
 
-**The 3.44x is placement, not compute.** The H100 has 80 GB and holds the 60.3 GB
-DiT resident; this board has 32 GB and streams all of it every step. Comparing
-like attention to like on this host decomposes it exactly:
+**The headline attention arm transfers to W2 and pays nearly twice as well
+there: -37.7%, against -21.2% at W1.** Part of that is structural --
+`VLLM_OMNI_K6_EXACT_ATTN_STEPS=1` makes one step exact, which is 10% of W1's ten
+steps and 2% of W2's fifty, so the arm runs the fast kernel on 98% of W2 steps
+against 90% of W1's. But backing the exact step out of both still leaves W2 ahead
+(about -38.5% against -23.6%), so **attention is a larger share of the W2 step
+than of the W1 step, and W2 has not been profiled to say why.** Stated as
+measured rather than explained.
+
+**That takes a 32 GB consumer board from 3.44x to 2.14x the upstream H100 80 GB
+recipe, on a workload where the board cannot hold the model at all.** The
+remaining 2.14x is placement, and the two levers against it are named below.
+
+Quality at W2 is **not** gated: one prompt, no W2 reference set, so these are
+timings only. Both MP4s are kept for a human look.
+
+**The platform-attention 3.44x is placement, not compute.** The H100 has 80 GB
+and holds the 60.3 GB DiT resident; this board has 32 GB and streams all of it
+every step. Comparing like attention to like on this host decomposes it exactly:
 
 | | per step | |
 |---|---:|---|
@@ -657,6 +781,48 @@ like attention to like on this host decomposes it exactly:
 
 That leaves **1.12x for +3.2% more tokens**, so nothing about W2's per-step cost
 is anomalous: it is steps times forwards, plus a little sequence length.
+
+### Quality at W2: the approximation transfers, on one prompt
+
+An attention approximation validated at 10 PiFlow steps has not been shown to
+behave the same at 50 Euler steps with CFG 5.0 -- the schedule is where the
+step-sensitivity mechanism lives, and the first exact step is 1/50 of this one
+rather than 1/10. Both W2 MP4s existed, so this cost no GPU time.
+
+| W2, a1-portrait-speech, arm vs platform attention | | user's gate |
+|---|---:|---|
+| LPIPS mean | **0.0543** | <= 0.15 |
+| LPIPS max | **0.0920** | <= 0.25 |
+| PSNR / SSIM | 31.3 dB / 0.909 | — |
+
+Inside the gate on both axes -- **and that figure means nothing on its own**,
+because a1 is the easiest prompt in set A for every arm measured here. The
+control is the same arm on the same prompt at W1, scored the same way against a
+same-session reference:
+
+| workload | LPIPS mean | max | PSNR | SSIM |
+|---|---:|---:|---:|---:|
+| W1 (10 steps, guidance 1.0) | 0.0489 | 0.0976 | 29.0 dB | 0.875 |
+| W2 (50 steps, CFG 5.0) | 0.0543 | 0.0920 | 31.3 dB | 0.909 |
+
+**Unchanged within one sample**: the mean is 11% higher, the max slightly
+*lower*, and PSNR and SSIM both better. So fifty Euler steps with CFG 5.0 do not
+amplify what SageAttention2 on blocks 6-53 plus one exact step does to this
+model.
+
+**This is a screen and not a gate, and the distinction has teeth here.** The
+prompts where this arm fails the user's max at W1 -- a3 at 0.2047, a8 at 0.2504,
+a9 at 0.1815 -- have not been run at W2, and at 2587 s a request the nine-prompt
+set is a 6.5-hour proposition. Four screens in this study have already disagreed
+with their own full set, so the claim is "a1 transfers" and nothing wider.
+
+**And one number that should not be buried:** the audio SI-SDR between the two
+W2 runs is **-16.2 dB** (log-mel L1 0.4953), a large waveform difference. That is
+expected in kind -- a different attention kernel makes the model generate a
+*different* audio sample rather than a degraded one, and the same is true at W1
+where the video gate passed -- but **no gate in this study has ever scored audio
+against a threshold**, so there is no basis here for calling it fine. It needs a
+listen.
 
 ### The two W2 levers, measured rather than guessed
 

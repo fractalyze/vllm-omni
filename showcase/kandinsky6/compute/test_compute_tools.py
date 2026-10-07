@@ -322,6 +322,17 @@ class AttentionArmConfigTest(parameterized.TestCase):
             "kandinsky6.audio_video_cross": "TORCH_SDPA",
             "kandinsky6.audio_self": "TORCH_SDPA",
         },
+        # The band dial's zero point: the same three roles with no `layers`
+        # range at all, so Sage2 runs on every visual block. It exists so that a
+        # band comparison changes exactly one key. It is the fastest arm measured
+        # that still passes G2 and G3, but it is 4-of-9 over the user's own max
+        # against the shipped arm's 1-of-9, so it is not the headline -- see the
+        # L7 section of measurements.md.
+        "sage2-edge0.json": {
+            "kandinsky6.visual_self": "SAGE_ATTN",
+            "kandinsky6.audio_video_cross": "TORCH_SDPA",
+            "kandinsky6.audio_self": "TORCH_SDPA",
+        },
         # The same roles, with Sage's accuracy knobs on: FP16 PV with FP32
         # accumulation and per-thread INT8 granularity.
         "sage2-accurate.json": {
@@ -975,6 +986,9 @@ class BandedArmTest(parameterized.TestCase):
     """
 
     BANDS = {"sage2-wide.json": "3:57", "sage2-mid.json": "6:54", "sage2-narrow.json": "12:48"}
+    # The dial's zero point carries no range at all, so it cannot be expressed
+    # as a band string. It is tested separately below.
+    NO_BAND = "sage2-edge0.json"
 
     def _arm(self, filename):
         import json
@@ -1001,6 +1015,30 @@ class BandedArmTest(parameterized.TestCase):
         ends, so an asymmetric band would be measuring two changes."""
         start, stop = (int(part) for part in layers.split(":"))
         self.assertEqual(start, 60 - stop, f"{filename}: {start} exact at the front, {60 - stop} at the back")
+
+    def test_the_zero_band_arm_differs_only_by_the_missing_range(self):
+        """`sage2-edge0.json` is the band dial at zero exact blocks.
+
+        It must be `sage2-mid.json` with the `layers` key removed and nothing
+        else, because the L7 comparison it was built for reads the difference
+        between the two arms as the band's entire contribution -- a 26% quality
+        change and an 11% speed change. L7's conclusion, that the band is not
+        redundant with an exact first step, is only sound if exactly one thing
+        differs.
+        """
+        import copy
+
+        reference = copy.deepcopy(self._arm("sage2-mid.json"))
+        candidate = copy.deepcopy(self._arm(self.NO_BAND))
+
+        visual = reference["per_role"]["kandinsky6"]["visual_self"]
+        self.assertIn("layers", visual, "sage2-mid must carry a range or this comparison means nothing")
+        del visual["layers"]
+        self.assertNotIn(
+            "layers", candidate["per_role"]["kandinsky6"]["visual_self"],
+            "the zero-band arm must not restrict the range at all",
+        )
+        self.assertEqual(candidate, reference)
 
 
 class CompileDynamicFlagTest(parameterized.TestCase):
