@@ -15,9 +15,13 @@ from absl.testing import absltest
 from vllm_omni.diffusion.models.kandinsky6.step_precision import (
     StepFp8LinearMethod,
     fp8_after_step,
+    hadamard_block,
     install_step_fp8,
     nvfp4_global_scale,
+    nvfp4_linear,
     quantize_weight_per_tensor,
+    random_hadamard,
+    rotate_blocks,
     set_fp8_gemm_step,
     step_gemm_format,
 )
@@ -217,6 +221,51 @@ class Int8WrapTest(absltest.TestCase):
         )
         got = StepFp8LinearMethod(inner, "nvfp4")._bf16_weight(layer, torch.bfloat16)
         torch.testing.assert_close(got, dequantize_int8_rows(layer.weight, layer.weight_scale, torch.bfloat16))
+
+
+class HadamardTest(absltest.TestCase):
+    """The rotation applied before NVFP4 quantization (R3)."""
+
+    def test_rotation_is_orthogonal(self) -> None:
+        for b in (2, 16, 128):
+            r = random_hadamard(b, torch.device("cpu"), torch.float64)
+            torch.testing.assert_close(r @ r.T, torch.eye(b, dtype=torch.float64))
+
+    def test_rotating_both_operands_leaves_the_product_unchanged(self) -> None:
+        x = torch.randn(5, 64, dtype=torch.float64)
+        w = torch.randn(7, 64, dtype=torch.float64)
+        torch.testing.assert_close(rotate_blocks(x, 16) @ rotate_blocks(w, 16).T, x @ w.T)
+
+    def test_rotation_spreads_an_outlier_over_its_block(self) -> None:
+        x = torch.zeros(1, 32, dtype=torch.float64)
+        x[0, 3] = 100.0
+        rotated = rotate_blocks(x, 16)
+        self.assertAlmostEqual(float(rotated.abs().max()), 100.0 / 4.0)
+        self.assertEqual(int((rotated[0, :16].abs() > 0).sum()), 16)
+        self.assertEqual(float(rotated[0, 16:].abs().max()), 0.0)
+
+    def test_block_setting(self) -> None:
+        with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_NVFP4_HADAMARD": "64"}):
+            self.assertEqual(hadamard_block(), 64)
+        for bad in ("3", "1", "48"):
+            with mock.patch.dict(os.environ, {"VLLM_OMNI_K6_NVFP4_HADAMARD": bad}):
+                with self.assertRaisesRegex(ValueError, "power of two"):
+                    hadamard_block()
+        with self.assertRaisesRegex(ValueError, "multiple"):
+            rotate_blocks(torch.zeros(2, 24), 16)
+
+    def test_nvfp4_with_rotation_is_close(self) -> None:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest("needs a Blackwell CUDA device for the NVFP4 kernel")
+        torch.manual_seed(0)
+        x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+        x[:, 7] *= 50.0  # an outlier channel, the case rotation is for
+        w = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+        reference = (x.float() @ w.float().T).double()
+        for b in (0, 16, 128):
+            out = nvfp4_linear(x, w, None, b).double()
+            relative = float((out - reference).norm() / reference.norm())
+            self.assertLess(relative, 0.3, b)
 
 
 if __name__ == "__main__":
