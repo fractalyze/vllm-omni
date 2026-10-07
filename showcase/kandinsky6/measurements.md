@@ -9,6 +9,41 @@ Every number here was taken with all five of build-server-3's GPU lock files
 held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
 and a run that had a co-tenant is discarded rather than reported.
 
+## Round 3 / final session: base vs base + step-8 cache (Track M, build-server-2)
+
+One mirrored session on build-server-2, 2026-10-07 11:17-11:58 KST, showcase
+`2c7b899dc` (PRs #38 bias unfused, #40 background staging, #41 step cache,
+#42, #43). Visits A B B A, 1 warm-up + 2 timed requests each, prompt a1, seed 42,
+every GPU lock held, and the guard sampled no foreign GPU process (`validity: valid`; run
+`ABBA-final-B-cache8-vs-final-A-base-20261007-021719-build-server-2-15c52e`).
+
+| arm | W1 request, median (min-max), n=4 | vs A | vs the 04:16 headline (188.93 s) |
+|---|---:|---:|---:|
+| A: headline (BF16 streamed, sage2-mid with 12 exact blocks, exact step 1) + background staging + bias unfused | **173.42 s** (172.29-173.71) | -- | **-8.2%** |
+| **B: A + pi-Flow cache on step 8** (`VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8`, reuse) | **158.90 s** (157.54-159.58) | **-8.37%** | **-15.9%** |
+
+The control's spread is 0.82%, so B's delta is far outside it.
+
+**Round 2-3 gains in A.** A's -8.2% against the 188.93 s headline of the 04:16 session is the
+kernel and staging work of rounds 2 and 3: background weight staging (-2.06% in its own ABBA,
+bit-identical) and the unfused GEMM bias (PR #38). It spans two sessions, so it is not a
+same-session ratio. The two arms are the same configuration otherwise, on the same host and the
+same pinned Inductor cache.
+
+**Quality of B** (Track S, build-server-1): the cached run against the same arm uncached, same
+host, same process, same Inductor cache, all 9 set-A prompts.
+
+| | set mean | worst frame |
+|---|---:|---:|
+| B (reuse at step 8) | **0.0106** | **0.0259** |
+| reuse at steps 7 and 9 (not chosen) | 0.0278 | 0.0682 |
+| the pipeline's own run-to-run floor (fresh compiled process) | 0.0272 | 0.0636 |
+
+Reusing step 8 moves the output 0.39x / 0.41x as far as simply re-running the uncached arm in a
+new process does. B inherits A's gate standing: G2 and G3 on both sets as reported for the headline
+arm, and G1 failing on the worst frame. B was not re-gated end to end on both sets; its quality
+claim rests on this same-process delta.
+
 ## Headline: the fastest W1 configuration on one RTX 5090 that passes the working gate (Track M)
 
 Track M, build-server-2, 2026-10-07. Kandinsky 6 Pro-distill 5s, W1 (864x480,
@@ -292,6 +327,79 @@ so identical audio means the DiT trajectory reproduced. The difference is in
 the video decode. Its tiling plan is chosen per call from free GPU memory
 (previous section), so two processes in different memory states decode the same
 latents differently. Every G1 number above carries that ~0.02.
+
+## Round 2-3 / K2, K3, L1: idle time, the VAE decode, and step-scheduled precision (Track M)
+
+Build-server-2, headline arm. Each verdict is in the vault (k6m-09 to k6m-14).
+
+### K2: the GPU idle was host-side weight staging, and moving it off the forward thread is -2.1%
+
+An Nsight profile of one headline request put the GPU idle at 8.6 s:
+- gaps under 5 us summed to 0.04 s;
+- **8.38 s was 107 stalls over 10 ms**, about 10 per step and 85 ms on average, almost all just before a
+  block's first kernel;
+- during those stalls the copy engine was idle and the host was in no CUDA call.
+
+The forward thread was packing the next block's host staging slot from the mmapped checkpoint.
+That copy waits on page faults, and on NVMe reads when the 40 GB cgroup has evicted the pages.
+
+| trial | change | ABBA vs headline (bs2) | output | verdict |
+|---|---|---:|---|---|
+| k6m-09 | `madvise(MADV_WILLNEED)` 4 blocks ahead | +1.9% (191.00 vs 187.45 s) | -- | retired |
+| **k6m-11** | **pack the block after next on a background thread (`VLLM_OMNI_DLO_STAGE_AHEAD=1`, PR #40)** | **-2.06% (182.57 vs 186.41 s)** | **bit-identical** | **kept** |
+
+Readahead failed because the pack's cost is mostly mapping the pages, not reading them: touching a
+0.9 GiB block of already-cached pages still took ~300 ms of page faults. Background staging uses
+the same two pinned slots and events, so nothing it computes changes.
+
+### K3: the VAE decode is 18.7-18.9 s because of its memory-planned tiling, and no cheap lever moved the plan
+
+Kernel time in the decode (17.3 s of a 19.15 s window):
+
+| class | seconds |
+|---|---:|
+| cuDNN conv3d (fp16) | 9.6 |
+| GroupNorm statistics | 3.1 |
+| elementwise | 1.6 |
+| `replication_pad` | 1.18 |
+| NCHW/NHWC transposes | 1.14 |
+
+The decode replans its tiling on every call from `cudaMemGetInfo`:
+- in the served state it picks (1, 17, 256, 448) spatial tiles with 16-frame chunks every 8 frames;
+- standalone with free memory, a full-frame plan decodes in 14.77 s against 18.86 s.
+
+| trial | change | served plan | `vae.decode` | verdict |
+|---|---|---|---:|---|
+| k6m-12 | plan from free + allocator reserve | unchanged (256x448) | 18.7 s | retired |
+| k6m-14 | `empty_cache()` before decode | unchanged (256x448) | 18.7 s | retired |
+| -- | `torch.compile` on the decoder (standalone) | -- | median 52 s, min 10.9 s | parked |
+
+The compiled decoder recompiles on every new tile shape. The resident text encoder and the DiT's
+streaming buffers keep free memory under the ~14.4 GB a full-frame plan needs. The levers left are
+moving the text encoder off the GPU for the decode, and compiling with fixed tile shapes.
+
+### L1: FP8 GEMMs after an exact first step are -18%, and miss set B by 0.0007
+
+`VLLM_OMNI_K6_FP8_GEMM_AFTER_STEP=k` (PR #43) works like this:
+- from sampler step k on, every visual-block linear quantizes its already-streamed BF16 weight per
+  tensor on the GPU and runs `torch._scaled_mm` (cuBLASLt);
+- earlier steps are bit-identical to the base;
+- it needs no extra memory, so step 1 costs nothing.
+
+Measured on full sets A and B. The walls come from the gate run on base + background staging,
+not an ABBA.
+
+| | k=1 (exact step 1, FP8 steps 2-10) |
+|---|---|
+| W1 request | 146.6-154.5 s (base + staging ~182.6 s): about **-18%** |
+| set A vs eager (G2, limits 0.1819 / 0.5200) | 0.1550 / 0.4164: pass |
+| set B vs eager (G2, limits 0.1809 / 0.4245) | **0.1816** / 0.3646: **fails the mean by 0.0007** |
+| set A vs compiled (G1) | 0.1345 / 0.3959: mean inside 0.15 |
+| set B vs compiled (G1) | 0.1419 / 0.2974: mean inside 0.15 |
+| CLIP ratio A / B | 1.009 / 0.998 |
+
+The obvious next step, k=2 (two exact GEMM steps, about -16%), was not measured. Its driver failed
+to start, and the freeze came first. It is the first thing to run after this round.
 
 ## Round 2 / K1: the BF16 GEMMs are at the hardware, and the bias was the lever
 

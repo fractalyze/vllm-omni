@@ -90,6 +90,35 @@ marked contaminated rather than reported.
 
 ## Result
 
+### Round 3 final (build-server-2, 2026-10-07 11:17-11:58 KST)
+
+One mirrored session, A B B A, n=4 timed requests per arm, every GPU lock held, valid:
+
+| configuration | W1 request (median, min-max) | vs A | vs last night's 188.93 s headline |
+|---|---:|---:|---:|
+| A: the headline arm below + background staging (`VLLM_OMNI_DLO_STAGE_AHEAD=1`) + unfused GEMM bias | 173.42 s (172.29-173.71) | -- | -8.2% |
+| **B: A + pi-Flow cache on step 8** (`VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8`) | **158.90 s** (157.54-159.58) | **-8.37%** | **-15.9%** |
+
+B's cost in quality is set A LPIPS 0.0106 mean / 0.0259 worst frame against A in the same
+process. That's 0.39x / 0.41x of what simply re-running A in a fresh process moves.
+
+```bash
+HF_HOME=/data/jooman/hf VLLM_OMNI_K6_EXACT_ATTN_STEPS=1 VLLM_OMNI_K6_EXACT_ATTN_BLOCKS=6 \
+VLLM_OMNI_DLO_STAGE_AHEAD=1 VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8 K6_MEMMAX=40G \
+serve/run_capped.sh serve/serve_pro_bf16_ref.sh \
+    --diffusion-attention-config "$(cat compute/arms/sage2.json)"
+```
+
+That is the exact configuration measured (`arms/final-B-cache8.json`).
+`sage2.json` + `VLLM_OMNI_K6_EXACT_ATTN_BLOCKS=6` is the same block split as `sage2-mid.json`'s
+`"layers": "6:54"`.
+
+Measured but not in the stack: FP8 GEMMs after an exact first step
+(`VLLM_OMNI_K6_FP8_GEMM_AFTER_STEP=1`) are about -18% more, and miss set B's working gate by
+0.0007 on the mean. See measurements.md, "Round 2-3 / K2, K3, L1".
+
+### Round 1 headline
+
 The fastest configuration measured on this track that clears the quality bar is
 **SageAttention2 on visual blocks 6-53 with the first sampler step exact**, on
 the exact BF16 checkpoint streamed from NVMe:
