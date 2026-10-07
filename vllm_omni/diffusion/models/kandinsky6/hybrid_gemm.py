@@ -138,80 +138,6 @@ def fp16_safety(t: torch.Tensor) -> dict:
 _LEGACY_BIAS_PTR = os.environ.get("VLLM_OMNI_K6_HYBRID_LEGACY_BIAS_PTR", "") == "1"
 
 
-# --------------------------------------------------------------------------
-# The FP16 operand cache.
-# --------------------------------------------------------------------------
-#
-# The MMA needs FP16 operands and the model holds BF16, so a conversion has to
-# happen somewhere. Three places were measured on this GPU at W1's shapes:
-#
-#   operands pre-converted to FP16        d->d  5487 us   ff1  22935 us
-#   BF16 passed straight to the kernel          7372 us        30561 us
-#   BF16 + cast in the kernel's registers       5971 us        26977 us
-#   BF16 + one host conversion (this)           5902 us        23657 us
-#
-# **Casting in the kernel is 8-14% WORSE on the FFN shapes**, which is worth
-# writing down because it looks like the obvious fix. The grid re-reads each A
-# element `ceil(N / BLOCK_N)` times -- 128 times for ff1 -- so an in-register
-# cast performs the conversion 128 times where a single streaming pass over
-# global memory does it once. Converting once and reusing is right.
-#
-# What *is* waste is converting the same tensor repeatedly. A fused block feeds
-# one visual stream to six different projections (`to_query`, `to_key`,
-# `to_value`, the text cross query, the va-cross query, and the av-cross
-# key/value), so the identical 411 MB activation was converted six times a
-# block. This caches the last conversion.
-#
-# The key reads ``data_ptr()``, which Dynamo cannot trace: inside a compiled
-# region (the served DiT blocks are regionally compiled) it is a graph break at
-# every large call, and ``fullgraph=True`` fails. So by default the cache is used
-# only outside ``torch.compile``; compiled code converts with ``.to`` and leaves
-# the conversion to Inductor, which fuses it into the producer.
-# VLLM_OMNI_K6_HYBRID_FP16_CACHE: ``eager`` (default), ``always`` (cache even
-# while compiling: the PR #65 behaviour, graph breaks included) or ``off``. The
-# last two are A/B controls (round 5) and are removed after the measurement.
-#
-# The key includes `_version`, which PyTorch bumps on any in-place write, so a
-# mutated tensor cannot be served a stale copy. One entry only: the copy is the
-# size of the activation (411 MB at W1) and this runs on a board with a few GiB
-# spare, so holding two would cost more than it saves.
-_FP16_CACHE: dict[str, object] = {"key": None, "value": None}
-
-# Below this many elements the conversion is cheap enough that the bookkeeping
-# and the retained memory are not worth it.
-_CACHE_MIN_ELEMENTS = 1 << 22
-
-_CACHE_MODE = os.environ.get("VLLM_OMNI_K6_HYBRID_FP16_CACHE", "eager")
-if _CACHE_MODE not in ("eager", "always", "off"):
-    raise ValueError(f"VLLM_OMNI_K6_HYBRID_FP16_CACHE={_CACHE_MODE!r}; expected eager, always or off")
-
-
-def _as_fp16(t: torch.Tensor) -> torch.Tensor:
-    """``t`` in FP16, reusing the last conversion when it is the same tensor."""
-    if t.dtype == torch.float16:
-        return t
-    if (
-        t.numel() < _CACHE_MIN_ELEMENTS
-        or _CACHE_MODE == "off"
-        or (_CACHE_MODE == "eager" and torch.compiler.is_compiling())
-    ):
-        return t.to(torch.float16)
-    key = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t._version)
-    if _FP16_CACHE["key"] == key:
-        return _FP16_CACHE["value"]
-    value = t.to(torch.float16)
-    _FP16_CACHE["key"] = key
-    _FP16_CACHE["value"] = value
-    return value
-
-
-def clear_fp16_cache() -> None:
-    """Drop the retained FP16 copy. For tests and for freeing memory between
-    requests; correctness never depends on calling it."""
-    _FP16_CACHE["key"] = None
-    _FP16_CACHE["value"] = None
-
-
 def hybrid_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -233,7 +159,16 @@ def hybrid_matmul(
     if w.shape[1] != K:
         raise ValueError(f"weight {tuple(w.shape)} does not match input feature size {K}")
 
-    xh = _as_fp16(x2)
+    # NOT `_as_fp16` here. This function runs inside the regionally-compiled
+    # DiT, and under `dynamic=True` `x2.numel()` and `x2.shape` are SymInts that
+    # Dynamo cannot put in a Python dict key: it raises
+    # `InternalTorchDynamoError: 'SymNodeVariable' object has no attribute
+    # 'value'` on the first request. The operand cache stays in the showcase
+    # copy, which is eager measurement code. Repeated conversions of the same
+    # activation are therefore still paid on the serving path; removing them
+    # needs something Dynamo can trace -- a custom op holding its own cache --
+    # not a Python dict.
+    xh = x2 if x2.dtype == torch.float16 else x2.to(torch.float16)
     # The kernel reads B as (K, N); `w.t()` is a view, and a non-contiguous B is
     # fine here because the strides are passed explicitly.
     wh = (w if w.dtype == torch.float16 else w.to(torch.float16)).t()
