@@ -42,7 +42,7 @@ FP16_MAX = 65504.0
 # accumulate in FP16 before being promoted, so a smaller BLOCK_K costs speed and
 # buys accuracy. 32 is the default because at W1's shapes it measured within 1%
 # of the fastest config while scoring 3.3e-4 against 64's 3.9e-4.
-_DEFAULT = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=4)
+_DEFAULT = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=2)
 
 
 @triton.jit
@@ -75,6 +75,12 @@ def _hybrid_mm(A, B, Bias, C, M, N, K,
     a_ptr = A + rm[:, None] * sam + rk[None, :] * sak
     b_ptr = B + rk[:, None] * sbk + rn[None, :] * sbn
 
+    # Promotion is per K-block and that is not a tunable. Decoupling the two --
+    # accumulating several blocks in an FP16 partial before promoting, to cut the
+    # BLOCK_M x BLOCK_N conversions -- was tried and is 2-5x SLOWER than cuBLAS at
+    # every interval above 1 (measured: 0.18-0.45x). The mutable FP16 partial plus
+    # a dynamic branch in the loop body defeats Triton's software pipelining and
+    # spills, and the conversions it saves were never the bottleneck.
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         k_mask = rk[None, :] + k < K
