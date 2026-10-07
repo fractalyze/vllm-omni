@@ -46,6 +46,7 @@ from vllm_omni.diffusion.offloader.config import offload_enabled, offload_stream
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.platforms import current_omni_platform
 
 from .kandinsky6_transformer import (
     Kandinsky6Transformer3DModel,
@@ -62,6 +63,7 @@ from .scheduling_kandinsky6_piflow import (
     shift_timesteps,
     split_grid_prediction,
 )
+from .step_precision import fp8_after_step, install_step_fp8, set_fp8_gemm_step
 
 logger = init_logger(__name__)
 
@@ -357,6 +359,12 @@ def postprocess_video(
     frames = (frames / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)
     # Hunyuan VAE loads as fp16; DiT latents are bf16 — match weight dtype.
     vae_dtype = next(vae.parameters()).dtype
+    if os.environ.get("VLLM_OMNI_K6_VAE_FREE_CACHE", "0") == "1":
+        # The decode plans its tiling from free device memory (the allocator's
+        # cache does not count), and after the DiT has run that cache holds most
+        # of the board: the planner then picks small spatial tiles. Returning the
+        # cache first lets it see the memory the decode can actually use.
+        current_omni_platform.empty_cache()
     frames = vae.decode(frames.to(dtype=vae_dtype)).sample
 
     return ((frames.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)
@@ -842,9 +850,12 @@ def piflow_denoise_loop(  # noqa: PLR0913
     scheduler.set_timesteps(num_steps, device=device)
 
     exact_steps = exact_attention_steps()
+    fp8_from_step = fp8_after_step()
     for segment in scheduler.segments(num_steps):
         if exact_steps:
             set_exact_attention_step(_raw_dit(dit), segment.step_index < exact_steps)
+        if fp8_from_step:
+            set_fp8_gemm_step(_raw_dit(dit), segment.step_index >= fp8_from_step)
         tau_src = torch.full((batch_size,), segment.tau_src, device=device, dtype=torch.float32)
         tau_dst = torch.full((batch_size,), segment.tau_dst, device=device, dtype=torch.float32)
         sigma_src = shift_timesteps(tau_src, shift)
@@ -1362,6 +1373,13 @@ class Kandinsky6TI2VAPipeline(
             raise ValueError("Kandinsky6TI2VAPipeline requires transformer, vae, text_encoder, and scheduler.")
 
         self.transformer = transformer
+        if fp8_after_step():
+            wrapped = install_step_fp8(transformer)
+            logger.info(
+                "Kandinsky 6: %d DiT linears run FP8 GEMMs from sampler step %d on (exact BF16 before)",
+                wrapped,
+                fp8_after_step(),
+            )
         self.vae = vae
         self.text_encoder = text_encoder
         self.audio_vae = audio_vae
