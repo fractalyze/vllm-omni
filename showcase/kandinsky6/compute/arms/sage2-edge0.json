@@ -1,0 +1,1 @@
+{"per_role": {"kandinsky6": {"visual_self": {"backend": "SAGE_ATTN"}, "audio_video_cross": {"backend": "TORCH_SDPA"}, "audio_self": {"backend": "TORCH_SDPA"}}}}
