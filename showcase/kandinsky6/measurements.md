@@ -296,9 +296,19 @@ divides by a BF16 peak measured on the same GPU **while it is busy**:
 | `visual.attn_out` | 50220 | 4096 | 4096 | 216.8 | **98%** | 0.466 |
 | `cross.q_from_visual` | 50220 | 4096 | 4096 | 216.7 | **98%** | 0.467 |
 | `cross.kv_from_visual` | 50220 | 4096 | 4096 | 216.9 | **98%** | 0.466 |
-| the audio branch (M=218), 6 GEMMs | | | | 85-133 | 38-60% | 0.017 |
+| `cross.out_from_visual` | 50220 | 4096 | 4096 | 216.7 | **98%** | 0.467 |
+| the audio branch (M=218), 7 GEMMs | | | | 85-133 | 38-60% | 0.018 |
 | the text tower (M=256), 2 GEMMs | | | | 169-175 | 76-79% | 0.002 |
-| **total** | | | | | | **6.512** |
+| **total** | | | | | | **6.979** |
+
+`cross.out_from_visual` is a correction. The first version of this census listed
+the two cross-attentions' query and key/value projections and **missed their
+output projections**: each `Kandinsky6Attention` has an `out_layer` on the side
+its query came from, so `va_cross_attention.out_layer` is another full-size
+4096 -> 4096 GEMM at M=50,220. Omitting it understated the census by 0.47
+s/step, which made the unexplained remainder below look a third larger than it
+is. **A census that silently misses a GEMM inflates exactly the gap it was built
+to measure**, which is the failure mode to watch for in this kind of tool.
 
 Peak is **221.4 TFLOP/s at 2617 MHz and 575 W**. Measuring it correctly matters
 more than it sounds: the first version of this tool sampled clocks *after*
@@ -319,9 +329,11 @@ share: the audio branch runs at 38-60% of peak and is 0.017 s of 6.512.
 ### What was left was the gap between the bucket and the GEMMs
 
 Compiled, the profile's GEMM bucket is **143.83 ms a block = 8.63 s/step** where
-the census of those same GEMMs totals **6.51 s/step**. A 2.12 s/step gap, on a
-step whose kernels are at 98% of the machine. Three explanations were eliminated
-by measurement, and they are listed because each is the obvious guess:
+the census of those same GEMMs totals **6.98 s/step**. A **1.65 s/step** gap, on
+a step whose kernels are at 98% of the machine. Of it, the bias below accounts
+for a measured **0.80 s/step -- 48%**; the remaining ~0.85 s/step is unresolved
+and is not claimed here. Three explanations were eliminated by measurement, and
+they are listed because each is the obvious guess:
 
 - **Profiler misattribution** -- the bucket being named after the biggest kernel
   in a region. No: 130.34 of its 130.45 ms are genuine

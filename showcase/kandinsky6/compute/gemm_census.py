@@ -57,8 +57,12 @@ def block_gemms(d: int = 4096, ff: int = 16384, d_a: int = 2048, ff_a: int = 716
     code, so a config change is visible here instead of silently changing what
     is being benchmarked.
 
-    QKV is listed fused. The port issues it as one GEMM, and splitting it would
-    make the census measure a kernel nobody runs.
+    QKV is listed fused although the port issues it as **three** separate
+    ``ColumnParallelLinear``s of d -> d (it deliberately avoids
+    ``QKVParallelLinear``; see the class docstring). The two forms are within
+    0.2% at W1 -- 3 x 7759 us against 23230 us for the fused shape -- so the
+    fused row is kept for brevity and this note exists so nobody reads the row
+    as a claim about the port.
 
     ``bias`` is the port's own setting, not a guess: every attention projection
     is ``bias=True`` (``Kandinsky6Attention``) and every FFN is ``bias=False``
@@ -80,6 +84,14 @@ def block_gemms(d: int = 4096, ff: int = 16384, d_a: int = 2048, ff_a: int = 716
         dict(name="cross.kv_from_audio", m=Ma, k=d_a, n=2 * d, count=VISUAL_BLOCKS, bias=True, branch="cross"),
         dict(name="cross.q_from_audio", m=Ma, k=d_a, n=d_a, count=VISUAL_BLOCKS, bias=True, branch="cross"),
         dict(name="cross.kv_from_visual", m=M, k=d, n=2 * d_a, count=VISUAL_BLOCKS, bias=True, branch="cross"),
+        # Each cross-attention also has an output projection, on the side its
+        # *query* came from, so `va_cross_attention.out_layer` is another
+        # full-size d -> d GEMM at M=50,220. Leaving it out understated this
+        # census by 0.47 s/step -- a third of the gap the tool was built to
+        # explain. A census that misses a GEMM makes the unexplained remainder
+        # look bigger than it is, which is the failure mode to guard here.
+        dict(name="cross.out_from_visual", m=M, k=d, n=d, count=VISUAL_BLOCKS, bias=True, branch="cross"),
+        dict(name="cross.out_from_audio", m=Ma, k=d_a, n=d_a, count=VISUAL_BLOCKS, bias=True, branch="cross"),
         # The audio branch is the same structure at 218 rows: a shape where a
         # kernel tuned for 50,220 rows can be far off peak and it may not matter.
         dict(name="audio.qkv", m=Ma, k=d_a, n=3 * d_a, count=VISUAL_BLOCKS, bias=True, branch="audio"),
