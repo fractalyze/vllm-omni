@@ -72,9 +72,53 @@ def nvfp4_global_scale(t: torch.Tensor) -> torch.Tensor:
     return torch.where(amax > 0, FP8_E4M3_MAX * FP4_E2M1_MAX / amax, torch.ones_like(amax)).reshape(1)
 
 
-def nvfp4_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """``x @ weight.T + bias`` with both operands quantized to NVFP4 on the fly."""
+def hadamard_block() -> int:
+    """Block size of the randomized Hadamard rotation applied before NVFP4 quantization; 0 = off.
+
+    ``VLLM_OMNI_K6_NVFP4_HADAMARD=b`` (a power of two dividing the layer's input
+    width) rotates every ``b`` consecutive input channels of both operands by
+    the same orthogonal matrix. ``x W^T = (x R)(W R)^T`` for orthogonal ``R``,
+    so nothing has to be undone on the output: the rotation only changes what
+    the quantizer sees, spreading an outlier over ``b`` channels instead of
+    letting it set a whole 16-element block's scale (QuaRot / SpinQuant).
+    """
+    b = int(os.environ.get("VLLM_OMNI_K6_NVFP4_HADAMARD", "0") or 0)
+    if b and (b < 2 or b & (b - 1)):
+        raise ValueError(f"VLLM_OMNI_K6_NVFP4_HADAMARD={b}: must be 0 or a power of two >= 2")
+    return b
+
+
+_ROTATIONS: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def random_hadamard(b: int, device: torch.device, dtype: torch.dtype, seed: int = 0) -> torch.Tensor:
+    """A fixed ``b x b`` orthogonal matrix: Sylvester Hadamard times random signs, over sqrt(b)."""
+    key = (b, torch.device(device), dtype)
+    if key not in _ROTATIONS:
+        h = torch.ones(1, 1, dtype=torch.float64)
+        while h.shape[0] < b:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        gen = torch.Generator().manual_seed(seed)
+        signs = torch.randint(0, 2, (b,), generator=gen, dtype=torch.float64) * 2 - 1
+        _ROTATIONS[key] = (signs[:, None] * h / b**0.5).to(device=device, dtype=dtype)
+    return _ROTATIONS[key]
+
+
+def rotate_blocks(t: torch.Tensor, b: int) -> torch.Tensor:
+    """Multiply every ``b``-wide block of ``t``'s last dimension by :func:`random_hadamard`."""
+    k = t.shape[-1]
+    if k % b:
+        raise ValueError(f"input width {k} is not a multiple of the Hadamard block {b}")
+    r = random_hadamard(b, t.device, t.dtype)
+    return (t.reshape(*t.shape[:-1], k // b, b) @ r).reshape(t.shape)
+
+
+def nvfp4_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, hadamard: int = 0) -> torch.Tensor:
+    """``x @ weight.T + bias`` with both operands quantized to NVFP4 on the fly, after an
+    optional block-Hadamard rotation of their shared input dimension (:func:`hadamard_block`)."""
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if hadamard:
+        x_2d, weight = rotate_blocks(x_2d, hadamard), rotate_blocks(weight, hadamard)
     x_scale, w_scale = nvfp4_global_scale(x_2d), nvfp4_global_scale(weight)
     x_fp4, x_blocks = ops.scaled_fp4_quant(x_2d, x_scale)
     w_fp4, w_blocks = ops.scaled_fp4_quant(weight, w_scale)
@@ -96,10 +140,11 @@ def quantize_weight_per_tensor(weight: torch.Tensor) -> tuple[torch.Tensor, torc
 class StepFp8LinearMethod(UnquantizedLinearMethod):
     """A BF16 linear that runs an FP8 GEMM on the steps its layer is told to."""
 
-    def __init__(self, inner: UnquantizedLinearMethod, gemm_format: str = "fp8") -> None:
+    def __init__(self, inner: UnquantizedLinearMethod, gemm_format: str = "fp8", hadamard: int = 0) -> None:
         super().__init__()
         self.inner = inner
         self.gemm_format = gemm_format
+        self.hadamard = hadamard
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         # The loader post-processes through whatever method the layer holds; an
@@ -116,7 +161,7 @@ class StepFp8LinearMethod(UnquantizedLinearMethod):
         if not getattr(layer, "fp8_step", False):
             return self.inner.apply(layer, x, bias)
         if self.gemm_format == "nvfp4":
-            return nvfp4_linear(x, self._bf16_weight(layer, x.dtype), bias)
+            return nvfp4_linear(x, self._bf16_weight(layer, x.dtype), bias, self.hadamard)
         weight_fp8, weight_scale = quantize_weight_per_tensor(layer.weight)
         x_2d = x.reshape(-1, x.shape[-1])
         x_fp8, x_scale = ops.scaled_fp8_quant(x_2d, None)
@@ -135,6 +180,7 @@ def install_step_fp8(dit: nn.Module, layers: str | None = None) -> int:
     """Wrap every matching unquantized linear; returns how many were wrapped."""
     pattern = re.compile(layers or os.environ.get("VLLM_OMNI_K6_FP8_GEMM_LAYERS", DEFAULT_LAYERS))
     gemm_format = step_gemm_format()
+    hadamard = hadamard_block() if gemm_format == "nvfp4" else 0
     wrapped = 0
     for name, module in dit.named_modules():
         method = getattr(module, "quant_method", None)
@@ -147,7 +193,7 @@ def install_step_fp8(dit: nn.Module, layers: str | None = None) -> int:
         )
         if not wrappable:
             continue
-        module.quant_method = StepFp8LinearMethod(method, gemm_format)
+        module.quant_method = StepFp8LinearMethod(method, gemm_format, hadamard)
         module.fp8_step = False
         wrapped += 1
     return wrapped
