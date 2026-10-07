@@ -90,6 +90,22 @@ marked contaminated rather than reported.
 
 ## Result
 
+### Round 4: hybrid FP16-accumulate GEMMs (build-server-2, 2026-10-07 15:36-16:11 KST)
+
+One mirrored session, A B B A, n=4 timed requests per arm, every GPU lock held, valid:
+
+| configuration | W1 request (median, min-max) | vs final stack |
+|---|---:|---:|
+| final stack (round 3's B, below) | 160.54 s (159.37-163.38) | -- |
+| **+ hybrid FP16-accumulate GEMM on 1736 DiT linears** (`VLLM_OMNI_K6_HYBRID_GEMM=1`, `arms/h1-hybrid-all.json`) | **153.82 s** (153.26-155.70) | **-4.18%** |
+| + the same, small-M calls kept on cuBLAS (2048-row gate, `arms/h1-hybrid.json`; short pair 16:35-17:03, n=2) | 153.69 s (153.45-153.93) | -4.25% |
+
+This is a numerics change: FP16 operands, FP16 accumulation inside each 32-term
+K block. Against a compiled BF16 reference on the same code, set A scores
+**0.1126 / 0.4597** (worst frame a3). The final stack scores 0.1128 / 0.3675 against the same reference.
+No DiT linear is near FP16 overflow; the modulation and time-embedding layers
+underflow in FP16 and stay BF16. See measurements.md, "Round 4 / H1".
+
 ### Round 3 final (build-server-2, 2026-10-07 11:17-11:58 KST)
 
 One mirrored session, A B B A, n=4 timed requests per arm, every GPU lock held, valid:
