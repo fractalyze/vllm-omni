@@ -14,7 +14,7 @@ tags:
 
 # Kandinsky 6 Pro with audio on one RTX 5090: a 5-second clip in 151 s
 
-Kandinsky 6.0 Pro-distill (a 29B joint video+audio DiT, 56 GiB in BF16) generating 864x480, 121 frames at 24 fps with audio on a single RTX 5090 (32 GB) in a 60 GB host, with [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Upstream cannot serve this checkpoint on that machine; this branch does it in **151.05 s, -36% against its own BF16 reference configuration**, at set-A LPIPS 0.1114 against that reference. A separate fast, lossy mode takes **104.8 s** ([Results](#results)).
+Kandinsky 6.0 Pro-distill (a 29B joint video+audio DiT, 56 GiB in BF16) generating 864x480, 121 frames at 24 fps with audio on a single RTX 5090 (32 GB) in a 60 GB host, with [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Upstream cannot serve this checkpoint on that machine; this branch does it in **151.05 s, -36% against the BF16 reference configuration's own gate run** (round-1 code, not the same session), at set-A LPIPS 0.1114 against a BF16 reference built from the same code. A separate fast, lossy mode takes **104.8 s** ([Results](#results)).
 
 - **Code:** [fractalyze/vllm-omni @ `kandinsky6/showcase`](https://github.com/fractalyze/vllm-omni/tree/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6) (pinned commit)
 - **This repo:** results, samples and how to reproduce them. **No model weights**: use [kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers) (MIT). The fast mode's INT8 checkpoint is built locally from it with one command.
@@ -25,7 +25,7 @@ Kandinsky 6.0 Pro-distill (a 29B joint video+audio DiT, 56 GiB in BF16) generati
 - **Exact BF16 weights streamed per block** from the mmapped checkpoint: one 0.9 GiB block at a time through two GPU slots, the block after next packed on a worker thread; ~57 GB/s over PCIe, 93% hidden behind compute.
 - **SageAttention2 on visual blocks 6-53** from sampler step 2, cuDNN attention on the first and last six blocks and on the whole first step.
 - **PiFlow cache:** step 8 reuses step 7's prediction instead of running the DiT.
-- **A hybrid FP16-accumulate GEMM** (Triton, sm_120). FP16 accumulation inside each 32-element K block, FP32 across blocks, on the large-M linears. An FP16 range audit keeps the layers that underflow in BF16.
+- **A hybrid FP16-accumulate GEMM** (Triton, sm_120). FP16 accumulation inside each 32-element K block, FP32 across blocks, on the large-M linears. An FP16 range audit keeps in BF16 the layers (modulation, time embeddings) that would underflow in FP16.
 - **`torch.compile`** with a pinned Inductor cache, so the server and its quality reference use the same kernels.
 - **Fast, lossy mode:** NVFP4 GEMMs and SageAttention3 from step 3, on an INT8 weight-only DiT held in pinned host RAM.
 
@@ -33,34 +33,35 @@ Every change is behind a `VLLM_OMNI_K6_*` / `VLLM_OMNI_DLO_*` switch or an atten
 
 ## Results
 
-W1: 864x480, 121 frames, 10 PiFlow steps, guidance 1.0, audio on. One RTX 5090, batch 1, prompt a1, seed 42. Each speed row comes from one mirrored session (servers visited A B B A, warm-up then timed requests) and is compared with that session's own control. Quality: LPIPS mean / worst frame over nine set-A prompts, against a compiled BF16 reference generated on the same code, host and Inductor cache.
+W1: 864x480, 121 frames, 10 PiFlow steps, guidance 1.0, audio on. One RTX 5090, batch 1, prompt a1, seed 42. Each speed row comes from one mirrored session (servers visited A B B A, warm-up then timed requests) and is compared with that session's own control, except the BF16 reference, whose wall time is its own gate run on round-1 code. Quality: LPIPS mean / worst frame over nine set-A prompts, against a compiled BF16 reference generated on the same code, host and Inductor cache.
 
 | configuration | W1 request | change | set A LPIPS, mean / worst frame |
 | --- | --: | --: | --- |
 | BF16 reference, platform attention | 234.6 s | -- | the reference |
-| final stack, round 3 (Sage2 mid-blocks, exact step 1, step-8 cache) | 158.90 s | -32% vs reference | 0.1128 / 0.3675 |
-| **final stack (head)**: + hybrid FP16-accumulate GEMM | **151.05 s** | **-36% vs reference** | **0.1114 / 0.3492** |
-| **fast, lossy (INT8 + NVFP4 + Sage3)** | **104.8 s** | -36% vs its base (164.3 s) | lossy: CLIP within 0.42% of base; b6 changes shot |
+| final stack, round 3 (Sage2 mid-blocks, exact step 1, step-8 cache) | 158.90 s | -32% vs the reference's gate run (another session) | 0.1128 / 0.3675 |
+| **final stack (head)**: + hybrid FP16-accumulate GEMM | **151.05 s** | **-36% vs the reference's gate run (another session)** | **0.1114 / 0.3492** |
+| **fast, lossy (INT8 + NVFP4 + Sage3)** | **104.8 s** | -36% vs its base, the round-3 final stack on bs1 (164.3 s) | lossy: CLIP within 0.42% of base; b6 changes shot |
 
 On set B (nine harder prompts) the final stack scores **0.1307 / 0.3576** against the same kind of reference: mean inside 0.15, worst frame (b6) over 0.25 as on set A.
 
-- The fast mode was measured on a second 5090 host, on prompts a3, b6 and a1, against the round-3 final stack.
+- The fast mode was measured on a second 5090 host (bs1), on prompts a3, b6 and a1, against the round-3 final stack on that host; it does not include the hybrid GEMM.
 - W2 (the non-distilled Pro-5s checkpoint, 50 steps, CFG 5.0) takes 1610.8 s against 2587.4 s with platform attention; its quality was screened on one prompt only.
 - Every protocol, commit and host: [`measurements.md`, "Headline"](https://github.com/fractalyze/vllm-omni/blob/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6/measurements.md).
 
 ## Quick start
 
-Requires an RTX 5090, CUDA 13, Python 3.12, 60 GB of host RAM and ~110 GB of NVMe.
+Requires an RTX 5090, CUDA 13, Python 3.12, 60 GB of host RAM, ~110 GB of NVMe, and `uv`, `git` and `jq` on `PATH`. `093ed22b5` is the serving code every number here was measured on.
 
 ```bash
-git clone --branch kandinsky6/showcase https://github.com/fractalyze/vllm-omni.git && cd vllm-omni
+git clone https://github.com/fractalyze/vllm-omni.git && cd vllm-omni && git checkout 093ed22b5
 uv venv --python 3.12 .venv
 VIRTUAL_ENV=.venv uv pip install setuptools_scm
 VIRTUAL_ENV=.venv uv pip install vllm==0.31.0 --torch-backend=auto
 VIRTUAL_ENV=.venv uv pip install -e .
 git clone https://github.com/thu-ml/SageAttention.git ../SageAttention && git -C ../SageAttention checkout d1a57a5
 TORCH_CUDA_ARCH_LIST=12.0 VIRTUAL_ENV=.venv uv pip install --no-build-isolation ../SageAttention
-export HF_HOME=/path/with/room TORCHINDUCTOR_CACHE_DIR=$PWD/.inductor-cache
+# Source env.sh in every shell (server, request): the cache must be the same one the reference used.
+echo "export HF_HOME=/path/with/room TORCHINDUCTOR_CACHE_DIR=$PWD/.inductor-cache" > env.sh && source env.sh
 
 PATH=$PWD/.venv/bin:$PATH \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MALLOC_MMAP_THRESHOLD_=131072 \
@@ -91,14 +92,14 @@ Seed 42, W1, the prompts in [`prompts-setA.json`](prompts-setA.json) (b6 is from
 | a1, portrait with speech | [mp4](samples/bf16-reference/a1-portrait-speech.mp4) | [mp4](samples/final-stack/a1-portrait-speech.mp4) | [mp4](samples/fast-lossy-int8/a1-portrait-speech.mp4) |
 | a3, sprint start | [mp4](samples/bf16-reference/a3-sprint-start.mp4) | [mp4](samples/final-stack/a3-sprint-start.mp4) | [mp4](samples/fast-lossy-int8/a3-sprint-start.mp4) |
 | a7, café menu board | [mp4](samples/bf16-reference/a7-cafe-menu.mp4) | [mp4](samples/final-stack/a7-cafe-menu.mp4) | -- |
-| b6, train platform | [mp4](samples/bf16-reference/b6-train-platform.mp4) | -- | [mp4](samples/fast-lossy-int8/b6-train-platform.mp4) |
+| b6, train platform | [mp4](samples/bf16-reference/b6-train-platform.mp4) | [mp4](samples/final-stack/b6-train-platform.mp4) | [mp4](samples/fast-lossy-int8/b6-train-platform.mp4) |
 
 - **a1:** the easiest prompt. Every arm stays close to the reference; listen for the voice and the gulls.
-- **a3:** the final stack's hardest prompt. Fast motion is where the attention approximation and the compiler's own variance show; compare the runner's legs and the bystanders. In the fast mode the shorts change colour.
+- **a3:** fast motion, where the attention approximation and the compiler's own variance show most; compare the runner's legs and the bystanders. In the fast mode the shorts change colour.
 - **a7:** rendered text. Compare the menu board's lettering between the reference and the final stack; signage glyphs are what an approximation loses first.
-- **b6:** the prompt that decided the design. Its framing is set in the first sampler step, which the final stack keeps exact. The fast mode's INT8 weights change it anyway: a different shot down the platform, with the "WEST" board barely legible.
+- **b6:** the prompt that decided the design. Its framing is set in the first sampler step, which the final stack keeps exact, and the final stack keeps the reference's framing; b6 is still its worst set-B prompt (0.308 mean). The fast mode's INT8 weights change it anyway: a different shot down the platform, with the "WEST" board barely legible.
 
-The final-stack clips are the round-5 head's output; the round-4 head's output for these prompts is bit-identical.
+The BF16-reference and final-stack clips are the exact pairs the G1 numbers score: the same-code reference and the head's outputs for set A and set B (code `093ed22b5`).
 
 Contact sheets:
 
