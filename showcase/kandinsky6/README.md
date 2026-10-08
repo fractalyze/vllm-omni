@@ -121,7 +121,7 @@ uv venv --python 3.12 .venv
 VIRTUAL_ENV=.venv uv pip install setuptools_scm
 VIRTUAL_ENV=.venv uv pip install vllm==0.31.0 --torch-backend=auto
 VIRTUAL_ENV=.venv uv pip install -e .
-VIRTUAL_ENV=.venv uv pip install lpips av          # only for the gate scripts
+VIRTUAL_ENV=.venv uv pip install lpips av torchmetrics   # only for the gate scripts
 
 # SageAttention 2 (both modes) and 3 (fast mode), built for sm_120.
 git clone https://github.com/thu-ml/SageAttention.git ../SageAttention
@@ -161,7 +161,9 @@ staging buffers in its heap, which otherwise grows host RSS by the size of the
 DiT. On a host shared with other work, `systemd-run --user --scope -p
 MemoryMax=40G -p MemorySwapMax=0 <command>` caps the server instead of the host
 (`serve/run_capped.sh`). The server is ready when `curl -sf localhost:8094/health`
-succeeds; its first request also compiles the DiT blocks and takes ~25 s longer.
+succeeds. Its first request also compiles the DiT blocks: on an empty
+`TORCHINDUCTOR_CACHE_DIR` expect it to take ~50 s longer (201 s on a clean clone
+on build-server-3), less on a warm cache.
 
 **The fast, lossy mode.** Build the INT8 weight-only checkpoint once. The
 destination is a full model root: the INT8 transformer plus symlinks to the
