@@ -5,9 +5,67 @@ section per decided question, newest first. Track C (compute, build-server-3)
 writes the kernel sections; Track M (build-server-2) writes the end-to-end and
 quality sections.
 
-Every number here was taken with all five of build-server-3's GPU lock files
-held and `nvidia-smi` showing no foreign compute process. The GPU is shared,
-and a run that had a co-tenant is discarded rather than reported.
+Every number here was taken with all of its host's GPU lock files held and
+`nvidia-smi` showing no foreign compute process. The GPUs are shared, and a run
+that had a co-tenant is discarded rather than reported.
+
+## Headline (the numbers the README and the model card quote)
+
+W1: Kandinsky 6.0 Pro-distill-5s, 864x480, 121 frames at 24 fps, 10 PiFlow
+steps, guidance 1.0, audio on, seed 42, prompt a1 for timing; one RTX 5090
+(32 GB, 575 W) in a 60 GB host, batch 1.
+
+| configuration (arm) | W1 request, median (min-max) | n | host, session | code | set A G1 vs same-code reference, mean / worst frame | numerics vs the row above |
+|---|---:|---:|---|---|---|---|
+| BF16 reference: platform cuDNN attention, compiled (`arms/bf16-reference.json`) | 234.6 s (233.4-243.3) | 9 (its own gate run) | bs2, round 1 | -- | the reference | -- |
+| A: sage2-mid + exact step 1 + background staging + unfused bias (`arms/final-A-base.json`) | 173.42 s (172.29-173.71) | 4 | bs2, A B B A, 2026-10-07 11:17-11:58 | `2c7b899dc` | not scored against the same-code reference | approximate (Sage2 on blocks 6-53) |
+| **final stack** = A + PiFlow cache on step 8 (`arms/final-B-cache8.json`) | **158.90 s** (157.54-159.58) | 4 | same session | `2c7b899dc` | **0.1128 / 0.3675** | approximate (step 8 reuses step 7's x_0): 0.0106 / 0.0259 vs A in one process |
+| + hybrid FP16-accumulate GEMM, every linear (`arms/h1-hybrid-all.json`) | 153.82 s (153.26-155.70); control 160.54 s | 4 | bs2, A B B A, 15:36-16:11 | `747ef44f8` | 0.1126 / 0.4597 | numerics change (FP16 operands, FP16 accumulation per 32-term K block) |
+| **round-5 head** = hybrid on large-M linears only (2048-row gate) + placeholder bias pointer (`arms/h1-hybrid.json`) | **151.05 s** (150.64-151.60); control 152.70 s | 4 | bs2, A B B A, 20:12-20:46 | `794693892` (docs to `093ed22b5`) | **0.1114 / 0.3492** | the gate moves the small-M linears back to BF16; the placeholder is exact (identical decoded video and audio) |
+| fast/lossy H5-INT8: NVFP4 step GEMMs + Sage3 from step 3, INT8 weight storage (Track S) | 104.8 s (104.4-105.1); its base 164.3 s | 3 | bs1, bracketed visits, 2026-10-07 15:36 | `b9ede41fb` | lossy, not G1: CLIP (G3) +0.42% vs base; b6 changes shot | lossy |
+
+- **Protocol (speed).** `bench/abba.py`: one server per visit, visits A B B A,
+  1 warm-up + 2 timed requests a visit (the 16:35 gated pair: 1 timed), every GPU
+  lock held, `nvidia-smi` sampled throughout, the session marked contaminated if
+  anything else touched the GPU. A delta is quoted against the control of the
+  same session, never across sessions; the rows above therefore chain
+  (160.54 -> 153.82, 152.70 -> 151.05), and the absolute walls drift by ~1-2 s
+  between sessions on this shared host.
+- **Protocol (quality).** G1 is LPIPS (mean over frames, mean over the nine
+  set-A prompts; worst single frame) against a **compiled BF16 reference
+  generated on the same code, on the same host, from the same pinned Inductor
+  cache** (`TORCHINDUCTOR_CACHE_DIR`). A reference from older code measures the
+  code change as well as the arm: PR #38's bias reassociation alone moved the
+  reference by 0.1473 / 0.4229 ("Round 3 / attribution"). The round-5 reference
+  check: a1 regenerated on the round-5 code decodes identically to the stored
+  reference, same VAE tile plan.
+- **Set B** for the final head (round-5 head, `arms/h1-hybrid.json`):
+  **0.1307 / 0.3576** (worst b6), scored at the write-up. bs2, 2026-10-08
+  12:58-13:39, code `093ed22b5`, no foreign GPU process, every server on the
+  reference's VAE tile plan. Per prompt: b1 .085, b2 .091, b3 .216, b4 .182,
+  b5 .059, b6 .308, b7 .146, b8 .033, b9 .056.
+  - The same-code set-B reference: b1-b5 were generated on 2026-10-07 at
+    `3c58335db`, b6-b9 at the write-up at `093ed22b5`.
+  - Nothing between those two commits touches the BF16 path: the hybrid and
+    staging changes are behind switches the reference does not set, and set A's
+    a1, regenerated on the round-5 code, decodes identically to its stored
+    reference.
+  - Set B is the harder set for every arm ("Set B is 28% harder"). The mean is
+    inside 0.15; the worst frame, like set A's, is over 0.25. The earlier rows
+    were not scored on set B against a same-code reference.
+- **Superseded numbers.** Round 4 reported the hybrid GEMM's set-A worst frame
+  as **0.4597** (a3). That is the all-linears configuration, now
+  `arms/h1-hybrid-all.json`. The default since PR #61 keeps the small-M linears
+  on BF16 cuBLAS; it was first scored in round 5, at **0.3492** (worst a9), and
+  the placeholder fix on top of it is exact. Read 0.4597 as the all-linears
+  arm's number, not the shipped one's. The G1 worst frame of every arm here
+  exceeds the user's 0.25; recompiling the BF16 reference alone moves its own
+  worst frame by 0.4160 (compile vs eager, "The pipeline's own numerical
+  floor"), so that bar is below this pipeline's noise.
+- **W2** (Pro-5s, 50 steps, CFG 5.0, 125 frames): 1610.8 s with sage2-mid + exact
+  step 1 against 2587.4 s with platform attention, one request each; quality
+  screened on a1 only ("Round 3 / W2").
+
 
 ## Round 5 / R1: where H1's lost gain went (Track M, build-server-2)
 
@@ -274,6 +332,122 @@ worker (bs2, all locks):
 against the served GEMM, and the FP16-accumulate ceiling measured on this
 card is 1.54x (Track C). Stream bytes are not limiting this arm on bs2.
 
+## Round 4 / H5: the fast/lossy mode (Track S, build-server, recorded at the write-up)
+
+Track S's final H5 screen, as posted to the bs2 HANDOFF on 2026-10-07 at 15:36 KST
+and copied here so the README can cite it. **A lossy mode, judged by CLIP (G3)
+and contact sheets only; never a G1 arm.**
+
+Code: PR #57 (`b9ede41fb`). `VLLM_OMNI_K6_STEP_GEMM_FORMAT=nvfp4` on the step
+schedule (`VLLM_OMNI_K6_FP8_GEMM_AFTER_STEP=2`): NVFP4 GEMMs from step 3,
+weight and activation quantized on the device per call, vLLM's CUTLASS sm_120
+kernel. SageAttention3 from step 3 (`compute/arms/h5-sage3.json` +
+`VLLM_OMNI_K6_EXACT_ATTN_STEPS=2`). Steps 1-2 run BF16 GEMMs and exact
+cuDNN attention. Every arm includes `VLLM_OMNI_K6_PIFLOW_CACHE_STEPS=8`; none
+includes the hybrid GEMM.
+
+Protocol: bs1 (build-server), visits base -> H5-INT8 -> H5-BF16 -> base (base
+brackets both), 1 warm-up + 3 timed requests each on a3, b6 and a1, every lock
+held, no foreign GPU process.
+
+| arm | a3 / b6 / a1 | median | vs base |
+|---|---|---:|---:|
+| base: the final stack (BF16 streamed, sage2-mid, exact step 1, cache 8) | 165.5 / 164.9 / 164.0 (+ 163.2 / 164.3) | 164.3 s (n=5) | -- |
+| H5-BF16: the BF16 checkpoint streamed off NVMe | 143.8 / 137.2 / 139.4 | 139.4 s | -15.2% |
+| **H5-INT8: the INT8 weight-only checkpoint staged from pinned RAM** | 104.4 / 104.8 / 105.1 | **104.8 s** | **-36.2%** |
+
+- **Why two rows.** With NVFP4 GEMMs a step's compute is ~4-5 s, while
+  streaming 56 GiB of BF16 off NVMe takes ~10 s a step, so H5-BF16 is
+  stream-bound. The INT8 checkpoint (30 GB) sits in pinned RAM, and its NVFP4
+  steps take 5.8 s.
+- **Quality, CLIP text-video agreement vs base (G3, +-2%).**
+  - H5-BF16: +2.66%, outside the tolerance on the favourable side. Same scenes
+    and motion; a3's background bystanders differ. LPIPS vs base: a3 .227,
+    b6 .244, a1 .071.
+  - H5-INT8: +0.42%, passes. But b6 becomes a different shot (a view down the
+    platform), its "WEST" board barely legible, and a3's sprinter wears dark
+    shorts instead of red. LPIPS vs base: a3 .352, b6 .575, a1 .076. The b6
+    change is the INT8 weights' own; they change b6 from the first frame in
+    every earlier round.
+- **Contact sheets:** `h5-int8-vs-base.jpg` and `h5-bf16-vs-base.jpg` on the
+  Hugging Face card.
+
+## Earlier README summaries (moved here at the write-up)
+
+The branch README carried a per-round result section; those summaries now live
+in this record. Rounds 1-5 are the sections above. The three explanatory
+sections below are kept as they were written after round 1, and their numbers
+describe the round-1 headline arm.
+
+### What remained after round 1
+
+Measured on the headline arm (one profiled request on build-server-2; details
+in measurements.md, "Where the headline arm's time goes"):
+
+| where one request goes (192.6 s profiled; 188.9 s unprofiled) | per request | next lever |
+|---|---:|---|
+| BF16 GEMMs | 94 s (54% of denoise) | a narrower one-byte band; every wider format tried fails the gate |
+| exact cuDNN attention (step 1 + 12 edge blocks) | 30.4 s | a faster **exact** kernel, which cannot fail the gate; 2x would save ~15 s |
+| Sage2 attention (blocks 6-53) | 30.6 s | already the fast kernel |
+| video VAE decode (tiling planned per call from free GPU memory; 16-frame chunks every 8) | 18.9 s | a deterministic plan (14.8 s when it gets full-frame tiles) and less temporal overlap |
+| other kernels (norms, RoPE, elementwise) | 5.5 s | -- |
+| GPU idle while weights stream from NVMe | 8.6 s | already overlapped |
+| text encoders, audio decode, mux | < 1 s | none |
+
+The denoise step is compute-bound: the GPU is busy 95% of the time, and the
+56 GiB/step of BF16 weights is copied at 50.6 GiB/s, overlapped with compute.
+
+### What this workload turned out to be
+
+Four things decided every arm in [measurements.md](measurements.md), and they
+are worth knowing before reading any number here.
+
+**The DiT does not fit anywhere.** 56.14 GiB in BF16 -- 60 visual blocks of
+0.899 GiB, four text blocks, embeddings and two output heads -- against a 32 GB
+board and 60 GB of host RAM. It runs from the mmapped checkpoint and every one
+of W1's 10 steps re-reads all of it, at a measured 1.67 GB/s off NVMe with a
+page-cache hit rate near 0.6.
+
+**No sub-BF16 weight format on this GPU can pass a tight perceptual gate.** FP8
+E4M3's weight error is 2.6% *at any scale granularity* -- per-tensor 0.02645,
+per-output-row 0.02643 -- because the format carries its own 4-bit exponent, so
+a finer scale slides the matrix along the exponent ladder while the step stays
+at the 3-bit mantissa. INT8 at per-row scales would cost 0.00908, 2.9x less, and
+sm_120 has no INT8 GEMM: CUTLASS's `dispatch_scaled_mm` refuses with "Int8 not
+supported on SM120". So the weights stay BF16 and precision is not the lever.
+
+**Attention is, and it is worth a third of the request.** The platform's cuDNN
+attention runs 21.9 s/step against a stream worth about 15 s; SageAttention2
+takes the arm to 165.9 s from 231.8 s. But Sage2 everywhere costs LPIPS 0.1858
+against the BF16 reference, so the question becomes *which blocks* approximate,
+which is what `AttentionSpec.layers` exists for.
+
+**And the harness moves more than most of the arms do.** Running the same BF16
+checkpoint compiled instead of eager changes LPIPS by 0.1455 on the set mean and
+**0.4160 on the worst frame** -- Inductor picks kernels by measured latency, so
+two compiled processes are not identical while two eager ones are. That is
+larger than the gate those arms were being judged against, and it is why three
+bars are reported instead of one.
+
+### The quality gate
+
+Three questions, reported side by side, because they disagree and the
+disagreement is informative:
+
+- **G1** is the user's bar: per prompt set, LPIPS mean <= 0.15 **and** max <=
+  0.25 against the same checkpoint's BF16 output at the same seed.
+- **G2** is floor-relative: within 1.25x the pipeline's own numerical floor.
+  It exists because rerunning *the same configuration* in a fresh process
+  already costs LPIPS 0.0272 mean / 0.0636 max on this pipeline, so an absolute
+  bar below that movement measures noise rather than the arm. **Coordinator-chosen,
+  pending the user.**
+- **G3** is distributional: CLIP text-video agreement within 2% of the
+  reference's, plus a contact sheet for a human to look at.
+
+Two disjoint prompt sets of nine prompts each, every set covering faces,
+rendered text, fast motion and a sharp sound event -- because an FP8 recipe in
+the vault passed one 8-prompt set at LPIPS 0.034 and failed another at 0.162.
+
 ## Round 3 / attribution: the final stack's G1 rise is PR #38's reassociation, not the cache
 
 The final stack (showcase head + pi-Flow cache on step 8) scored set A **0.1393 / 0.4675** on bs3,
@@ -372,7 +546,7 @@ the first thing to measure next: set A, then a mirrored session against B. B inh
 arm, and G1 failing on the worst frame. B was not re-gated end to end on both sets; its quality
 claim rests on this same-process delta.
 
-## Headline: the fastest W1 configuration on one RTX 5090 that passes the working gate (Track M)
+## Round 1 headline: the fastest W1 configuration on one RTX 5090 that passes the working gate (Track M)
 
 Track M, build-server-2, 2026-10-07. Kandinsky 6 Pro-distill 5s, W1 (864x480,
 121 frames, 10 pi-Flow steps, guidance 1.0, audio on), one RTX 5090 (32 GB),
