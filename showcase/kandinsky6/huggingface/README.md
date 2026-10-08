@@ -16,7 +16,7 @@ tags:
 
 Kandinsky 6.0 Pro-distill (a 29B joint video+audio DiT, 56 GiB in BF16) generating 864x480, 121 frames at 24 fps with audio on a single RTX 5090 (32 GB) in a 60 GB host, with [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Upstream cannot serve this checkpoint on that machine; this branch does it in **151.05 s, -36% against its own BF16 reference configuration**, at set-A LPIPS 0.1114 against that reference. A separate fast, lossy mode takes **104.8 s** ([Results](#results)).
 
-- **Code:** [fractalyze/vllm-omni @ `kandinsky6/showcase`](https://github.com/fractalyze/vllm-omni/tree/PINNED_COMMIT/showcase/kandinsky6) (pinned commit)
+- **Code:** [fractalyze/vllm-omni @ `kandinsky6/showcase`](https://github.com/fractalyze/vllm-omni/tree/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6) (pinned commit)
 - **This repo:** results, samples and how to reproduce them. **No model weights**: use [kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers) (MIT). The fast mode's INT8 checkpoint is built locally from it with one command.
 
 ## What's inside
@@ -46,7 +46,7 @@ On set B (nine harder prompts) the final stack scores **0.1307 / 0.3576** agains
 
 - The fast mode was measured on a second 5090 host, on prompts a3, b6 and a1, against the round-3 final stack.
 - W2 (the non-distilled Pro-5s checkpoint, 50 steps, CFG 5.0) takes 1610.8 s against 2587.4 s with platform attention; its quality was screened on one prompt only.
-- Every protocol, commit and host: [`measurements.md`, "Headline"](https://github.com/fractalyze/vllm-omni/blob/PINNED_COMMIT/showcase/kandinsky6/measurements.md).
+- Every protocol, commit and host: [`measurements.md`, "Headline"](https://github.com/fractalyze/vllm-omni/blob/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6/measurements.md).
 
 ## Quick start
 
@@ -80,7 +80,7 @@ until [ "$(curl -s localhost:8094/v1/videos/$ID | jq -r .status)" = completed ];
 curl -s localhost:8094/v1/videos/$ID/content -o clip.mp4
 ```
 
-The fast mode, the quality-gate scripts and every switch are in the branch's [`showcase/kandinsky6/README.md`](https://github.com/fractalyze/vllm-omni/blob/PINNED_COMMIT/showcase/kandinsky6/README.md).
+The fast mode, the quality-gate scripts and every switch are in the branch's [`showcase/kandinsky6/README.md`](https://github.com/fractalyze/vllm-omni/blob/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6/README.md).
 
 ## Samples
 
@@ -119,8 +119,8 @@ Contact sheets:
 
 ## Links
 
-- Code: [`showcase/kandinsky6/` @ PINNED_COMMIT](https://github.com/fractalyze/vllm-omni/tree/PINNED_COMMIT/showcase/kandinsky6)
-- Record: [`measurements.md` @ PINNED_COMMIT](https://github.com/fractalyze/vllm-omni/blob/PINNED_COMMIT/showcase/kandinsky6/measurements.md)
-- Where the next 20 s are: the [ncu rooflines](https://github.com/fractalyze/vllm-omni/tree/PINNED_COMMIT/showcase/kandinsky6/compute) (`ncu-roofline*.md`)
+- Code: [`showcase/kandinsky6/` @ 9310bdad259dd75af0098526a34fa4105d704b26](https://github.com/fractalyze/vllm-omni/tree/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6)
+- Record: [`measurements.md` @ 9310bdad259dd75af0098526a34fa4105d704b26](https://github.com/fractalyze/vllm-omni/blob/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6/measurements.md)
+- Where the next 20 s are: the [ncu rooflines](https://github.com/fractalyze/vllm-omni/tree/9310bdad259dd75af0098526a34fa4105d704b26/showcase/kandinsky6/compute) (`ncu-roofline*.md`)
 - Checkpoint: [kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers) (MIT)
 - Earlier showcase on this fork: [Fractalyze/qwen3-omni-rtx5090-showcase](https://huggingface.co/Fractalyze/qwen3-omni-rtx5090-showcase)
